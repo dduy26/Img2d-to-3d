@@ -1,0 +1,1 @@
+update status mỗi khi làm xong 1 task / requirement
