@@ -520,35 +520,48 @@ print(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f}GB")
 
 ### 3. Hai Luồng Kiến Trúc Chuẩn cho N Ảnh 2D → 3D trên Colab Free (T4)
 
-#### • LUỒNG 1: DUSt3R + TSDF / Marching Cubes (Đa năng, tự do số lượng ảnh $N$)
+#### • LUỒNG 1: DUSt3R + Quality Gate + TSDF / Marching Cubes (Pipeline v1 Chuẩn hóa)
 
 ```
-[N Ảnh 2D Input (N = 2 ~ 10 ảnh)]
+[N Ảnh RGB gốc (N = 2 ~ 8 ảnh)]
        ↓
-[RMBG-2.0 + Scale Normalization] (Tách nền, Canh tâm & Pad về 512×512 chuẩn)
+[DUSt3R Image Loader] (Resize bảo toàn Aspect Ratio, KHÔNG crop từng ảnh)
        ↓
-[DUSt3R / MASt3R Model] (Dự đoán đồng thời Camera Poses + Point Clouds đồng nhất)
+[DUSt3R Engine] (Pairwise Matching + Global Alignment → Poses, Focals, Point-maps đồng nhất)
        ↓
-[Open3D Scalable TSDF Volume Integration] (Tích lũy N depth maps vào không gian thể tích 3D)
-       ↓
-[Marching Cubes Algorithm] (Trích xuất Iso-surface ra Closed 3D Mesh)
-       ↓
-[XAtlas UV Unwrapping] (Trải phẳng UV islands cho toàn bộ vật thể 360°)
-       ↓
-[Multi-view Angle-weighted Texture Blending] (Hòa trộn màu sắc từ N ảnh gốc)
-       ↓
+[Quality Gate Validation]
+   ├── Đồ thị Co-visibility liên thông hoàn toàn
+   ├── Mật độ pixel confidence cao đạt chuẩn
+   └── Global-alignment loss không bất thường
+       │
+   ┌───┴────────────────────────────────────────┐
+(Pass ✅)                                    (Fail ❌)
+   │                                            │
+   ▼                                            ▼
+[Lọc điểm nền bằng Alpha Mask RMBG-2.0]     [Fallback: Chọn ảnh confidence cao nhất]
+   │                                            │
+   ▼                                            ▼
+[Open3D Scalable TSDF Volume Integration]   [TripoSR Single-view Inference]
+   │                                            │
+   ▼                                            ▼
+[Marching Cubes → Lưới 360° kín nước]       [Xuất file .GLB + Cảnh báo Pose Fail]
+   │
+   ▼
+[XAtlas UV + Base-color Texture Blending]
+   │
+   ▼
 [Xuất file .glb hoàn chỉnh]
 ```
 
-- **Ưu điểm:** Chấp nhận số lượng ảnh bất kỳ ($N = 2, 4, 8...$), không cần biết trước thông số camera, mesh kín nước và đúng bản chất hình học.
-- **Tài nguyên:** VRAM ~5-6GB, RAM ~6GB, thời gian chạy ~5-8 giây trên T4. Hoàn toàn nằm trong ngưỡng an toàn của Colab Free.
+- **Ưu điểm:** Tận dụng 100% sức mạnh của DUSt3R (tự sinh cả pose, focal và depth trong cùng hệ tọa độ); có Quality Gate phát hiện lỗi sớm; có túi khí Fallback TripoSR đảm bảo luôn ra kết quả; không bị lệch scale hay méo hình do crop độc lập.
+- **Tài nguyên:** VRAM ~5.0GB, RAM ~6GB, thời gian chạy ~8-9 giây trên T4.
 
 ---
 
 #### • LUỒNG 2: 4-View LGM (Tốc độ siêu nhanh khi có 4 góc chuẩn)
 
 ```
-[4 Ảnh 2D (Front, Right, Back, Left)]
+[4 Ảnh 2D chuẩn trực giao (Front, Right, Back, Left)]
        ↓
 [RMBG-2.0 Batch] (Xóa nền)
        ↓
@@ -558,18 +571,18 @@ print(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f}GB")
 ```
 
 - **Ưu điểm:** Cực nhanh (~5 giây), ra thẳng mesh có texture sắc nét mà không cần code các bước hình học phức tạp.
-- **Nhược điểm:** Đòi hỏi ảnh chụp phải tương đối khớp với 4 góc chuẩn 90 độ.
+- **Nhược điểm:** Đòi hỏi ảnh chụp phải khớp với 4 góc chuẩn 90 độ trực giao.
 - **Tài nguyên:** VRAM ~7-8GB, RAM ~8GB trên Colab T4.
 
 ---
 
-### 4. Bảng Tổng kết Đánh giá Luồng N Ảnh
+### 4. Bảng Tổng kết Đánh giá Luồng N Ảnh (Pipeline v1)
 
-| Bước | Đề xuất ban đầu (Leader/Gợi ý) | Thực tế áp dụng cho N ảnh | Khuyến nghị tối ưu cho Colab T4 |
+| Bước | Đề xuất ban đầu (Leader/Gợi ý) | Thực tế áp dụng cho N ảnh (Pipeline v1) | Khuyến nghị tối ưu cho Colab T4 |
 | :--- | :--- | :--- | :--- |
-| **1. Tiền xử lý** | RMBG-2.0 / BRIA | ✅ Tốt, cần chạy tuần tự batch cho $N$ ảnh | Dùng **RMBG-2.0 + Scale Normalization** (Letterbox 512×512, canh tâm & giữ aspect ratio) |
-| **Bổ sung bắt buộc** | _Không đề cập_ | ⚠️ Cần ước lượng Camera Pose giữa các ảnh | Dùng **DUSt3R** (tự động pose & depth cùng lúc) |
-| **2. Suy luận 3D** | Depth Anything V2 hoặc TripoSR | ❌ TripoSR chỉ nhận 1 ảnh; Depth Anything bị lỗi scale ambiguity giữa các ảnh | • Hướng hình học: **DUSt3R**<br>• Hướng Feed-forward: **LGM (4 views)** |
-| **3. Dựng lưới Mesh** | Marching Cubes / Poisson | ✅ **Marching Cubes cực kỳ tối ưu** khi kết hợp cùng TSDF Fusion đa ảnh | **TSDF Fusion + Marching Cubes** (hoặc Poisson nếu từ Dense Point Cloud) |
-| **4. Render & Export** | XAtlas / BFF + Projection | ✅ **XAtlas là bắt buộc** cho mesh $N$ ảnh; cần thêm Multi-view Blending | **XAtlas + Angle-weighted Blending + Xuất .glb** |
+| **1. Tiền xử lý** | RMBG-2.0 / BRIA | ✅ Dùng DUSt3R Loader chuẩn; RMBG-2.0 chạy song song lấy Alpha Mask lọc điểm sau | **KHÔNG crop độc lập từng ảnh**; giữ nguyên quan hệ camera gốc |
+| **Bổ sung bắt buộc** | _Không đề cập_ | ⚠️ **Quality Gate 3 tiêu chí** (Đồ thị liên thông, Confidence, Alignment loss) | Nếu fail $\to$ Tự động **Fallback về TripoSR** trên ảnh nét nhất |
+| **2. Suy luận 3D** | Depth Anything V2 hoặc TripoSR | ✅ **DUSt3R tự sinh Pose + Focals + Point-maps đồng nhất** | **Bỏ chạy riêng Depth Anything** trong luồng DUSt3R để tránh lệch scale |
+| **3. Dựng lưới Mesh** | Marching Cubes / Poisson | ✅ **TSDF Fusion + Marching Cubes** trên điểm đã lọc mask nền | **TSDF Fusion + Marching Cubes** tạo mesh 360° kín nước |
+| **4. Render & Export** | XAtlas / BFF + Projection | ✅ **XAtlas + Base-Color Blending** (Texture màu cơ bản, không gọi là PBR) | **XAtlas + Angle-weighted Blending + Xuất .glb** |
 

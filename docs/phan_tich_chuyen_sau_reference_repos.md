@@ -143,54 +143,115 @@ Từ việc phân tích 3 repo trên, ta thấy:
 - **Không nên sao chép mù quáng 1 repo duy nhất**, vì mỗi repo có một thế mạnh riêng và điểm yếu riêng.
 - **Giải pháp tối ưu nhất:** Kết hợp các thế mạnh tinh hoa của cả 3 repo để tạo thành một pipeline hoàn chỉnh chạy mượt mà trên **Google Colab Free (NVIDIA T4 15GB VRAM, 12GB RAM)**.
 
-### 🌟 SƠ ĐỒ PIPELINE TÍCH HỢP TỔNG THỂ
+### 🌟 SƠ ĐỒ PIPELINE TỔNG THỂ CHUẨN HÓA (2 KỊCH BẢN ĐỘC LẬP)
 
+#### 1. Biểu đồ tương tác Mermaid (Hiển thị đồ họa trực quan)
+
+```mermaid
+flowchart TD
+    Start([Ảnh Đầu Vào]) --> Route{Kiểm tra số lượng ảnh}
+    
+    %% Kịch bản 1
+    Route -- "Đơn ảnh (N = 1)" --> Pre1["GIAI ĐOẠN 1A: TIỀN XỬ LÝ ĐƠN ẢNH<br>• RMBG-2.0 lấy Alpha Mask<br>• Canh tâm & Scale vật thể 80%<br>• Pad 512×512 & Cập nhật ma trận K"]
+    Pre1 --> Gen1["GIAI ĐOẠN 2A: TÁI TẠO ĐƠN ẢNH<br>• Option 1A: Depth Anything V2 + Poisson Mesh + Chiếu UV<br>• Option 2A: TripoSR sinh thẳng Mesh + Texture"]
+    Gen1 --> Export1(["Xuất file .GLB Đơn Ảnh"])
+
+    %% Kịch bản 2
+    Route -- "Đa ảnh (N = 4 ~ 8)" --> PreN["GIAI ĐOẠN 1B: TIỀN XỬ LÝ ĐA ẢNH<br>• Giữ nguyên quang học, không crop riêng lẻ<br>• Resize max 512px, tách mask nền song song<br>• Cân bằng sáng Histogram Matching"]
+    PreN --> Dust3r["GIAI ĐOẠN 2B: DUST3R GLOBAL POSE & 3D SHAPE<br>• Pairwise Matching & Global Alignment<br>• Xuất Poses, Focals, Point-maps cùng hệ tọa độ"]
+    Dust3r --> Gate{"GIAI ĐOẠN 3: QUALITY GATE<br>• Đồ thị liên thông?<br>• Mật độ confidence đạt?<br>• Alignment loss hợp lệ?"}
+    
+    Gate -- "Pass ✅ (Đạt chuẩn)" --> Stage4["GIAI ĐOẠN 4: DỰNG MESH 360° & NƯỚNG TEXTURE<br>• Lọc bỏ 100% điểm nền bằng Alpha Mask<br>• Tích lũy không gian 3D (Open3D Voxel TSDF)<br>• Trích xuất bề mặt kín 360° (Marching Cubes)<br>• Trải UV & Hòa trộn màu đa góc (XAtlas)"]
+    Stage4 --> ExportN(["Xuất file .GLB 3D Hoàn Chỉnh"])
+    
+    Gate -- "Fail ❌ (Lỗi góc chụp/pose)" --> Fallback["GIAI ĐOẠN 4-FALLBACK: CỨU HỘ TỰ ĐỘNG<br>• Tự động chọn 1 ảnh nét nhất chuyển sang TripoSR<br>• Cảnh báo UI: Multi-view lỗi pose, đã về đơn ảnh"]
+    Fallback --> ExportFB(["Xuất file .GLB Cứu Hộ"])
+
+    style Start fill:#4f46e5,stroke:#312e81,stroke-width:2px,color:#fff
+    style Export1 fill:#059669,stroke:#065f46,stroke-width:2px,color:#fff
+    style ExportN fill:#059669,stroke:#065f46,stroke-width:2px,color:#fff
+    style ExportFB fill:#d97706,stroke:#92400e,stroke-width:2px,color:#fff
+    style Gate fill:#b45309,stroke:#78350f,stroke-width:2px,color:#fff
+    style Route fill:#4338ca,stroke:#312e81,stroke-width:2px,color:#fff
 ```
-[ N Ảnh 2D chụp quanh vật thể ]
-               │
-               ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ GIAI ĐOẠN 1: TIỀN XỬ LÝ ẢNH (PREPROCESSING)                     │
-│ • RMBG-2.0: Tách nền từng ảnh, trích xuất Alpha Mask             │
-│ • Chuẩn hóa tỉ lệ & Canh tâm (Scale & Centering Normalization):  │
-│   - Crop Bounding Box từ Alpha Mask, đưa tâm vật thể về giữa     │
-│   - Resize bảo toàn Aspect Ratio + Square Letterbox Padding      │
-│   - Đưa toàn bộ N ảnh về cùng 1 độ phân giải chuẩn (512×512)     │
-│ • Cân bằng sáng & màu sắc (Histogram Matching giữa các ảnh)       │
-└──────────────────────────────────────────────────────────────────┘
-               │
-               ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ GIAI ĐOẠN 2: ƯỚC LƯỢNG POSE & ĐỘ SÂU HỆ MÉT (DEPTH & POSE)       │
-│ • Camera Pose: Ước lượng ma trận xoay & tịnh tiến [R|T]           │
-│   (Sử dụng DUSt3R hoặc LightGlue + Essential Matrix)              │
-│ • Metric Depth: Depth-Anything-V2-Metric (từ Repo 3)             │
-│   → Xuất bản đồ độ sâu chính xác bằng mét, triệt tiêu Scale Bias │
-│ • Lọc cạnh: Áp dụng thuật toán Filter Edges (từ Repo 2 DA3)      │
-│   → Cắt bỏ toàn bộ pixel nhiễu rách ở biên phân cách             │
-└──────────────────────────────────────────────────────────────────┘
-               │
-               ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ GIAI ĐOẠN 3: DUNG HỢP THỂ TÍCH & TRÍCH XUẤT MESH                │
-│ • Open3D Scalable TSDF Volume Integration (học từ Repo 1 NVIDIA) │
-│   → Tích lũy N depth maps vào không gian Voxel 3D                │
-│ • Marching Cubes Algorithm: Trích xuất Iso-surface Mesh khép kín │
-│ • Dọn dẹp Mesh: Lọc bỏ cụm tam giác cô lập, làm mịn Laplasse     │
-└──────────────────────────────────────────────────────────────────┘
-               │
-               ▼
-┌──────────────────────────────────────────────────────────────────┐
-│ GIAI ĐOẠN 4: TRẢI PHẲNG UV & HÒA TRỘN MÀU ĐA ẢNH (TEXTURING)     │
-│ • UV Unwrapping: XAtlas trải phẳng toàn bộ bề mặt 360°           │
-│ • Color Fusion (học từ Repo 1 NVIDIA):                           │
-│   - Ray-casting kiểm tra góc khuất (Visibility Check)             │
-│   - Trọng số góc nhìn cosine (Angle-weighted color blending)      │
-│ • Đóng gói: Xuất thành 1 file .GLB duy nhất                      │
-└──────────────────────────────────────────────────────────────────┘
-               │
-               ▼
-[ Model 3D hoàn chỉnh (.GLB) chuẩn PBR Texture ]
+
+---
+
+#### 2. Sơ đồ khối ASCII rút gọn (Chống tràn chữ, hiển thị tối ưu trên mọi kích thước màn hình)
+
+##### 🅰️ KỊCH BẢN 1: ĐƠN ẢNH ($N = 1$)
+```
+[ 1 Ảnh 2D duy nhất ]
+         │
+         ▼
+┌────────────────────────────────────────────────────────┐
+│ GIAI ĐOẠN 1A: TIỀN XỬ LÝ ĐƠN ẢNH                       │
+│ • RMBG-2.0: Tách nền lấy Alpha Mask                    │
+│ • Crop Bounding Box, canh giữa, scale vật thể ~82%     │
+│ • Pad viền vuông 512×512, cập nhật ma trận K → K'      │
+└────────────────────────┬───────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────┐
+│ GIAI ĐOẠN 2A: TÁI TẠO ĐƠN ẢNH                          │
+│ • Option 1A (Depth-Anything-V2-Metric):                │
+│   Dự đoán Depth → Chiếu ngược Point Cloud              │
+│   → Dựng lưới Poisson Mesh → Chiếu Camera UV Texture   │
+│ • Option 2A (TripoSR Transformer):                     │
+│   Sinh trực tiếp Textured Mesh 3D trong 1.5s           │
+└────────────────────────┬───────────────────────────────┘
+                         │
+                         ▼
+   [ XUẤT THẲNG FILE .GLB HOÀN CHỈNH CHO ĐƠN ẢNH ]
+```
+
+##### 🅱️ KỊCH BẢN 2: ĐA ẢNH ($N = 4 \sim 8$, TỐI ƯU 6 ẢNH)
+```
+[ 4 ~ 8 Ảnh chụp quanh vật thể 360° ]
+         │
+         ▼
+┌────────────────────────────────────────────────────────┐
+│ GIAI ĐOẠN 1B: TIỀN XỬ LÝ ĐA ẢNH                        │
+│ • Không crop riêng lẻ (bảo toàn Epipolar Geometry)     │
+│ • Resize max 512px, tách Alpha Mask song song          │
+│ • Cân bằng sáng (Histogram Matching giữa các ảnh)      │
+└────────────────────────┬───────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────┐
+│ GIAI ĐOẠN 2B: ĐỒNG BỘ POSE & HÌNH HỌC (DUSt3R)         │
+│ • Pairwise Matching + Global Alignment toàn cục        │
+│ • Xuất đồng thời: Camera Poses, Focals, 3D Point-maps  │
+│   và bản đồ Confidence trong CÙNG 1 HỆ TỌA ĐỘ.         │
+└────────────────────────┬───────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────┐
+│ GIAI ĐOẠN 3: BỘ LỌC CHẤT LƯỢNG (QUALITY GATE)          │
+│ • Kiểm tra liên thông đồ thị quan sát chung           │
+│ • Đạt ngưỡng số lượng pixel tin cậy (Confidence)       │
+│ • Mất mát căn chỉnh (Alignment loss) trong mức an toàn │
+└────────────────────────┬───────────────────────────────┘
+                         │
+          ┌──────────────┴──────────────┐
+       (Pass ✅)                     (Fail ❌)
+          │                             │
+          ▼                             ▼
+┌───────────────────────────┐ ┌───────────────────────────┐
+│ GIAI ĐOẠN 4: DỰNG MESH    │ │ GIAI ĐOẠN 4-FALLBACK:     │
+│ 360° & NƯỚNG TEXTURE      │ │ CỨU HỘ TỰ ĐỘNG            │
+│ • Lọc sạch điểm nền bằng  │ │ • Tự động chọn 1 ảnh sắc  │
+│   Alpha Mask (Point Prune)│ │   nét nhất đưa qua        │
+│ • Tích lũy không gian 3D  │ │   TripoSR tạo mesh nhanh. │
+│   (Open3D Voxel TSDF)     │ │ • Báo UI: "Multi-view     │
+│ • Trích xuất vỏ 360° kín  │ │   lỗi pose, đã tự động    │
+│   bằng Marching Cubes     │ │   chuyển sang tạo đơn ảnh"│
+│ • Trải UV & hòa trộn màu  │ │ • Đảm bảo 100% không văng │
+│   góc nhìn (XAtlas)       │ │   lỗi hay treo hệ thống.  │
+└─────────────┬─────────────┘ └─────────────┬─────────────┘
+              │                             │
+              ▼                             ▼
+   [ XUẤT FILE .GLB ĐA ẢNH ]     [ XUẤT FILE .GLB CỨU HỘ ]
 ```
 
 ---
@@ -199,27 +260,30 @@ Từ việc phân tích 3 repo trên, ta thấy:
 
 ---
 
-### Thuật toán 0: Chuẩn hóa tỉ lệ, Canh tâm vật thể & Đồng bộ Camera Intrinsics (Foreground Scale & Aspect Normalization)
-- **Vấn đề cốt tử:**
-  1. *Độ phân giải & Tỉ lệ khung hình không đồng nhất:* Ảnh người dùng chụp thực tế có kích thước bất kỳ ($4:3, 16:9$, dọc, ngang). Các mô hình AI như Depth-Anything-V2 yêu cầu tensor chia hết cho 14 (chuẩn $518 \times 518$), DUSt3R/TripoSR yêu cầu khung vuông $512 \times 512$. Nếu resize trực tiếp (kéo dãn vô điều kiện), vật thể sẽ bị biến dạng hình học (dẹt hoặc kéo dài), dẫn đến 3D mesh bị méo mó vĩnh viễn.
-  2. *Cự ly chụp không đều (Scale Inconsistency):* Trong chuỗi $N$ ảnh, có ảnh chụp gần (vật thể chiếm 90% khung hình), có ảnh chụp xa (vật thể chỉ chiếm 35%). Sự chênh lệch này làm giảm độ nét chi tiết bề mặt và gây sai lệch mật độ điểm khi dung hợp.
-- **Quy trình giải thuật chuẩn hóa:**
-  1. *Trích xuất Bounding Box từ Alpha Mask:*
-     Từ mặt nạ phân đoạn $\mathbf{M} \in \{0, 1\}^{H \times W}$ sinh ra bởi RMBG-2.0:
-     $$x_{\min} = \min \{x \mid \mathbf{M}(y, x) > 0\}, \quad x_{\max} = \max \{x \mid \mathbf{M}(y, x) > 0\}$$
-     $$y_{\min} = \min \{y \mid \mathbf{M}(y, x) > 0\}, \quad y_{\max} = \max \{y \mid \mathbf{M}(y, x) > 0\}$$
-     Kích thước vật thể: $w_{\text{obj}} = x_{\max} - x_{\min}$, $h_{\text{obj}} = y_{\max} - y_{\min}$. Tâm vật thể: $(c_{x,\text{obj}}, c_{y,\text{obj}}) = (\frac{x_{\min} + x_{\max}}{2}, \frac{y_{\min} + y_{\max}}{2})$.
-  2. *Scale bảo toàn tỉ lệ (Aspect-ratio-preserving Scale):*
-     Chọn kích thước chuẩn hóa đích $S_{\text{target}} = 512$ pixel và hệ số chiếm dụng mục tiêu $\eta \approx 0.80 \sim 0.85$ (dành $15\% \sim 20\%$ lề biên an toàn để không bị cắt cạnh khi lọc viền).
-     Hệ số scale đồng nhất:
-     $$s = \frac{\eta \cdot S_{\text{target}}}{\max(w_{\text{obj}}, h_{\text{obj}})}$$
-  3. *Letterbox Centering & Square Padding:*
-     Dời tâm vật thể về chính giữa khung hình vuông $S_{\text{target}} \times S_{\text{target}}$:
-     $$\Delta x = \frac{S_{\text{target}}}{2} - s \cdot c_{x,\text{obj}}, \quad \Delta y = \frac{S_{\text{target}}}{2} - s \cdot c_{y,\text{obj}}$$
-     Toàn bộ viền ngoài được pad màu đen hoặc trong suốt (Alpha = 0).
-  4. *Đồng bộ Ma trận Camera Intrinsics ($K \to K'$):*
-     Khi ảnh bị biến đổi qua phép co dãn $s$ và tịnh tiến $(\Delta x, \Delta y)$, ma trận thông số nội tại camera $K$ phải được cập nhật tương ứng để bước Back-projection không bị sai lệch:
-     $$K' = \begin{bmatrix} s \cdot f_x & 0 & s \cdot c_x + \Delta x \\ 0 & s \cdot f_y & s \cdot c_y + \Delta y \\ 0 & 0 & 1 \end{bmatrix}$$
+### Thuật toán 0: Tiền Xử Lý Ảnh Phân Theo 2 Kịch Bản (Single-View vs. Multi-View)
+
+Giai đoạn 1 được tinh gọn chính xác thành 2 trường hợp thực tế:
+
+#### Trường hợp 1: Đơn ảnh ($N = 1$) — Bounding Box Canh Tâm & Chuẩn Hóa Tỉ Lệ (Scale Normalization)
+- **Mục tiêu:** Tối ưu hóa kích thước vật thể và đưa về khung vuông $512 \times 512$ cho Depth Anything V2 hoặc TripoSR.
+- **Quy trình:**
+  1. Tách nền bằng RMBG-2.0 lấy Alpha Mask $\mathbf{M} \in \{0, 1\}^{H \times W}$.
+  2. Xác định Bounding Box vật thể: $[x_{\min}, y_{\min}, x_{\max}, y_{\max}]$, tâm vật thể $(c_{x,\text{obj}}, c_{y,\text{obj}})$.
+  3. Scale bảo toàn Aspect Ratio để chiều lớn nhất chiếm $80\% \sim 85\%$ khung hình $512 \times 512$:
+     $$s = \frac{\eta \cdot S_{\text{target}}}{\max(w_{\text{obj}}, h_{\text{obj}})} \quad (S_{\text{target}} = 512, \eta \approx 0.82)$$
+  4. Canh giữa tâm và bù viền (Square Letterbox Padding).
+  5. Cập nhật ma trận Camera Intrinsics $K \to K'$ theo hệ số co dãn $s$ và độ dời tâm $(\Delta x, \Delta y)$ để bảo toàn tia chiếu ngược 3D.
+
+#### Trường hợp 2: Đa ảnh ($N = 4 \sim 8$ ảnh, tối ưu 6 ảnh) — Loader Giữ Nguyên Quang Học
+- **Giới hạn số lượng:** Hệ thống nhận tối ưu từ $4$ đến $8$ ảnh. Nếu người dùng tải lên nhiều hơn 8 ảnh, hệ thống tự động lọc giữ lại $6 \sim 8$ ảnh phân bổ góc đều nhất quanh $360^\circ$ nhằm giữ số cặp ảnh DUSt3R $\le 28$ cặp, đảm bảo không tràn VRAM GPU T4 và thời gian xử lý $< 10$s.
+- **Nguyên tắc sống còn:** **TUYỆT ĐỐI KHÔNG crop hoặc canh tâm Bounding Box riêng lẻ từng ảnh.**
+  - *Lý do:* Crop các khung khác nhau sẽ làm lệch tâm quang học $(c_x, c_y)$ bất đối xứng giữa các góc nhìn, phá vỡ cấu trúc Epipolar Geometry khiến DUSt3R dự đoán sai Pose.
+- **Quy trình:**
+  1. Sử dụng DUSt3R standard image loader: Resize đồng bộ giữ nguyên aspect ratio về kích thước cạnh tối đa 512px (giữ nguyên toàn bộ hậu cảnh để DUSt3R bám điểm đặc trưng).
+  2. RMBG-2.0 chạy song song để trích xuất Alpha Mask $\mathbf{M}_i$, lưu sẵn vào bộ nhớ tạm.
+  3. Áp dụng Histogram Matching giữa các ảnh nếu có sự chênh lệch ánh sáng lớn giữa các góc chụp.
+  4. Sau khi DUSt3R hoàn thành Global Alignment, dùng mask $\mathbf{M}_i$ để **Lọc bỏ điểm nền (Background Point Pruning)** trước khi tích lũy vào TSDF Volume:
+     $$\mathbf{X}_{i, \text{valid}}(u, v) = \begin{cases} \mathbf{X}_i(u, v) & \text{nếu } \mathbf{M}_i(u, v) = 1 \text{ và } \mathbf{C}_i(u, v) > \tau_{\text{conf}} \\ \text{Discard} & \text{ngược lại (thuộc nền hoặc nhiễu)} \end{cases}$$
 
 ---
 
@@ -234,18 +298,23 @@ Từ việc phân tích 3 repo trên, ta thấy:
 
 ---
 
-### Thuật toán 2: Dung hợp thể tích TSDF (TSDF Volumetric Fusion - Kế thừa từ NVIDIA)
-- **Bản chất:** Tạo một thể tích 3D hình hộp gồm hàng triệu ô voxel nhỏ (kích thước voxel $v_{\text{size}} = 2\text{mm} \sim 5\text{mm}$).
-- Với mỗi voxel tại tọa độ thế giới $\mathbf{p} = (X, Y, Z)^T$, chiếu ngược $\mathbf{p}$ về ảnh thứ $i$ sử dụng ma trận camera extrinsic $[R_i | T_i]$ và intrinsic $K$:
-  $$\mathbf{x}_i = K (R_i \mathbf{p} + T_i)$$
-  Độ sâu thực từ camera đến voxel là $z = (R_i \mathbf{p} + T_i)_z$.
-  Khoảng cách khoảng cách có dấu đến bề mặt quan sát được:
-  $$d_i(\mathbf{p}) = D_i(\mathbf{x}_i) - z$$
-- Cắt ngắn khoảng cách trong khoảng $[-\mu, +\mu]$:
-  $$\text{tsdf}_i(\mathbf{p}) = \max\left(-1, \min\left(1, \frac{d_i(\mathbf{p})}{\mu}\right)\right)$$
-- Tích lũy liên tục qua $N$ khung hình:
-  $$\mathbf{D}_{\text{new}}(\mathbf{p}) = \frac{\mathbf{W}_{\text{old}}(\mathbf{p}) \mathbf{D}_{\text{old}}(\mathbf{p}) + w_i \cdot \text{tsdf}_i(\mathbf{p})}{\mathbf{W}_{\text{old}}(\mathbf{p}) + w_i}$$
-  $$\mathbf{W}_{\text{new}}(\mathbf{p}) = \mathbf{W}_{\text{old}}(\mathbf{p}) + w_i$$
+### Thuật toán 2: Dựng Lưới 3D Bằng Không Gian Voxel TSDF (Tích Lũy Thể Tích Đa Ảnh)
+- **Giải thích trực quan bằng đời thường:**
+  - Hãy tưởng tượng không gian 3D bao quanh vật thể được chia thành hàng triệu khối lập phương nhỏ li ti (gọi là **Voxel** - tức "pixel trong không gian 3 chiều").
+  - Với mỗi góc chụp từ camera, hệ thống "bắn" các tia nhìn xuyên qua các voxel này. Mỗi voxel sẽ đo đạc xem nó đang nằm ở **phía trước**, **ngay trên bề mặt** hay **phía sau lưng** vật thể mà camera quan sát được (gọi là *Truncated Signed Distance Function - TSDF*).
+  - Khi quét đủ $N$ góc chụp quanh vật thể, các giá trị này được cộng dồn (tích lũy thể tích). Những điểm nhiễu bay lơ lửng ngẫu nhiên sẽ tự động bị triệt tiêu, để lại đường biên bề mặt sắc nét và chính xác tuyệt đối.
+- **Bản chất toán học:**
+  - Tạo một thể tích 3D hình hộp gồm các ô voxel nhỏ (kích thước voxel $v_{\text{size}} = 2\text{mm} \sim 5\text{mm}$).
+  - Với mỗi voxel tại tọa độ thế giới $\mathbf{p} = (X, Y, Z)^T$, chiếu ngược $\mathbf{p}$ về ảnh thứ $i$ sử dụng ma trận camera extrinsic $[R_i | T_i]$ và intrinsic $K$:
+    $$\mathbf{x}_i = K (R_i \mathbf{p} + T_i)$$
+    Độ sâu thực từ camera đến voxel là $z = (R_i \mathbf{p} + T_i)_z$.
+    Khoảng cách có dấu đến bề mặt quan sát được:
+    $$d_i(\mathbf{p}) = D_i(\mathbf{x}_i) - z$$
+  - Cắt ngắn khoảng cách trong khoảng $[-\mu, +\mu]$:
+    $$\text{tsdf}_i(\mathbf{p}) = \max\left(-1, \min\left(1, \frac{d_i(\mathbf{p})}{\mu}\right)\right)$$
+  - Tích lũy liên tục qua $N$ khung hình:
+    $$\mathbf{D}_{\text{new}}(\mathbf{p}) = \frac{\mathbf{W}_{\text{old}}(\mathbf{p}) \mathbf{D}_{\text{old}}(\mathbf{p}) + w_i \cdot \text{tsdf}_i(\mathbf{p})}{\mathbf{W}_{\text{old}}(\mathbf{p}) + w_i}$$
+    $$\mathbf{W}_{\text{new}}(\mathbf{p}) = \mathbf{W}_{\text{old}}(\mathbf{p}) + w_i$$
 
 ---
 
@@ -256,7 +325,8 @@ Từ việc phân tích 3 repo trên, ta thấy:
 
 ---
 
-### Thuật toán 4: Trải UV (XAtlas) & Hòa trộn màu sắc đa góc nhìn (Color Fusion)
+### Thuật toán 4: Trải UV (XAtlas) & Hòa trộn Texture Màu Cơ Bản (Base-Color Texture Blending)
+- **Chuẩn hóa thuật ngữ:** XAtlas + RGB blending chỉ cho **Base-Color Texture (Albedo map)**, **KHÔNG GỌI LÀ PBR TEXTURE**. Một mô hình chuẩn PBR đòi hỏi cả Normal map, Roughness map, Metallic map và Ambient Occlusion. Pipeline v1 tạo ra texture màu khuếch tán cơ bản thực tế từ ảnh chụp.
 1. **XAtlas UV Parameterization:** 
    - Nhận lưới tam giác từ Marching Cubes $\to$ Cắt lưới thành các mảng phẳng (charts) sao cho độ méo dãn (distortion) nhỏ nhất $\to$ Đóng gói (pack) vào khung UV $[0, 1] \times [0, 1]$.
 2. **Angle-Weighted Blending:**
@@ -272,17 +342,16 @@ Từ việc phân tích 3 repo trên, ta thấy:
 
 ## 📌 PHẦN 5: ĐÁNH GIÁ TÀI NGUYÊN & KHẢ THI TRÊN GOOGLE COLAB FREE (T4)
 
-| Thành phần trong Pipeline | GPU VRAM | RAM Hệ Thống | Thời Gian Xử Lý ($N=6$ ảnh) |
+| Thành phần trong Pipeline v1 | GPU VRAM | RAM Hệ Thống | Thời Gian Xử Lý ($N=6$ ảnh) |
 | :--- | :---: | :---: | :---: |
-| **1. RMBG-2.0 (Batch tuần tự)** | ~0.5 GB | ~1.0 GB | ~1.5 giây |
-| **2. DUSt3R Pose & Alignment** | ~5.0 GB | ~4.0 GB | ~3.5 giây |
-| **3. Depth-Anything-V2-Metric (FP16)** | ~0.4 GB | ~1.0 GB | ~0.8 giây |
-| **4. Edge Filtering (Numpy/Torch)** | ~0 | ~0.5 GB | ~0.1 giây |
-| **5. Open3D TSDF Volume + Marching Cubes**| ~0 (chạy CPU) | ~2.5 GB | ~1.2 giây |
-| **6. XAtlas UV + Texture Blending** | ~0 (chạy CPU) | ~2.0 GB | ~2.0 giây |
-| **TỔNG TOÀN BỘ PIPELINE** | **~5.5 GB / 15 GB** | **~6.5 GB / 12 GB** | **~9 - 10 GIÂY** |
+| **1. RMBG-2.0 (Mask extraction)** | ~0.5 GB | ~1.0 GB | ~1.5 giây |
+| **2. DUSt3R (Pose + Point-maps đồng nhất)** | ~5.0 GB | ~4.0 GB | ~3.5 giây |
+| **3. Background Point Pruning & Filtering** | ~0 | ~0.5 GB | ~0.1 giây |
+| **4. Open3D TSDF Volume + Marching Cubes** | ~0 (chạy CPU) | ~2.5 GB | ~1.2 giây |
+| **5. XAtlas UV + Base-color Texture Blending** | ~0 (chạy CPU) | ~2.0 GB | ~2.0 giây |
+| **TỔNG TOÀN BỘ PIPELINE V1** | **~5.0 GB / 15 GB** | **~6.0 GB / 12 GB** | **~8 - 9 GIÂY** |
 
 > 🎯 **Kết luận quan trọng:**
-> - Mức đỉnh VRAM tối đa chỉ đạt **~5.5 GB** (so với 15 GB của GPU T4), hoàn toàn không có rủi ro Out-Of-Memory (OOM).
-> - Mức tiêu thụ RAM hệ thống duy trì ở mức **~6.5 GB** (so với 12 GB RAM Colab), nằm trong vùng an toàn tuyệt đối.
-> - Tốc độ xuất ra file `.glb` hoàn chỉnh chỉ mất **dưới 10 giây cho 6 ảnh đầu vào**.
+> - Mức đỉnh VRAM tối đa chỉ đạt **~5.0 GB** (so với 15 GB của GPU T4), hoàn toàn an toàn, không có nguy cơ OOM.
+> - Bỏ qua bước chạy Depth-Anything riêng biệt giúp tiết kiệm cả VRAM lẫn thời gian, đồng thời triệt tiêu 100% lỗi lệch thang đo tọa độ.
+> - Tốc độ xuất ra file `.glb` hoàn chỉnh chỉ mất **dưới 9 giây cho 6 ảnh đầu vào**.
