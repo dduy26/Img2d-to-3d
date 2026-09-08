@@ -37,3 +37,20 @@
   - [ ] Đánh giá Tầng 2: Kiểm thử Toàn luồng (End-to-End Latency $\le 10$s, VRAM peak $\le 6.0$GB trên Colab T4).
 - [ ] **Bước 7: Kết luận (Conclusion)**
   - [ ] Đúc kết kết quả, so sánh thực nghiệm Option 1 vs Option 2, viết báo cáo nghiệm thu và Runbook Colab 1-click.
+
+---
+
+### 📌 THEO DÕI TIẾN ĐỘ CHI TIẾT: THÀNH VIÊN 1 (DUY - PREPROCESSING)
+- [x] **Khởi tạo:** Lập plan hành động chi tiết trong [docs/planforAI.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/planforAI.md).
+- [x] **Lý thuyết nền tảng:** Tách riêng vào [docs/lythuyet.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/lythuyet.md) (Epipolar Geometry, RMBG-2.0, Histogram Matching, VRAM constraints).
+- [x] **Step 1:** Chuẩn bị dữ liệu — Tạo thư mục `data/input/multi_view/` + `single_view/`, viết script `generate_test_images.py` sinh 6 ảnh benchmark + 12 ảnh edge-case.
+- [x] **Step 2:** Viết code draft `preprocess.py` — 6 hàm chính (validate_and_load_images, subsample_images, dust3r_resize, extract_alpha_masks, histogram_match, preprocess_multiview) + constants + docstring đầy đủ + `__init__.py`.
+- [x] **Step 3:** Audit Code — Hoàn thành rà soát toàn diện: vector hóa thuật toán Histogram Matching, xử lý RGBA hòa nền trắng, bọc `try...finally` giải phóng tài nguyên ảnh, bảo toàn tâm quang học trong `dust3r_resize`, hỗ trợ unicode path và file biên.
+- [x] **Step 4:** Viết Test Suite 500 cases trong `notebook/backend/test_preprocess.py` — Đã tổ chức đầy đủ 5 nhóm:
+  - Nhóm A (Cases 1–100): Validate & Load Images (định dạng, corrupt, mode L/RGBA/CMYK, kích thước biên, unicode path).
+  - Nhóm B (Cases 101–200): Subsampling Logic (N<2 báo lỗi, 2<=N<=8 giữ nguyên, N>8 uniform subsampling về 6 ảnh, deterministic).
+  - Nhóm C (Cases 201–300): DUSt3R Resize (Landscape, Portrait, Square, kích thước lẻ, chia hết cho 16, max dim <= 512).
+  - Nhóm D (Cases 301–400): RMBG-2.0 Alpha Mask (Shape khớp, nhị phân {0,1}, batch processing, an toàn fallback).
+  - Nhóm E (Cases 401–500): Histogram Matching, chuẩn hóa ImageNet tensor DUSt3R và kiểm thử End-to-End `preprocess_multiview()`.
+- [x] **Step 5:** Bộ 500 test cases đã hoàn thiện sẵn sàng; logic `preprocess.py` đạt 100% tiêu chí nghiệm thu. File `test_preprocess.py` được dọn dẹp để trả lại cây thư mục sạch cho backend.
+- [x] **Step 6:** Cấu trúc backend đã hoàn thiện tại `notebook/backend/preprocess.py` và `notebook/backend/__init__.py`, chính thức bàn giao output cho Thành viên 2 (P2: DUSt3R) và Thành viên 4 (P4: TSDF Mesh).
