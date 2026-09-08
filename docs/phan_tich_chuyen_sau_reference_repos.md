@@ -151,7 +151,11 @@ Từ việc phân tích 3 repo trên, ta thấy:
                ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │ GIAI ĐOẠN 1: TIỀN XỬ LÝ ẢNH (PREPROCESSING)                     │
-│ • RMBG-2.0: Tách nền từng ảnh, bảo tồn tâm ảnh (W, H)            │
+│ • RMBG-2.0: Tách nền từng ảnh, trích xuất Alpha Mask             │
+│ • Chuẩn hóa tỉ lệ & Canh tâm (Scale & Centering Normalization):  │
+│   - Crop Bounding Box từ Alpha Mask, đưa tâm vật thể về giữa     │
+│   - Resize bảo toàn Aspect Ratio + Square Letterbox Padding      │
+│   - Đưa toàn bộ N ảnh về cùng 1 độ phân giải chuẩn (512×512)     │
 │ • Cân bằng sáng & màu sắc (Histogram Matching giữa các ảnh)       │
 └──────────────────────────────────────────────────────────────────┘
                │
@@ -192,6 +196,30 @@ Từ việc phân tích 3 repo trên, ta thấy:
 ---
 
 ## 📌 PHẦN 4: CHI TIẾT TỪNG THUẬT TOÁN & BẢN CHẤT TOÁN HỌC
+
+---
+
+### Thuật toán 0: Chuẩn hóa tỉ lệ, Canh tâm vật thể & Đồng bộ Camera Intrinsics (Foreground Scale & Aspect Normalization)
+- **Vấn đề cốt tử:**
+  1. *Độ phân giải & Tỉ lệ khung hình không đồng nhất:* Ảnh người dùng chụp thực tế có kích thước bất kỳ ($4:3, 16:9$, dọc, ngang). Các mô hình AI như Depth-Anything-V2 yêu cầu tensor chia hết cho 14 (chuẩn $518 \times 518$), DUSt3R/TripoSR yêu cầu khung vuông $512 \times 512$. Nếu resize trực tiếp (kéo dãn vô điều kiện), vật thể sẽ bị biến dạng hình học (dẹt hoặc kéo dài), dẫn đến 3D mesh bị méo mó vĩnh viễn.
+  2. *Cự ly chụp không đều (Scale Inconsistency):* Trong chuỗi $N$ ảnh, có ảnh chụp gần (vật thể chiếm 90% khung hình), có ảnh chụp xa (vật thể chỉ chiếm 35%). Sự chênh lệch này làm giảm độ nét chi tiết bề mặt và gây sai lệch mật độ điểm khi dung hợp.
+- **Quy trình giải thuật chuẩn hóa:**
+  1. *Trích xuất Bounding Box từ Alpha Mask:*
+     Từ mặt nạ phân đoạn $\mathbf{M} \in \{0, 1\}^{H \times W}$ sinh ra bởi RMBG-2.0:
+     $$x_{\min} = \min \{x \mid \mathbf{M}(y, x) > 0\}, \quad x_{\max} = \max \{x \mid \mathbf{M}(y, x) > 0\}$$
+     $$y_{\min} = \min \{y \mid \mathbf{M}(y, x) > 0\}, \quad y_{\max} = \max \{y \mid \mathbf{M}(y, x) > 0\}$$
+     Kích thước vật thể: $w_{\text{obj}} = x_{\max} - x_{\min}$, $h_{\text{obj}} = y_{\max} - y_{\min}$. Tâm vật thể: $(c_{x,\text{obj}}, c_{y,\text{obj}}) = (\frac{x_{\min} + x_{\max}}{2}, \frac{y_{\min} + y_{\max}}{2})$.
+  2. *Scale bảo toàn tỉ lệ (Aspect-ratio-preserving Scale):*
+     Chọn kích thước chuẩn hóa đích $S_{\text{target}} = 512$ pixel và hệ số chiếm dụng mục tiêu $\eta \approx 0.80 \sim 0.85$ (dành $15\% \sim 20\%$ lề biên an toàn để không bị cắt cạnh khi lọc viền).
+     Hệ số scale đồng nhất:
+     $$s = \frac{\eta \cdot S_{\text{target}}}{\max(w_{\text{obj}}, h_{\text{obj}})}$$
+  3. *Letterbox Centering & Square Padding:*
+     Dời tâm vật thể về chính giữa khung hình vuông $S_{\text{target}} \times S_{\text{target}}$:
+     $$\Delta x = \frac{S_{\text{target}}}{2} - s \cdot c_{x,\text{obj}}, \quad \Delta y = \frac{S_{\text{target}}}{2} - s \cdot c_{y,\text{obj}}$$
+     Toàn bộ viền ngoài được pad màu đen hoặc trong suốt (Alpha = 0).
+  4. *Đồng bộ Ma trận Camera Intrinsics ($K \to K'$):*
+     Khi ảnh bị biến đổi qua phép co dãn $s$ và tịnh tiến $(\Delta x, \Delta y)$, ma trận thông số nội tại camera $K$ phải được cập nhật tương ứng để bước Back-projection không bị sai lệch:
+     $$K' = \begin{bmatrix} s \cdot f_x & 0 & s \cdot c_x + \Delta x \\ 0 & s \cdot f_y & s \cdot c_y + \Delta y \\ 0 & 0 & 1 \end{bmatrix}$$
 
 ---
 

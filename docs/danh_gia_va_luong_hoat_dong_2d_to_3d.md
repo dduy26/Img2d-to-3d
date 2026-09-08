@@ -201,9 +201,10 @@ Dưới đây là thiết kế kiến trúc chuẩn hóa toàn diện cho dự �
     ↓
 ┌─────────────────────────────────────────────────────────┐
 │  BƯỚC 1: TIỀN XỬ LÝ ẢNH                                │
-│  - Thuật toán: Image Segmentation                       │
+│  - Thuật toán: Image Segmentation & Scale Normalization │
 │  - Mô hình: RMBG-2.0 (BriaAI)                           │
-│  - Thư viện: transformers + PIL                         │
+│  - Thao tác: Tách nền, Canh tâm & Scale về tỉ lệ chuẩn  │
+│  - Thư viện: transformers + PIL + torchvision           │
 │  - VRAM: ~0.5GB | Thời gian: < 1s                       │
 └─────────────────────────────────────────────────────────┘
     ↓
@@ -443,11 +444,16 @@ print(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f}GB")
 
 ### 2. Phân tích & Phản biện chi tiết 4 bước gợi ý khi áp dụng cho N ảnh
 
-#### Bước 1: Tiền xử lý ảnh (Image Preprocessing - RMBG / BRIA)
+#### Bước 1: Tiền xử lý ảnh (Image Preprocessing - RMBG / BRIA & Scale Normalization)
 - **Đánh giá:** ✅ **Vẫn cực kỳ cần thiết và tối ưu.**
 - **Điểm cần hiệu chỉnh cho N ảnh:**
   - **Batch Inference / Tuần tự:** Với $N$ ảnh, chạy tuần tự từng ảnh qua RMBG-2.0 trên GPU T4 để giữ VRAM < 0.5GB. Thời gian xử lý cho $N = 4 \sim 10$ ảnh chỉ mất khoảng $1 \sim 3$ giây.
-  - **Nhất quán mặt nạ (Mask Consistency):** Các ảnh chụp từ các góc khác nhau cần được tách nền sạch sẽ và giữ nguyên kích thước gốc $(W, H)$ cùng tâm ảnh (Center alignment). Không được tự ý crop lệch làm méo ma trận camera intrinsics ($c_x, c_y$).
+  - **Chuẩn hóa Tỉ lệ & Canh tâm vật thể (Scale & Centering Normalization):**
+    - Ảnh chụp đa góc nhìn thực tế thường có độ phân giải và cự ly khác nhau (góc chụp gần vật thể to, góc chụp xa vật thể nhỏ).
+    - Sau khi trích xuất Alpha Mask bằng RMBG-2.0, hệ thống tính Bounding Box của vật thể $\to$ căn giữa khung hình $\to$ scale theo tỉ lệ bảo toàn Aspect Ratio (để vật thể chiếm ~80-85% diện tích) và Square Letterbox Padding về kích thước vuông duy nhất chuẩn (ví dụ $512 \times 512$).
+    - Thao tác này ngăn chặn hiện tượng méo mó hình học (so với việc resize ép dẹt/kéo dài) và đồng bộ độ phân giải chi tiết bề mặt trước khi đưa vào các mô hình downstream.
+  - **Bảo toàn & Cập nhật Ma trận Camera Intrinsics ($K$):**
+    - Khi ảnh bị scale theo hệ số $s$ và padding dời tâm $(\Delta x, \Delta y)$, ma trận tiêu cự $K$ phải được cập nhật tương ứng ($f'_x = s \cdot f_x, c'_x = s \cdot c_x + \Delta x \dots$) để các tia chiếu ngược (Back-projection rays) và TSDF Fusion không bị lệch hình học.
   - ⚠️ **Mắt xích bị thiếu trong gợi ý ban đầu:** **Ước lượng vị trí Camera (Camera Pose Estimation).** Nếu $N$ ảnh do người dùng chụp tự do (Uncalibrated multi-view), bạn **không thể** ghép chúng lại thành 3D nếu không biết mỗi ảnh được chụp từ tọa độ nào!
     - *Giải pháp:* Dùng **DUSt3R / MASt3R** (mô hình AI mới không cần pose trước) hoặc **COLMAP SFM (Structure from Motion)** / **SuperPoint + LightGlue** để tìm tương quan góc nhìn.
 
@@ -519,7 +525,7 @@ print(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f}GB")
 ```
 [N Ảnh 2D Input (N = 2 ~ 10 ảnh)]
        ↓
-[RMBG-2.0 Batch] (Tách nền từng ảnh, < 0.5GB VRAM)
+[RMBG-2.0 + Scale Normalization] (Tách nền, Canh tâm & Pad về 512×512 chuẩn)
        ↓
 [DUSt3R / MASt3R Model] (Dự đoán đồng thời Camera Poses + Point Clouds đồng nhất)
        ↓
@@ -561,7 +567,7 @@ print(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f}GB")
 
 | Bước | Đề xuất ban đầu (Leader/Gợi ý) | Thực tế áp dụng cho N ảnh | Khuyến nghị tối ưu cho Colab T4 |
 | :--- | :--- | :--- | :--- |
-| **1. Tiền xử lý** | RMBG-2.0 / BRIA | ✅ Tốt, cần chạy tuần tự batch cho $N$ ảnh | Dùng **RMBG-2.0**, giữ nguyên center & aspect ratio |
+| **1. Tiền xử lý** | RMBG-2.0 / BRIA | ✅ Tốt, cần chạy tuần tự batch cho $N$ ảnh | Dùng **RMBG-2.0 + Scale Normalization** (Letterbox 512×512, canh tâm & giữ aspect ratio) |
 | **Bổ sung bắt buộc** | _Không đề cập_ | ⚠️ Cần ước lượng Camera Pose giữa các ảnh | Dùng **DUSt3R** (tự động pose & depth cùng lúc) |
 | **2. Suy luận 3D** | Depth Anything V2 hoặc TripoSR | ❌ TripoSR chỉ nhận 1 ảnh; Depth Anything bị lỗi scale ambiguity giữa các ảnh | • Hướng hình học: **DUSt3R**<br>• Hướng Feed-forward: **LGM (4 views)** |
 | **3. Dựng lưới Mesh** | Marching Cubes / Poisson | ✅ **Marching Cubes cực kỳ tối ưu** khi kết hợp cùng TSDF Fusion đa ảnh | **TSDF Fusion + Marching Cubes** (hoặc Poisson nếu từ Dense Point Cloud) |
