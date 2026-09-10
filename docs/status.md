@@ -27,7 +27,7 @@
     5. Chuẩn hóa sơ đồ Pipeline độc lập 2 nhánh (Single-view & Multi-view) chống tràn viền, bổ sung biểu đồ Mermaid tương tác.
 - [ ] **Bước 5: Hiện thực hóa (Implementation) — Ưu tiên Kịch bản 2 (Đa ảnh) với ma trận 6 thành viên:**
   - [ ] P1 (Data & Preprocessing): `preprocess.py` (DUSt3R loader + RMBG-2.0 mask + Histogram Matching).
-  - [ ] P2 (Pose & 3D Geometry AI): `engine_dust3r.py` (Pairwise matching, Global alignment, Point-maps).
+  - [x] P2 (Pose & 3D Geometry AI): `engine_dust3r.py` (Pairwise matching, Global alignment, Point-maps).
   - [ ] P3 (Quality Gate & Fail-safe): `quality_gate.py` (3 lớp kiểm tra) & `engine_triposr.py` (Cứu hộ fallback).
   - [ ] P4 (3D Volumetric Mesh): `engine_tsdf_mesh.py` (Pruning điểm nền + Voxel TSDF + Marching Cubes).
   - [ ] P5 (Texture & UV Shading): `texture_blender.py` & `utils_3d.py` (XAtlas UV + Color Blending + Xuất GLB).
@@ -54,3 +54,11 @@
   - Nhóm E (Cases 401–500): Histogram Matching, chuẩn hóa ImageNet tensor DUSt3R và kiểm thử End-to-End `preprocess_multiview()`.
 - [x] **Step 5:** Bộ 500 test cases đã hoàn thiện sẵn sàng; logic `preprocess.py` đạt 100% tiêu chí nghiệm thu. File `test_preprocess.py` được dọn dẹp để trả lại cây thư mục sạch cho backend.
 - [x] **Step 6:** Cấu trúc backend đã hoàn thiện tại `notebook/backend/preprocess.py` và `notebook/backend/__init__.py`, chính thức bàn giao output cho Thành viên 2 (P2: DUSt3R) và Thành viên 4 (P4: TSDF Mesh).
+
+---
+
+### 📌 THEO DÕI TIẾN ĐỘ CHI TIẾT: THÀNH VIÊN 2 (HUY)
+- [x] **Khởi tạo:** Lên kế hoạch Part 2 trong `planforAI.md`.
+- [x] **Lý thuyết:** Bổ sung lý thuyết DUSt3R, Camera Pose vào `lythuyet.md`.
+- [x] **Code & Audit:** Hoàn thành `engine_dust3r.py` với class `DUSt3REngine` và tự audit code tối ưu VRAM.
+- [x] **Test:** Hoàn thành unit tests với mock data trong `test_dust3r.py` và đã dọn dẹp file test tạm theo yêu cầu.

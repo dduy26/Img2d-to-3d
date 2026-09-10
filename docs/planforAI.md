@@ -181,3 +181,46 @@ def preprocess_multiview(
 | 4 | Audit code | Qua rà soát: logic, bộ nhớ, edge cases, docstring, naming |
 | 5 | Thời gian xử lý | $\le 2.0$s (GPU T4) hoặc $\le 5.0$s (CPU) cho 6 ảnh |
 | 6 | Tính độc lập | Chạy `test_preprocess.py` thành công mà không cần code của P2~P6 |
+
+
+---
+
+# 🚀 KẾ HOẠCH TRIỂN KHAI CHI TIẾT: THÀNH VIÊN 2 (HUY)
+## VỊ TRÍ: ƯỚC LƯỢNG 3D & CAMERA POSE (DUSt3R)
+
+> **Người thực hiện:** HUY (Thành viên 2 - P2)  
+> **Lý thuyết nền tảng:** [docs/lythuyet.md](file:///C:/Users/ADMIN/Downloads/Img2d-to-3d-main/Img2d-to-3d-main/docs/lythuyet.md)  
+> **Căn cứ plan tổng thể:** [docs/plan.md](file:///C:/Users/ADMIN/Downloads/Img2d-to-3d-main/Img2d-to-3d-main/docs/plan.md)  
+> **Phạm vi mã nguồn chịu trách nhiệm:**
+> - `notebook/backend/engine_dust3r.py` (Lõi DUSt3REngine).
+> - `notebook/backend/test_dust3r.py` (Test suite cho DUSt3R).
+
+---
+
+## 📦 PHẦN 1: CẤU TRÚC & GIAO DIỆN
+
+### 1.1 Hợp đồng dữ liệu (Interface Contract):
+- **Input:** dict từ `preprocess_multiview` (của P1), bao gồm `images_dust3r` (Tensor N,3,H,W chuẩn hóa ImageNet), `original_sizes`.
+- **Output:**
+  - `pointmaps_3d`: Điểm 3D tại mỗi pixel (N, H, W, 3) trong cùng hệ tọa độ toàn cục.
+  - `confidence_masks`: Độ tin cậy tại mỗi điểm (N, H, W).
+  - `camera_poses`: Danh sách ma trận 4x4 (R, T) của các góc nhìn.
+  - `focal_lengths`: Tiêu cự ước lượng (f_x, f_y).
+
+## 🛠️ PHẦN 2: LỘ TRÌNH THỰC HIỆN
+
+### Step 1: Viết module `engine_dust3r.py`
+- Tạo class `DUSt3REngine`.
+- Hàm `load_model()`: Khởi tạo mô hình ViT từ pretrained weights.
+- Hàm `run_pairwise_matching()`: Tính toán pose và point-map giữa các cặp ảnh.
+- Hàm `run_global_alignment()`: Tối ưu Global alignment.
+- Hàm `process()`: pipeline chính gọi các hàm trên.
+
+### Step 2: Tự Audit Code
+- Tối ưu GPU VRAM (dọn dẹp cache, dùng context `torch.no_grad()`).
+- Bắt lỗi ngoại lệ (OOM, input không hợp lệ).
+- Nhận xét tự Audit Code ghi tại cuối file dưới dạng comment.
+
+### Step 3: Viết Test Case `test_dust3r.py`
+- Viết unit tests kiểm thử độc lập các hàm của `DUSt3REngine`.
+- Sử dụng mock data (tensor) để test logic.
