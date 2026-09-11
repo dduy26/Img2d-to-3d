@@ -62,3 +62,16 @@
 - [x] **Lý thuyết:** Bổ sung lý thuyết DUSt3R, Camera Pose vào `lythuyet.md`.
 - [x] **Code & Audit:** Hoàn thành `engine_dust3r.py` với class `DUSt3REngine` và tự audit code tối ưu VRAM.
 - [x] **Test:** Hoàn thành unit tests với mock data trong `test_dust3r.py` và đã dọn dẹp file test tạm theo yêu cầu.
+
+---
+### 📌 THEO DÕI TIẾN ĐỘ CHI TIẾT: THÀNH VIÊN 3 (ĐỨC)
+- [x] **Khởi tạo & Kiến trúc Backend:** Xây dựng máy chủ FastAPI (`app.py`) làm trung tâm điều phối, cấu hình tự động khởi tạo thư mục `temp_uploads` và `outputs`.
+- [x] **Cổng kiểm định chất lượng (`quality_gate.py`):** Hiện thực hóa thuật toán kiểm tra không gian 3D (sử dụng Cosine Similarity đánh giá góc lệch overlap camera, kiểm tra Confidence map và Bundle Adjustment Loss).
+- [x] **Động cơ cứu hộ dự phòng (`engine_triposr.py`):** Tích hợp mô hình TripoSR kết hợp `rembg` để chạy luồng tạo mô hình 3D khẩn cấp từ 1 ảnh đơn khi dữ liệu không đạt chuẩn.
+- [x] **Khắc phục toàn diện các điểm nghẽn kỹ thuật (Bug Fixes):**
+  - Xử lý bất đồng nhất kênh màu RGBA sang RGB bằng lớp lót nền trắng (`white_bg`).
+  - Khắc phục triệt để lỗi tràn RAM (OOM) trên CPU bằng cách tối ưu hạ độ phân giải lưới xuống `resolution=128`.
+  - Fix lỗi cú pháp TripoSR (`has_vertex_color=True`) và tối ưu lệnh xuất file trực tiếp qua `mesh.export()`.
+- [x] **Nghiệm thu End-to-End & KPI:** Kiểm chứng toàn bộ chuỗi xử lý qua giao diện Swagger UI, xác nhận xuất thành công file định dạng `.glb` và bảo vệ thành công chuẩn thời gian phản hồi $\le 2.0$ giây.
+- [x] **Hoàn thiện tài liệu hệ thống (`README.md`):** Đóng gói toàn bộ tài liệu hướng dẫn cài đặt, cấu trúc thư mục, luồng hoạt động và tổng hợp các bản vá lỗi kỹ thuật cốt lõi.
+---
