@@ -3,6 +3,7 @@
 Phân hệ này là một phần của hệ thống tạo mô hình 3D từ ảnh 2D. Nhiệm vụ chính của phân hệ là kiểm tra chất lượng dữ liệu đầu vào (Quality Gate) và cung cấp một cơ chế tạo mô hình 3D dự phòng siêu tốc bằng **TripoSR** trong trường hợp dữ liệu không đạt chuẩn (Fail-safe), đảm bảo KPI thời gian phản hồi $\le 2$s.
 
 ---
+.\.venv\Scripts\python.exe notebook/backend/app.py --single data/input/multi_view/test.jpg
 
 ## Mục lục
 1. [Cấu trúc thư mục](#1-cấu-trúc-thư-mục)
