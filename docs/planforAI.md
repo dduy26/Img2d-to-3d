@@ -224,3 +224,82 @@ def preprocess_multiview(
 ### Step 3: Viết Test Case `test_dust3r.py`
 - Viết unit tests kiểm thử độc lập các hàm của `DUSt3REngine`.
 - Sử dụng mock data (tensor) để test logic.
+
+---
+## PHẦN 3: CẤU TRÚC FILE & HỢP ĐỒNG GIAO DIỆN (INTERFACE CONTRACT)
+
+### 3.1 Cây thư mục liên quan trực tiếp đến Quality Gate & Fail-safe Engine:
+```text
+Img2d-to-3d/
+├── notebook/
+│   └── backend/
+│       ├── tsr/                     # Thư mục mã nguồn lõi của TripoSR (cần clone từ repo gốc)
+│       ├── app.py                   # FILE CHÍNH - Máy chủ FastAPI điều phối luồng
+│       ├── quality_gate.py          # Module cổng lọc chất lượng (Cosine Similarity)
+│       ├── engine_triposr.py        # Module động cơ cứu hộ dự phòng
+│       ├── temp_uploads/            # Thư mục tự động tạo lưu ảnh input
+│       └── outputs/                 # Thư mục tự động tạo lưu kết quả .glb
+└── docs/
+    └── status.md                    # Cập nhật tiến độ sau mỗi step (bổ sung, không ghi đè)
+```
+
+### 3.2 Hợp đồng giao diện (Các API & Hàm cốt lõi bàn giao cho toàn hệ thống):
+
+```Python
+# ==========================================
+# 1. API ĐIỀU PHỐI (app.py)
+# ==========================================
+@app.post("/generate-3d/")
+async def generate_3d(file: UploadFile = File(...)) -> Dict[str, Any]:
+    """
+    Endpoint chính nhận yêu cầu tạo 3D. 
+    Điều phối dữ liệu qua Quality Gate và quyết định gọi DUST3R (Main) hay TripoSR (Fail-safe).
+
+    Returns:
+        dict chứa:
+            'status': str ("success" hoặc "failed")
+            'quality_passed': bool (Kết quả đánh giá từ cổng kiểm định)
+            'gate_reason': str (Lý do chi tiết nếu bị đánh rớt)
+            'execution_time_seconds': float (KPI đo lường thời gian <= 2s)
+            'output_file': str (Đường dẫn tới file .glb thành phẩm)
+    """
+
+# ==========================================
+# 2. CỔNG KIỂM ĐỊNH (quality_gate.py)
+# ==========================================
+class QualityGate:
+    def evaluate(
+        self, 
+        poses: List[np.ndarray], 
+        confidence_map: np.ndarray, 
+        ba_loss: float
+    ) -> Tuple[bool, str]:
+        """
+        Đánh giá chất lượng dữ liệu 3D không gian dựa trên ngưỡng toán học.
+        - Kiểm tra độ lệch góc Camera bằng Cosine Similarity
+        - Kiểm tra Confidence & Bundle Adjustment Loss
+
+        Returns:
+            Tuple[bool, str] chứa (is_valid, reason)
+        """
+
+# ==========================================
+# 3. ĐỘNG CƠ CỨU HỘ (engine_triposr.py)
+# ==========================================
+class TripoSREngine:
+    def run_fallback(
+        self, 
+        image_path: str, 
+        output_glb_path: str
+    ) -> Tuple[bool, str, float]:
+        """
+        Kích hoạt quy trình tạo 3D khẩn cấp khi Quality Gate báo lỗi.
+        - Tiền xử lý: Tách nền rembg, ép định dạng RGB phông trắng.
+        - Xử lý: Nặn mesh 3D qua TripoSR (resolution=128 tối ưu RAM).
+        - Hậu xử lý: Trực tiếp xuất file mesh.export().
+
+        Returns:
+            Tuple[bool, str, float] chứa (success, model_path, execution_time)
+        """
+```
+

@@ -35,3 +35,21 @@ node_modules/
 # Output dữ liệu sinh ra
 data/output/*
 !data/output/.gitkeep
+
+# ============================================================================
+# TripoSR — Mã nguồn bên thứ 3 (clone riêng theo hướng dẫn README)
+# Không push vào repo vì nặng (~2GB model weights) và có .git riêng
+# ============================================================================
+notebook/backend/tsr/
+
+# Model weights & checkpoints (tự tải từ HuggingFace)
+*.ckpt
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Temp uploads & generated outputs (dữ liệu runtime)
+notebook/backend/temp_uploads/
+notebook/backend/outputs/

@@ -28,7 +28,7 @@
 - [ ] **Bước 5: Hiện thực hóa (Implementation) — Ưu tiên Kịch bản 2 (Đa ảnh) với ma trận 6 thành viên:**
   - [ ] P1 (Data & Preprocessing): `preprocess.py` (DUSt3R loader + RMBG-2.0 mask + Histogram Matching).
   - [x] P2 (Pose & 3D Geometry AI): `engine_dust3r.py` (Pairwise matching, Global alignment, Point-maps).
-  - [ ] P3 (Quality Gate & Fail-safe): `quality_gate.py` (3 lớp kiểm tra) & `engine_triposr.py` (Cứu hộ fallback).
+  - [x] P3 (Quality Gate & Fail-safe): `quality_gate.py` (3 lớp kiểm tra) & `engine_triposr.py` (Cứu hộ fallback) & `app.py` (Nối pipeline P1→P2→P3→Fallback).
   - [ ] P4 (3D Volumetric Mesh): `engine_tsdf_mesh.py` (Pruning điểm nền + Voxel TSDF + Marching Cubes).
   - [ ] P5 (Texture & UV Shading): `texture_blender.py` & `utils_3d.py` (XAtlas UV + Color Blending + Xuất GLB).
   - [ ] P6 (Full-Stack & Cloud Lead): `main.py` (FastAPI), Web Three.js (`frontend/`), Runbook Colab Tunnel.
@@ -62,3 +62,23 @@
 - [x] **Lý thuyết:** Bổ sung lý thuyết DUSt3R, Camera Pose vào `lythuyet.md`.
 - [x] **Code & Audit:** Hoàn thành `engine_dust3r.py` với class `DUSt3REngine` và tự audit code tối ưu VRAM.
 - [x] **Test:** Hoàn thành unit tests với mock data trong `test_dust3r.py` và đã dọn dẹp file test tạm theo yêu cầu.
+
+---
+### 📌 THEO DÕI TIẾN ĐỘ CHI TIẾT: THÀNH VIÊN 3 (ĐỨC)
+- [x] **Khởi tạo & Kiến trúc Backend:** Xây dựng máy chủ FastAPI (`app.py`) làm trung tâm điều phối, cấu hình tự động khởi tạo thư mục `temp_uploads` và `outputs`.
+- [x] **Cổng kiểm định chất lượng (`quality_gate.py`):** Hiện thực hóa thuật toán kiểm tra không gian 3D (sử dụng Cosine Similarity đánh giá góc lệch overlap camera, kiểm tra Confidence map và Bundle Adjustment Loss).
+- [x] **Động cơ cứu hộ dự phòng (`engine_triposr.py`):** Tích hợp mô hình TripoSR kết hợp `rembg` để chạy luồng tạo mô hình 3D khẩn cấp từ 1 ảnh đơn khi dữ liệu không đạt chuẩn.
+- [x] **Khắc phục toàn diện các điểm nghẽn kỹ thuật (Bug Fixes):**
+  - Xử lý bất đồng nhất kênh màu RGBA sang RGB bằng lớp lót nền trắng (`white_bg`).
+  - Khắc phục triệt để lỗi tràn RAM (OOM) trên CPU bằng cách tối ưu hạ độ phân giải lưới xuống `resolution=128`.
+  - Fix lỗi cú pháp TripoSR (`has_vertex_color=True`) và tối ưu lệnh xuất file trực tiếp qua `mesh.export()`.
+- [x] **Nghiệm thu End-to-End & KPI:** Kiểm chứng toàn bộ chuỗi xử lý qua giao diện Swagger UI, xác nhận xuất thành công file định dạng `.glb` và bảo vệ thành công chuẩn thời gian phản hồi $\le 2.0$ giây.
+- [x] **Hoàn thiện tài liệu hệ thống (`README.md`):** Đóng gói toàn bộ tài liệu hướng dẫn cài đặt, cấu trúc thư mục, luồng hoạt động và tổng hợp các bản vá lỗi kỹ thuật cốt lõi.
+- [x] **Nối Pipeline đầy đủ (`app.py` v2):** Tích hợp toàn bộ luồng xử lý End-to-End trong `app.py`:
+  - Nối P1 Preprocessing (`preprocess_multiview`) → P2 DUSt3R (`DUSt3REngine.process`) → P3 Quality Gate (`QualityGate.evaluate`) → TripoSR Fallback.
+  - Hỗ trợ 2 chế độ: **Single-image** (1 ảnh → TripoSR trực tiếp) và **Multi-view** (≥2 ảnh → Full pipeline).
+  - API mới `POST /generate-3d/` nhận `List[UploadFile]` thay vì 1 file, tự phân luồng theo số ảnh.
+  - Giữ API cũ tương thích tại `POST /generate-3d/single/`.
+  - Cấu hình `.gitignore` loại trừ `tsr/` (TripoSR source ~2GB), model weights, temp_uploads và outputs.
+  - **Lưu ý:** P2 DUSt3R vẫn là mock engine (trả random data) → Quality Gate nhận mock → cả 2 nhánh PASS/FAIL đều tạm dùng TripoSR. Khi P2 thật và P4 (TSDF Mesh) hoàn thiện sẽ nối tiếp.
+---
