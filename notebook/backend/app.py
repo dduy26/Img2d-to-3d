@@ -9,6 +9,7 @@ import time
 import glob
 import numpy as np
 import logging
+from PIL import Image
 
 try:
     import torch
@@ -157,13 +158,30 @@ async def generate_3d(files: List[UploadFile] = File(...)):
             images_tensor = preprocess_result["images_normalized"]
 
         dust3r_result = dust3r_engine.process({
-            "images_dust3r": images_tensor
+            "images_dust3r": images_tensor,
+            "image_paths": saved_paths,   # P2 bản thật (DUSt3R) nạp ảnh từ đây
         })
 
         pointmaps_3d = dust3r_result["pointmaps_3d"]
         confidence_masks = dust3r_result["confidence_masks"]
         camera_poses = dust3r_result["camera_poses"]
         focal_lengths = dust3r_result["focal_lengths"]
+
+        # P2 bản thật chạy DUSt3R ở geometry riêng (cạnh dài 512, crop bội số 16) ->
+        # căn lại alpha mask & ảnh RGB về đúng geometry đó, nếu không thì mask lệch
+        # từng pixel so với pointmap và P4 sẽ đắp TSDF sai chỗ.
+        geom = dust3r_result.get("geometry")
+        if geom is not None:
+            target = (int(geom[1]), int(geom[0]))          # PIL size = (W, H)
+            preprocess_result["alpha_masks"] = [
+                np.asarray(Image.fromarray(np.asarray(m, dtype=np.uint8)).resize(target, Image.NEAREST))
+                for m in preprocess_result["alpha_masks"]
+            ]
+            preprocess_result["images_rgb"] = [
+                np.asarray(Image.fromarray(np.asarray(a, dtype=np.uint8)).resize(target, Image.BILINEAR))
+                for a in preprocess_result["images_rgb"]
+            ]
+            logger.info(f"[P2->P4/P5] Đã căn alpha mask & ảnh RGB về geometry {geom}")
 
         logger.info(
             f"[P2] Hoàn tất: pointmaps shape={pointmaps_3d.shape}, "
@@ -173,8 +191,8 @@ async def generate_3d(files: List[UploadFile] = File(...)):
         # ── Bước 3 (P3): Quality Gate ──
         logger.info("[P3] Đánh giá chất lượng qua Quality Gate...")
         
-        # Tính BA loss giả lập (TODO: lấy từ DUSt3R global alignment thực tế)
-        ba_loss = 1.0  # Placeholder - sẽ được thay bằng loss thực từ DUSt3R
+        # BA loss thật lấy từ DUSt3R global alignment (chế độ mock trả 1.0)
+        ba_loss = dust3r_result.get("ba_loss", 1.0)
         
         if hasattr(confidence_masks, 'cpu'):
             confidence_np = confidence_masks.cpu().numpy()
@@ -230,6 +248,7 @@ async def generate_3d(files: List[UploadFile] = File(...)):
             "status": "success" if success else "failed",
             "mode": "multiview_pipeline",
             "pipeline_type": pipeline_type,
+            "dust3r_backend": dust3r_result.get("backend", "mock"),
             "quality_passed": is_high_quality,
             "gate_reason": reason,
             "num_input_images": preprocess_result["num_images"],
