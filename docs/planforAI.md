@@ -306,7 +306,7 @@ class TripoSREngine:
 ---
 
 # 🚀 KẾ HOẠCH TRIỂN KHAI CHI TIẾT: THÀNH VIÊN 4 (NVIDIA 3D RECONSTRUCTION)
-## VỊ TRÍ: 3D VOLUMETRIC MESH & TEXTURE BLENDING ENGINEER
+## VỊ TRÍ: 3D VOLUMETRIC MESH ENGINEER
 
 > **Người thực hiện:** P4 (3D Mesh) & P5 (Texture Blending)  
 > **Lý thuyết nền tảng:** [docs/lythuyet.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/lythuyet.md), [docs/phan_tich_chuyen_sau_reference_repos.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/phan_tich_chuyen_sau_reference_repos.md) (Phần 4: Chi tiết thuật toán & bản chất toán học)  
@@ -358,5 +358,54 @@ class TripoSREngine:
   - Viết `test_tsdf_pipeline.py` kiểm thử độc lập 100% pass trên dữ liệu mô phỏng.
   - Nối vào `app.py`, hoàn thiện luồng End-to-End.
 
+---
 
+# 🚀 KẾ HOẠCH TRIỂN KHAI CHI TIẾT: THÀNH VIÊN 5
+## VỊ TRÍ: TEXTURE & UV SHADING ENGINEER
 
+> **Người thực hiện:** Phước (Thành viên 5 - P5)
+> **Lý thuyết nền tảng:** [docs/lythuyet.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/lythuyet.md)
+> **Căn cứ plan tổng thể:** [docs/plan.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/plan.md)
+> **Phạm vi mã nguồn chịu trách nhiệm:** (tạo 3 file mới trong `notebook/backend/`)
+> - `utils_3d.py`: helper cho validation, camera projection, visibility, sampling và GLB export.
+> - `texture_blender.py`: XAtlas UV, angle-weighted Base-Color blending, texture baking và GLB assembly.
+> - `test_texture_blender.py`: test độc lập cho interface P5.
+
+---
+
+## 📦 PHẦN 1: HỢP ĐỒNG BÀN GIAO
+
+### Input từ các phần trước
+- P1 `preprocess_multiview()`: `images_rgb`, danh sách ảnh `(H, W, 3)` `uint8` đã resize và histogram-match.
+- P2 `DUSt3REngine.process()`: `camera_poses` camera-to-world `3x4`/`4x4` và `focal_lengths` `(fx, fy)`.
+- P4 `TSDFMeshEngine.reconstruct()`: `trimesh.Trimesh` có vertices, faces và normals.
+
+### Output
+- `TextureBlender.process_and_export(...) -> (success: bool, glb_path: str)`.
+- Một file `.glb` chứa mesh, UV và Base-Color/Albedo texture.
+- Không gọi output là PBR texture vì pipeline không tạo normal, roughness, metallic hoặc AO map.
+
+## 🛠️ PHẦN 2: LỘ TRÌNH P5
+
+- [x] Tạo helper dùng trực tiếp contract P1/P2/P4 trong `utils_3d.py`.
+- [x] Tạo `TextureBlender` trong `texture_blender.py`.
+- [x] Dùng XAtlas khi có thư viện; có fallback UV deterministic để test không phụ thuộc bắt buộc vào XAtlas.
+- [x] Chiếu vertices về từng ảnh và blend màu theo `max(0, n dot v)^gamma`.
+- [x] Lọc điểm không hợp lệ/không nhìn thấy bằng triangle-rasterized depth-buffer trước khi đóng góp màu.
+- [x] Bake màu trực tiếp theo texel UV, nội suy barycentric world position và blend từ các view nhìn thấy.
+- [x] Xuất GLB và kiểm tra lại UV/material image trong test.
+- [x] Viết test cho projection, visibility, UV, blending, baking, GLB và input mismatch.
+- [x] Hoàn tất code và bộ test P5; các file đã được duyệt: `utils_3d.py`, `texture_blender.py`, `test_texture_blender.py`.
+- [x] Chạy `pytest notebook/backend/test_texture_blender.py -q`: 4 passed với XAtlas backend thật.
+- [x] Bàn giao interface cho P6; P5 không tự sửa `app.py`.
+
+## ✅ DEFINITION OF DONE
+
+| Tiêu chí | Điều kiện đạt |
+|:---|:---|
+| UV | UV có shape `(N, 2)`, nằm trong `[0, 1]`; ưu tiên XAtlas |
+| Color blending | Dùng ảnh P1, pose/focal P2 và normal từ mesh P4 |
+| Visibility | Điểm bị che khuất không đóng góp màu trong depth-buffer |
+| Texture | Có RGB Base-Color texture được bake trên UV atlas |
+| GLB | Load lại được bằng Trimesh, có UV và material image |
+| Isolation | Test P5 không gọi `app.py` và không sửa module P1-P4 |
