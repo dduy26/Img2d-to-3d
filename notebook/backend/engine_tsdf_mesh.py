@@ -207,11 +207,14 @@ class TSDFVolume:
         self.resolution = resolution
 
         # Kích thước mỗi ô voxel
-        extent = self.bounds_max - self.bounds_min
-        self.voxel_size = np.max(extent) / float(self.resolution)
+        center = (self.bounds_min + self.bounds_max) / 2.0
+        max_extent = float(np.max(self.bounds_max - self.bounds_min))
+        self.voxel_size = max_extent / float(self.resolution)
 
-        # Căn chỉnh lại bounds để các voxel đều là khối lập phương
-        self.bounds_max = self.bounds_min + self.voxel_size * self.resolution
+        # Căn chỉnh lại bounds đối xứng qua tâm để các voxel đều là khối lập phương
+        half_cube = (self.voxel_size * self.resolution) / 2.0
+        self.bounds_min = (center - half_cube).astype(np.float32)
+        self.bounds_max = (center + half_cube).astype(np.float32)
         self.extent = self.bounds_max - self.bounds_min
 
         # Truncation margin mu

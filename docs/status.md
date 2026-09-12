@@ -96,7 +96,10 @@
 - [x] **Nối luồng chính thức trong `app.py`:**
   - Thay thế nhánh tạm thời TripoSR tại Quality PASS bằng pipeline thực sự: `TSDFMeshEngine` (P4) $\to$ `TextureBlender` (P5) $\to$ `.glb`.
   - Nhánh Quality FAIL vẫn bảo toàn TripoSR Fail-safe engine.
-- [x] **Nghiệm thu kiểm thử tự động:**
-  - `test_tsdf_pipeline.py`: Đạt 5/5 test pass 100% (Lọc viền, Pruning nền, Marching Cubes Watertight, XAtlas UV, E2E synthetic).
-  - `test_api_e2e.py`: Kiểm thử thành công 100% cả Single-image (0.06s) và Multi-view Full Pipeline 6 ảnh (3.59s <= 10s target).
+- [x] **Nghiệm thu kiểm thử tự động & Dọn dẹp thư mục:**
+  - Hợp nhất toàn bộ kiểm thử vào 1 file duy nhất: `test_pipeline.py` (đạt 6/6 test PASS 100% bao gồm cả Unit tests thuật toán và Full Integration API E2E).
+  - Đã dọn dẹp các file test cũ rời rạc (`test_tsdf_pipeline.py`, `test_api_e2e.py`, `run_experiments.py`) để trả lại cây thư mục chuẩn cho backend.
+- [x] **Lưu trữ phiên bản Baseline P5 để Thành viên 5 đối chiếu:**
+  - Đã sao lưu toàn bộ mã nguồn Texture Blender ban đầu và script thực nghiệm vào `notebook/backend/backup_p5/` (`texture_blender_baseline.py`, `run_experiments_baseline.py` và `README.md`).
+  - Thành viên 5 có thể thoải mái phát triển phiên bản mới trên `texture_blender.py` mà không sợ mất code baseline ban đầu, sẵn sàng đối chuẩn hiệu năng và chất lượng UV/texture sau này.
 ---
