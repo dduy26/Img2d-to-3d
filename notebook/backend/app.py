@@ -51,11 +51,19 @@ q_gate = QualityGate()
 # P3: TripoSR Fail-safe Engine (nạp sẵn vào RAM)
 triposr_engine = TripoSREngine()
 
+# ── Nút vặn chất lượng (đặt qua biến môi trường, không cần sửa code) ──
+# TSDF_RES: số voxel mỗi cạnh của lưới TSDF. Cao hơn = chi tiết hơn, chậm + tốn RAM hơn.
+#   128 -> ~16MB/grid (mặc định) | 192 -> ~57MB | 256 -> ~134MB
+# DUST3R_NITER: số vòng global alignment. Cao hơn = khớp camera chặt hơn, chậm hơn.
+TSDF_RES = int(os.environ.get("TSDF_RES", "128"))
+DUST3R_NITER = int(os.environ.get("DUST3R_NITER", "300"))
+logger.info(f"Cấu hình: TSDF_RES={TSDF_RES}, DUST3R_NITER={DUST3R_NITER}")
+
 # P2: DUSt3R Engine
-dust3r_engine = DUSt3REngine(device=device)
+dust3r_engine = DUSt3REngine(device=device, niter=DUST3R_NITER)
 
 # P4: TSDF Volumetric Mesh Engine (NVIDIA reference TSDF + Marching Cubes)
-tsdf_engine = TSDFMeshEngine(resolution=128)
+tsdf_engine = TSDFMeshEngine(resolution=TSDF_RES)
 
 # P5: XAtlas UV Parameterization & Base-Color Texture Blender
 texture_blender = TextureBlender()
