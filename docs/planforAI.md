@@ -409,3 +409,79 @@ class TripoSREngine:
 | Texture | Có RGB Base-Color texture được bake trên UV atlas |
 | GLB | Load lại được bằng Trimesh, có UV và material image |
 | Isolation | Test P5 không gọi `app.py` và không sửa module P1-P4 |
+
+
+---
+
+# 🚀 KẾ HOẠCH TRIỂN KHAI CHI TIẾT: THÀNH VIÊN 6 (P6)
+## VỊ TRÍ: FULL-STACK & CLOUD DEPLOYMENT LEAD
+
+> **Người thực hiện:** Thành viên 6 (P6)
+> **Lý thuyết nền tảng:** [docs/lythuyet.md](docs/lythuyet.md)
+> **Căn cứ plan tổng thể:** [docs/plan.md](docs/plan.md) (Bước 5 & 7) + [docs/require.md](docs/require.md) (ràng buộc Colab T4)
+> **Phạm vi mã nguồn chịu trách nhiệm:** (chỉ trong `notebook/`, KHÔNG sửa module P1–P5)
+> - `notebook/frontend/index.html` — Web UI (Three.js qua CDN, không cần build step).
+> - `notebook/frontend/readme.md` — Hợp đồng API + hướng dẫn deploy.
+> - `notebook/demo_colab.ipynb` — Runbook Colab 1-click + Cloudflare Tunnel.
+> - `notebook/backend/app.py` — **chỉ THÊM** 3 route phục vụ UI/static/health (không đổi logic pipeline).
+> - `notebook/backend/test_pipeline.py` — thêm Test 7 (P6).
+>
+> **Branch test:** `P6-FullStack-Cloud`
+
+---
+
+## 📦 PHẦN 1: HỢP ĐỒNG GIAO DIỆN (INTERFACE CONTRACT)
+
+### 1.1 Input nhận từ P1 → P5 (đã chốt, P6 KHÔNG sửa)
+| Nguồn | Bàn giao | P6 dùng làm gì |
+| :-- | :-- | :-- |
+| P1–P5 | `app.py`: `POST /generate-3d/` (1 hoặc 4–8 ảnh), `POST /generate-3d/single/` | Frontend gọi bằng `fetch` multipart |
+| P3/P4 | `outputs/*.glb` + field `output_file` trong response | Route `GET /outputs/<name>.glb` phục vụ viewer |
+
+### 1.2 Output P6 bàn giao
+- `GET /` → Web UI (upload + viewer 360° + wireframe + auto-rotate + tải `.glb`).
+- `GET /outputs/<name>.glb` → file GLB tĩnh cho Three.js `GLTFLoader` (cùng origin ⇒ không cần CORS).
+- `GET /api/health` → `{status, device, frontend}` (dùng để chờ server sẵn sàng trên Colab, không `sleep` mù).
+- URL công khai từ Cloudflare Tunnel để mở Web UI từ máy tính cá nhân.
+
+---
+
+## 🛠️ PHẦN 2: LỘ TRÌNH THỰC HIỆN
+
+### Step 1: Web UI (`frontend/index.html`)
+- [x] `<input type=file multiple>` + drag-drop, thumbnail preview, chặn 2–3 ảnh (P1 yêu cầu 1 hoặc 4–8).
+- [x] `fetch('/generate-3d/')` → hiển thị `mode`, `pipeline_type`, `quality_passed`, `gate_reason`, thời gian.
+- [x] Viewer Three.js (`OrbitControls` + `GLTFLoader`) auto-fit bounding box; bật/tắt Wireframe, Auto-rotate, nút tải `.glb`.
+- [x] **Quyết định kỹ thuật (lazy):** dùng ES-module importmap + CDN, KHÔNG dùng React/Vite. Lý do: UI chỉ 1 màn hình, 1 API, 1 file GLB — thêm build step là 200MB `node_modules` mà không đổi tính năng. Contract API ở trên không đổi, nên khi cần routing/state phức tạp chỉ cần tráo `index.html` bằng output Vite.
+
+### Step 2: Nối Frontend vào Backend (`app.py`) — chỉ THÊM, không sửa
+- [x] `app.mount("/outputs", StaticFiles(...))` để viewer tải GLB cùng origin.
+- [x] `GET /` trả `frontend/index.html` (`FileResponse`), có fallback message nếu thiếu file.
+- [x] `GET /api/health` cho health-check khi boot Colab.
+
+### Step 3: Runbook Colab 1-click (`notebook/demo_colab.ipynb`)
+- [x] Cell 1: clone repo + `pip install` dependencies.
+- [x] Cell 2: clone TripoSR → copy `tsr/` vào `notebook/backend/`.
+- [x] Cell 3 (tùy chọn): upload 4–8 ảnh test vào `data/input/multi_view/`.
+- [x] Cell 4: chạy `uvicorn` nền + **health-check loop** (không sleep mù) → mở **Cloudflare Tunnel** → in URL `*.trycloudflare.com`.
+- [x] Cell 5: smoke test `curl` (tự chọn chế độ đa ảnh / đơn ảnh theo số ảnh có sẵn).
+- [x] Cell 6: dừng server + tunnel.
+
+### Step 4: Tự Audit & Kiểm thử
+- [x] Audit: mọi thay đổi `app.py` nằm gọn trong 1 block P6, không đụng luồng P1–P5; không hard-code path tuyệt đối (`FRONTEND_DIR` tính từ `__file__`).
+- [x] Test 7 trong `test_pipeline.py`: `GET /` trả UI có `GLTFLoader`; `/api/health` ok; `/outputs/<file>.glb` trả về magic `glTF`.
+- [x] Chạy lại toàn bộ: `python notebook/backend/test_pipeline.py` → **7/7 PASS** (~12s, CPU).
+- [x] E2E thủ công: `uvicorn app:app` + POST 6 ảnh → HTTP 200, `nvidia_tsdf_mesh`, `quality_passed=true`, `GET /outputs/...glb` = 29KB magic `glTF`.
+
+---
+
+## 🎯 PHẦN 3: TIÊU CHÍ NGHIỆM THU (DoD)
+
+| # | Tiêu chí | Ngưỡng đạt |
+| :--: | :--- | :--- |
+| 1 | Web UI hoạt động | Upload 1 hoặc 4–8 ảnh → xem model 360°, wireframe, tải `.glb` |
+| 2 | Không cần build frontend | Chỉ `pip install`, không `npm install` (mở là chạy) |
+| 3 | Mở từ máy tính qua Colab | Cloudflare Tunnel in URL công khai, Swagger ở `/docs` |
+| 4 | Không phá P1–P5 | `test_pipeline.py` 6 test gốc vẫn PASS (tổng 7/7) |
+| 5 | Health-check boot | `GET /api/health` trả 200 trước khi mở tunnel (không sleep mù) |
+| 6 | KPI Colab T4 | Toàn luồng 6 ảnh ≤ 25s (đo local CPU ~12s, GPU nhanh hơn) |

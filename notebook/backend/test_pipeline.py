@@ -56,7 +56,7 @@ from starlette.testclient import TestClient
 
 def test_01_filter_depth_discontinuity():
     """Test 1: Lọc viền mép rách do bước nhảy độ sâu (DA3-blender Gradient Filter)."""
-    print("\n[TEST 1/6] Kiểm thử Lọc mép rách độ sâu (filter_depth_discontinuity)...")
+    print("\n[TEST 1/7] Kiểm thử Lọc mép rách độ sâu (filter_depth_discontinuity)...")
     # Mặt phẳng đồng nhất: không có mép rách
     flat_depth = np.full((100, 100), 2.0, dtype=np.float32)
     mask = filter_depth_discontinuity(flat_depth, tau=0.07)
@@ -75,7 +75,7 @@ def test_01_filter_depth_discontinuity():
 
 def test_02_prune_background_points():
     """Test 2: Pruning điểm nền kết hợp Alpha Mask & DUSt3R Confidence."""
-    print("\n[TEST 2/6] Kiểm thử Pruning điểm nền (prune_background_points)...")
+    print("\n[TEST 2/7] Kiểm thử Pruning điểm nền (prune_background_points)...")
     n_views, h, w = 2, 64, 64
     pointmaps = np.random.randn(n_views, h, w, 3).astype(np.float32)
     pointmaps[:, :, :, 2] = np.abs(pointmaps[:, :, :, 2]) + 1.0
@@ -102,7 +102,7 @@ def test_02_prune_background_points():
 
 def test_03_tsdf_marching_cubes_watertight():
     """Test 3: Tích lũy lưới thể tích TSDF và trích xuất Marching Cubes kín nước 360°."""
-    print("\n[TEST 3/6] Kiểm thử TSDF Volume & Marching Cubes Watertight...")
+    print("\n[TEST 3/7] Kiểm thử TSDF Volume & Marching Cubes Watertight...")
     res = 64
     bounds_min = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
     bounds_max = np.array([1.0, 1.0, 1.0], dtype=np.float32)
@@ -134,7 +134,7 @@ def test_03_tsdf_marching_cubes_watertight():
 
 def test_04_texture_blender_and_glb_export():
     """Test 4: Trải UV XAtlas, hòa trộn màu góc nhìn và xuất file .GLB hợp lệ."""
-    print("\n[TEST 4/6] Kiểm thử Texture Blender & Xuất GLB (TextureBlender)...")
+    print("\n[TEST 4/7] Kiểm thử Texture Blender & Xuất GLB (TextureBlender)...")
     if not HAS_TEXTURE_BLENDER:
         print("  ⏭️ SKIP: Module P5 (Texture Blender) đã tách riêng để Thành viên 5 tự phát triển từ đầu.")
         return
@@ -194,7 +194,7 @@ def test_04_texture_blender_and_glb_export():
 
 def test_05_api_single_image_triposr():
     """Test 5: API POST /generate-3d/single/ (Chế độ 1 ảnh cứu hộ)."""
-    print("\n[TEST 5/6] Kiểm thử API /generate-3d/single/ qua TestClient...")
+    print("\n[TEST 5/7] Kiểm thử API /generate-3d/single/ qua TestClient...")
     client = TestClient(app)
     test_img = Path("data/input/multi_view/view_01_front.jpg")
     assert test_img.exists(), f"Thiếu ảnh test: {test_img}"
@@ -213,7 +213,7 @@ def test_05_api_single_image_triposr():
 
 def test_06_api_multiview_full_pipeline():
     """Test 6: API POST /generate-3d/ (Toàn chu trình Đa ảnh P1 -> P2 -> P3 -> P4 -> P5)."""
-    print("\n[TEST 6/6] Kiểm thử API /generate-3d/ (Full Pipeline 6 ảnh)...")
+    print("\n[TEST 6/7] Kiểm thử API /generate-3d/ (Full Pipeline 6 ảnh)...")
     client = TestClient(app)
     img_paths = sorted(list(Path("data/input/multi_view").glob("view_*.jpg")))
     assert len(img_paths) >= 4, f"Cần ít nhất 4 ảnh benchmark, tìm thấy {len(img_paths)}"
@@ -252,6 +252,28 @@ def test_06_api_multiview_full_pipeline():
     print(f"  ✅ PASS: Full Multi-view Pipeline hoàn thành trong {total_time:.2f}s! ({total_verts} đỉnh, {total_faces} tam giác).")
 
 
+def test_07_frontend_and_static_outputs():
+    """Test 7 (P6): Web UI phục vụ tại '/' và file .glb phục vụ tại '/outputs/'."""
+    print("\n[TEST 7/7] Kiểm thử Web UI (P6) & Static GLB...")
+    client = TestClient(app)
+
+    r = client.get("/")
+    assert r.status_code == 200, f"GET / phải trả Web UI, nhận {r.status_code}"
+    assert "3D Viewer" in r.text, "index.html của frontend không được phục vụ đúng"
+    assert "GLTFLoader" in r.text, "Web UI phải có Three.js GLTFLoader để xem .glb"
+
+    r = client.get("/api/health")
+    assert r.status_code == 200 and r.json()["status"] == "ok"
+    assert r.json()["frontend"] is True
+
+    # .glb phải tải được qua /outputs/ (đúng tên file, không lộ path tuyệt đối)
+    out_file = Path("outputs/result_view_01_front.glb")
+    assert out_file.exists(), "Chưa có .glb — test 6 phải chạy trước"
+    r = client.get(f"/outputs/{out_file.name}")
+    assert r.status_code == 200 and r.content[:4] == b"glTF", "Static /outputs phải trả file GLB hợp lệ"
+    print(f"  ✅ PASS: Web UI + Static GLB OK ({len(r.content)} bytes, magic=glTF).")
+
+
 # ==============================================================================
 # MAIN ENTRYPOINT
 # ==============================================================================
@@ -268,11 +290,13 @@ if __name__ == "__main__":
     test_04_texture_blender_and_glb_export()
     test_05_api_single_image_triposr()
     test_06_api_multiview_full_pipeline()
+    test_07_frontend_and_static_outputs()
 
     total_elapsed = time.time() - t_start
     print("\n" + "=" * 70)
-    print(f"🎉 TẤT CẢ 6/6 BÀI KIỂM THỬ ĐÃ ĐẠT 100% TRONG {total_elapsed:.2f} GIÂY!")
+    print(f"🎉 TẤT CẢ 7/7 BÀI KIỂM THỬ ĐÃ ĐẠT 100% TRONG {total_elapsed:.2f} GIÂY!")
     print("   - Khối hình học P4 (TSDF Volumetric Fusion & Marching Cubes): PASS ✅")
     print("   - Khối trải UV & Nướng màu P5 (TextureBlender & GLB Export): PASS ✅")
     print("   - Khối điều phối máy chủ Backend (FastAPI E2E Single & Multi): PASS ✅")
+    print("   - Khối Web UI & Static GLB (P6): PASS ✅")
     print("=" * 70)

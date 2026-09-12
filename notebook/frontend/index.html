@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="vi" class="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>2D → 3D | Multi-View Pipeline</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script type="importmap">
+{ "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+<style>
+  body { background: radial-gradient(circle at 20% 0%, #1e293b, #020617 60%); color: #e2e8f0; }
+  .glass { background: rgba(30,41,59,.55); backdrop-filter: blur(12px); border: 1px solid rgba(148,163,184,.18); }
+  .drop.hot { border-color: #22d3ee; background: rgba(34,211,238,.08); }
+</style>
+</head>
+<body class="min-h-screen">
+<div class="max-w-6xl mx-auto p-6">
+  <header class="mb-6">
+    <h1 class="text-2xl font-bold">2D <span class="text-cyan-400">→</span> 3D Pipeline</h1>
+    <p class="text-sm text-slate-400">Upload 1 ảnh (TripoSR) hoặc 4–8 ảnh đa góc (DUSt3R → TSDF → Texture). Xuất .glb.</p>
+  </header>
+
+  <div class="grid md:grid-cols-2 gap-6">
+    <!-- LEFT: input -->
+    <section class="glass rounded-2xl p-5">
+      <label id="drop" class="drop flex flex-col items-center justify-center border-2 border-dashed border-slate-600 rounded-xl h-40 cursor-pointer transition text-center">
+        <span class="text-3xl">🖼️</span>
+        <span class="mt-2 text-sm">Kéo thả ảnh vào đây hoặc <span class="text-cyan-400">chọn file</span></span>
+        <span class="text-xs text-slate-500 mt-1">JPG / PNG · 1 ảnh hoặc 4–8 ảnh</span>
+        <input id="files" type="file" accept="image/jpeg,image/png,image/webp" multiple class="hidden" />
+      </label>
+
+      <div id="thumbs" class="grid grid-cols-4 gap-2 mt-4"></div>
+
+      <button id="run" class="mt-4 w-full py-3 rounded-xl font-semibold bg-cyan-500 hover:bg-cyan-400 text-slate-900 disabled:opacity-40 disabled:cursor-not-allowed" disabled>
+        Tạo mô hình 3D
+      </button>
+
+      <div id="status" class="mt-3 text-sm text-slate-400 h-5"></div>
+      <div id="meta" class="mt-2 text-xs text-slate-500 whitespace-pre-wrap"></div>
+    </section>
+
+    <!-- RIGHT: viewer -->
+    <section class="glass rounded-2xl p-5 flex flex-col">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold">3D Viewer</h2>
+        <div class="flex gap-2">
+          <button id="wire" class="px-3 py-1 text-xs rounded-lg border border-slate-600 hover:border-cyan-400" disabled>Wireframe</button>
+          <button id="spin" class="px-3 py-1 text-xs rounded-lg border border-slate-600 hover:border-cyan-400" disabled>Auto-rotate</button>
+          <a id="dl" class="px-3 py-1 text-xs rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white hidden" download>Tải .glb</a>
+        </div>
+      </div>
+      <div id="viewer" class="relative flex-1 min-h-[360px] rounded-xl overflow-hidden bg-slate-950/60 grid place-items-center">
+        <span id="viewerHint" class="text-sm text-slate-600">Chưa có mô hình</span>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ---------- 3D viewer (three.js, CDN, no build step) ----------
+const host = document.getElementById('viewer');
+let renderer, scene, camera, controls, model = null, wireframe = false;
+
+function initViewer() {
+  if (renderer) return;
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setSize(host.clientWidth, host.clientHeight);
+  host.appendChild(renderer.domElement);
+  renderer.domElement.style.position = 'absolute';
+  renderer.domElement.style.inset = '0';
+
+  scene = new THREE.Scene();
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x334155, 2.2));
+  const key = new THREE.DirectionalLight(0xffffff, 1.6); key.position.set(3, 5, 4); scene.add(key);
+
+  camera = new THREE.PerspectiveCamera(45, host.clientWidth / host.clientHeight, 0.01, 1000);
+  camera.position.set(0, 0.6, 2.4);
+
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.autoRotateSpeed = 2.0;
+
+  new ResizeObserver(() => {
+    camera.aspect = host.clientWidth / host.clientHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(host.clientWidth, host.clientHeight);
+  }).observe(host);
+
+  (function loop() { requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+}
+function clearModel() { if (model) { scene.remove(model); model = null; } }
+
+async function showGlb(url) {
+  initViewer(); clearModel(); document.getElementById('viewerHint').textContent = '';
+  const gltf = await new GLTFLoader().loadAsync(url);
+  model = gltf.scene;
+  const box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3()).length() || 1;
+  const center = box.getCenter(new THREE.Vector3());
+  model.position.sub(center);
+  controls.target.set(0, 0, 0);
+  camera.position.set(0, size * 0.15, size * 1.4);
+  camera.near = size / 100; camera.far = size * 20; camera.updateProjectionMatrix();
+  scene.add(model);
+}
+
+// ---------- upload + pipeline call ----------
+const filesEl = document.getElementById('files');
+const dropEl = document.getElementById('drop');
+const runBtn = document.getElementById('run');
+const statusEl = document.getElementById('status');
+const metaEl = document.getElementById('meta');
+const thumbsEl = document.getElementById('thumbs');
+let picked = [];
+
+['dragenter', 'dragover'].forEach(e => dropEl.addEventListener(e, ev => { ev.preventDefault(); dropEl.classList.add('hot'); }));
+['dragleave', 'drop'].forEach(e => dropEl.addEventListener(e, ev => { ev.preventDefault(); dropEl.classList.remove('hot'); }));
+dropEl.addEventListener('drop', ev => setFiles([...ev.dataTransfer.files]));
+filesEl.addEventListener('change', () => setFiles([...filesEl.files]));
+
+function setFiles(list) {
+  picked = list.filter(f => f.type.startsWith('image/'));
+  thumbsEl.innerHTML = '';
+  picked.forEach(f => {
+    const img = document.createElement('img');
+    img.src = URL.createObjectURL(f);
+    img.className = 'h-16 w-full object-cover rounded-lg border border-slate-700';
+    thumbsEl.appendChild(img);
+  });
+  runBtn.disabled = picked.length === 0 || picked.length === 2 || picked.length === 3;
+  statusEl.textContent = picked.length ? `${picked.length} ảnh` : '';
+  if (picked.length === 2 || picked.length === 3) {
+    statusEl.textContent = '⚠️ Cần 1 ảnh, hoặc 4–8 ảnh đa góc';
+    statusEl.className = 'mt-3 text-sm text-amber-400 h-5';
+  } else {
+    statusEl.className = 'mt-3 text-sm text-slate-400 h-5';
+  }
+}
+
+runBtn.addEventListener('click', async () => {
+  const fd = new FormData();
+  picked.forEach(f => fd.append('files', f, f.name));
+  runBtn.disabled = true;
+  const t0 = performance.now();
+  const tick = setInterval(() => statusEl.textContent = `⏳ Đang xử lý… ${((performance.now() - t0) / 1000).toFixed(1)}s`, 100);
+  metaEl.textContent = '';
+  try {
+    const res = await fetch('/generate-3d/', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    statusEl.textContent = data.status === 'success' ? `✅ Xong trong ${data.execution_time_seconds}s` : '❌ Thất bại';
+    metaEl.textContent = [
+      `mode: ${data.mode}`,
+      data.pipeline_type ? `pipeline: ${data.pipeline_type}` : null,
+      data.quality_passed !== null && data.quality_passed !== undefined ? `quality_gate: ${data.quality_passed} — ${data.gate_reason}` : null,
+      `số ảnh: ${data.num_input_images ?? 1}`,
+    ].filter(Boolean).join('\n');
+    if (data.status === 'success' && data.output_file) {
+      const url = '/outputs/' + data.output_file.split(/[\\/]/).pop();
+      await showGlb(url);
+      const dl = document.getElementById('dl'); dl.href = url; dl.download = 'model.glb'; dl.classList.remove('hidden');
+      for (const id of ['wire', 'spin']) document.getElementById(id).disabled = false;
+    }
+  } catch (err) {
+    statusEl.textContent = '❌ ' + err.message;
+  } finally {
+    clearInterval(tick);
+    runBtn.disabled = false;
+  }
+});
+
+document.getElementById('wire').addEventListener('click', () => {
+  wireframe = !wireframe;
+  model?.traverse(o => { if (o.isMesh && o.material) o.material.wireframe = wireframe; });
+});
+document.getElementById('spin').addEventListener('click', () => { controls.autoRotate = !controls.autoRotate; });
+</script>
+</body>
+</html>

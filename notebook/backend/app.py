@@ -1,4 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from typing import List
 import uvicorn
 import shutil
@@ -31,6 +33,11 @@ app = FastAPI(title="2D to 3D Generation API - Full Pipeline")
 os.makedirs("temp_uploads", exist_ok=True)
 os.makedirs("outputs", exist_ok=True)
 
+# ── P6: Phục vụ file .glb tĩnh (frontend tự fetch từ /outputs/<file>.glb) ──
+app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
+FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")
+FRONTEND_INDEX = os.path.join(FRONTEND_DIR, "index.html")
+
 # ============================================================================
 # KHỞI TẠO TẤT CẢ ENGINE (Chỉ chạy 1 lần lúc bật server)
 # ============================================================================
@@ -53,6 +60,28 @@ tsdf_engine = TSDFMeshEngine(resolution=128)
 texture_blender = TextureBlender()
 
 logger.info("═══ TẤT CẢ ENGINE P1-P5 ĐÃ SẴN SÀNG ═══")
+
+
+# ============================================================================
+# API 0: Giao diện Web (P6) + Health check
+# ============================================================================
+@app.get("/", include_in_schema=False)
+async def frontend():
+    """Phục vụ giao diện Web UI (Three.js) tại gốc máy chủ."""
+    if os.path.exists(FRONTEND_INDEX):
+        return FileResponse(FRONTEND_INDEX)
+    return {"message": "Frontend chưa được cài. Mở /docs để dùng Swagger UI."}
+
+
+@app.get("/api/health")
+async def health():
+    """Health check cho Colab/tunnel."""
+    return {
+        "status": "ok",
+        "device": device,
+        "frontend": os.path.exists(FRONTEND_INDEX),
+    }
+
 
 
 # ============================================================================

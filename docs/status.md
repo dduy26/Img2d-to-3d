@@ -31,7 +31,7 @@
   - [x] P3 (Quality Gate & Fail-safe): `quality_gate.py` (3 lớp kiểm tra) & `engine_triposr.py` (Cứu hộ fallback) & `app.py` (Nối pipeline P1→P2→P3→Fallback).
   - [x] P4 (3D Volumetric Mesh): `engine_tsdf_mesh.py` (Pruning điểm nền + Voxel TSDF + Marching Cubes).
   - [x] P5 (Texture & UV Shading): Đã hoàn thành `utils_3d.py`, `texture_blender.py` và `test_texture_blender.py`
-  - [ ] P6 (Full-Stack & Cloud Lead): Web Three.js (`frontend/`), Runbook Colab Tunnel.
+  - [x] P6 (Full-Stack & Cloud Lead): Web UI (`frontend/index.html`), route UI/static/health trong `app.py`, Runbook Colab 1-click + Cloudflare Tunnel (`notebook/demo_colab.ipynb`).
 - [x] **Bước 6: Kiểm thử và Đánh giá (Testing & Evaluation)**
   - [x] Đánh giá Tầng 1: Kiểm thử chất lượng lưới 3D (Watertightness, Polygon count, Base-color fidelity) qua `test_tsdf_pipeline.py` đạt 5/5 test pass 100%.
   - [x] Đánh giá Tầng 2: Kiểm thử Toàn luồng (End-to-End Latency ~3.59s <= 10s trên 6 ảnh benchmark qua `test_api_e2e.py`).
@@ -110,5 +110,19 @@
 - [x] **Test:** Hoàn thành `notebook/backend/test_texture_blender.py`, kiểm tra projection/visibility, UV, color blending, texture baking, GLB và input mismatch.
 - [x] **Bàn giao:** Interface P5 nhận `images_rgb` từ P1, `camera_poses`/`focal_lengths` từ P2 và `Trimesh` từ P4; trả `(success, glb_path)` cho P6.
 - [x] **Tích hợp toàn hệ thống:** Đã nối hoàn tất toàn bộ chuỗi P1 -> P2 -> P3 -> P4 -> P5 (`TextureBlender.process_and_export()`) vào nhánh Quality PASS trong `app.py`.
+
+---
+
+### 📌 THEO DÕI TIẾN ĐỘ CHI TIẾT: THÀNH VIÊN 6 (P6 FULL-STACK & CLOUD DEPLOYMENT)
+- [x] **Branch test:** Tạo branch `P6-FullStack-Cloud`.
+- [x] **Kế hoạch:** Ghi kế hoạch chi tiết vào `planforAI.md` (Phần Thành viên 6).
+- [x] **Web UI (`notebook/frontend/index.html`):** Upload 1 hoặc 4–8 ảnh (drag-drop + thumbnail), gọi `POST /generate-3d/`, hiển thị `mode`/`pipeline_type`/`quality_passed`/`gate_reason`/latency, viewer Three.js (`OrbitControls` + `GLTFLoader`) với Wireframe, Auto-rotate và nút tải `.glb`.
+- [x] **Quyết định kỹ thuật:** Dùng Three.js qua CDN importmap, KHÔNG dùng React/Vite (UI 1 màn hình, 1 API, 1 file GLB — bỏ được build step + `node_modules`). Contract API không đổi nên có thể tráo sang Vite sau nếu cần.
+- [x] **Backend (chỉ THÊM, không sửa P1–P5):** `GET /` phục vụ Web UI, `GET /outputs/<file>.glb` (StaticFiles, cùng origin ⇒ khỏi CORS), `GET /api/health` cho health-check boot.
+- [x] **Runbook Colab 1-click (`notebook/demo_colab.ipynb`):** 6 cell — clone repo, clone TripoSR, upload ảnh test (tùy chọn), boot uvicorn + health-check loop + Cloudflare Tunnel in URL công khai, smoke test `curl`, dừng server.
+- [x] **Kiểm thử:** Thêm Test 7 (P6) vào `test_pipeline.py` → chạy `python notebook/backend/test_pipeline.py` đạt **7/7 PASS** (~12s trên CPU).
+- [x] **Nghiệm thu E2E:** `uvicorn app:app` + POST 6 ảnh → HTTP 200, `pipeline_type=nvidia_tsdf_mesh`, `quality_passed=true`, `GET /outputs/result_*.glb` = 29KB (magic `glTF`).
+- [ ] **Bước 7 (Kết luận):** Báo cáo nghiệm thu + so sánh Option 1 vs Option 2 (bàn giao cuối dự án).
+
 
 ---
