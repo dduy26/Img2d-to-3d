@@ -109,7 +109,6 @@
 - [x] **Code:** Hoàn thành `notebook/backend/utils_3d.py` và `notebook/backend/texture_blender.py`.
 - [x] **Test:** Hoàn thành `notebook/backend/test_texture_blender.py`, kiểm tra projection/visibility, UV, color blending, texture baking, GLB và input mismatch.
 - [x] **Bàn giao:** Interface P5 nhận `images_rgb` từ P1, `camera_poses`/`focal_lengths` từ P2 và `Trimesh` từ P4; trả `(success, glb_path)` cho P6.
-- [x] **Nghiệm thu runtime P5:** Đã cài và xác nhận XAtlas backend thật; `pytest notebook/backend/test_texture_blender.py -q` đạt 4 passed, gồm projection, triangle visibility, UV/blending/bake, GLB UV + `baseColorTexture` và input mismatch.
-- [ ] **Tích hợp toàn hệ thống:** Thành viên 6 nối `TextureBlender.process_and_export()` vào nhánh Quality PASS trong `app.py`.
+- [x] **Tích hợp toàn hệ thống:** Đã nối hoàn tất toàn bộ chuỗi P1 -> P2 -> P3 -> P4 -> P5 (`TextureBlender.process_and_export()`) vào nhánh Quality PASS trong `app.py`.
 
 ---
