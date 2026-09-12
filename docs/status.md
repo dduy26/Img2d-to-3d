@@ -30,7 +30,7 @@
   - [x] P2 (Pose & 3D Geometry AI): `engine_dust3r.py` (Pairwise matching, Global alignment, Point-maps).
   - [x] P3 (Quality Gate & Fail-safe): `quality_gate.py` (3 lớp kiểm tra) & `engine_triposr.py` (Cứu hộ fallback) & `app.py` (Nối pipeline P1→P2→P3→Fallback).
   - [x] P4 (3D Volumetric Mesh): `engine_tsdf_mesh.py` (Pruning điểm nền + Voxel TSDF + Marching Cubes).
-  - [x] P5 (Texture & UV Shading): `texture_blender.py` (XAtlas UV + Color Blending + Xuất GLB).
+  - [x] P5 (Texture & UV Shading): Đã hoàn thành `utils_3d.py`, `texture_blender.py` và `test_texture_blender.py`
   - [ ] P6 (Full-Stack & Cloud Lead): Web Three.js (`frontend/`), Runbook Colab Tunnel.
 - [x] **Bước 6: Kiểm thử và Đánh giá (Testing & Evaluation)**
   - [x] Đánh giá Tầng 1: Kiểm thử chất lượng lưới 3D (Watertightness, Polygon count, Base-color fidelity) qua `test_tsdf_pipeline.py` đạt 5/5 test pass 100%.
@@ -83,7 +83,7 @@
 
 ---
 
-### 📌 THEO DÕI TIẾN ĐỘ CHI TIẾT: THÀNH VIÊN 4 & 5 (P4 TSDF MESH & P5 TEXTURE BLENDER)
+### 📌 THEO DÕI TIẾN ĐỘ CHI TIẾT: THÀNH VIÊN 4 (P4 TSDF MESH)
 - [x] **Khởi tạo & Kế hoạch:** Đăng ký kế hoạch chi tiết trong `planforAI.md` và tạo branch `P4-TSDF-Mesh`.
 - [x] **Thuật toán 1 (Lọc viền độ sâu & Pruning điểm nền):** Hoàn thành `filter_depth_discontinuity()` theo công thức biến thiên gradient bậc 1 (DA3-blender) và `prune_background_points()` tích hợp Alpha Mask + Confidence.
 - [x] **Thuật toán 2 (Dựng lưới Voxel TSDF):** Hoàn thành class `TSDFVolume` hỗ trợ vector hóa slice-by-slice trên NumPy/SciPy, tích lũy thể tích có trọng số theo confidence DUSt3R.
@@ -102,4 +102,13 @@
 - [x] **Lưu trữ phiên bản Baseline P5 để Thành viên 5 đối chiếu:**
   - Đã sao lưu toàn bộ mã nguồn Texture Blender ban đầu và script thực nghiệm vào `notebook/backend/backup_p5/` (`texture_blender_baseline.py`, `run_experiments_baseline.py` và `README.md`).
   - Thành viên 5 có thể thoải mái phát triển phiên bản mới trên `texture_blender.py` mà không sợ mất code baseline ban đầu, sẵn sàng đối chuẩn hiệu năng và chất lượng UV/texture sau này.
+
+---
+
+### 📌 THEO DÕI TIẾN ĐỘ CHI TIẾT: THÀNH VIÊN 5 (P5 TEXTURE & UV SHADING)
+- [x] **Code:** Hoàn thành `notebook/backend/utils_3d.py` và `notebook/backend/texture_blender.py`.
+- [x] **Test:** Hoàn thành `notebook/backend/test_texture_blender.py`, kiểm tra projection/visibility, UV, color blending, texture baking, GLB và input mismatch.
+- [x] **Bàn giao:** Interface P5 nhận `images_rgb` từ P1, `camera_poses`/`focal_lengths` từ P2 và `Trimesh` từ P4; trả `(success, glb_path)` cho P6.
+- [x] **Tích hợp toàn hệ thống:** Đã nối hoàn tất toàn bộ chuỗi P1 -> P2 -> P3 -> P4 -> P5 (`TextureBlender.process_and_export()`) vào nhánh Quality PASS trong `app.py`.
+
 ---

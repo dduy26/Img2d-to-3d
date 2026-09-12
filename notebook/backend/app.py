@@ -20,6 +20,7 @@ from engine_dust3r import DUSt3REngine
 from quality_gate import QualityGate
 from engine_triposr import TripoSREngine
 from engine_tsdf_mesh import TSDFMeshEngine
+from texture_blender import TextureBlender
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO)
@@ -48,8 +49,10 @@ dust3r_engine = DUSt3REngine(device=device)
 # P4: TSDF Volumetric Mesh Engine (NVIDIA reference TSDF + Marching Cubes)
 tsdf_engine = TSDFMeshEngine(resolution=128)
 
-# Ghi chú: P5 (Texture Blender) sẽ do Thành viên 5 tự phát triển và tích hợp sau
-logger.info("═══ TẤT CẢ ENGINE P1-P4 ĐÃ SẴN SÀNG ═══")
+# P5: XAtlas UV Parameterization & Base-Color Texture Blender
+texture_blender = TextureBlender()
+
+logger.info("═══ TẤT CẢ ENGINE P1-P5 ĐÃ SẴN SÀNG ═══")
 
 
 # ============================================================================
@@ -158,7 +161,7 @@ async def generate_3d(files: List[UploadFile] = File(...)):
 
         # ── Bước 4: Phân luồng theo kết quả Quality Gate ──
         if is_high_quality:
-            # ✓ PASS: Chạy luồng NVIDIA P4 TSDF Mesh (Marching Cubes 360°)
+            # ✓ PASS: Chạy luồng NVIDIA P4 TSDF Mesh & P5 Texture Blender
             logger.info("[P4] Quality PASS → Dựng Mesh TSDF 360°...")
             mesh = tsdf_engine.reconstruct(
                 pointmaps_3d=pointmaps_3d,
@@ -167,11 +170,22 @@ async def generate_3d(files: List[UploadFile] = File(...)):
                 camera_poses=camera_poses,
                 focal_lengths=focal_lengths,
             )
-            # Xuất trực tiếp file .glb thành phẩm từ lưới 3D kín nước của P4
-            # (TODO P5: Thành viên 5 sẽ kết nối TextureBlender để trải UV và nướng màu tại đây)
-            mesh.export(output_glb_path, file_type="glb")
-            success = os.path.exists(output_glb_path)
-            model_path = output_glb_path
+
+            logger.info("[P5] Trải UV XAtlas & Nướng màu Base-Color Texture vào Mesh...")
+            success, model_path = texture_blender.process_and_export(
+                mesh=mesh,
+                images_rgb=preprocess_result["images_rgb"],
+                camera_poses=camera_poses,
+                focal_lengths=focal_lengths,
+                output_path=output_glb_path,
+            )
+            # Fallback an toàn nếu nướng texture gặp sự cố: xuất mesh thô trực tiếp
+            if not success or not os.path.exists(output_glb_path):
+                logger.warning("[P5] Nướng texture không thành công, fallback xuất mesh thô của P4.")
+                mesh.export(output_glb_path, file_type="glb")
+                success = os.path.exists(output_glb_path)
+                model_path = output_glb_path
+
             pipeline_type = "nvidia_tsdf_mesh"
         else:
             # ✗ FAIL: Kích hoạt cứu hộ TripoSR
