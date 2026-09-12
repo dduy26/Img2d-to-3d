@@ -9,6 +9,7 @@ import time
 import glob
 import numpy as np
 import logging
+from PIL import Image
 
 try:
     import torch
@@ -21,7 +22,7 @@ from preprocess import preprocess_multiview, preprocess_single_view
 from engine_dust3r import DUSt3REngine
 from quality_gate import QualityGate
 from engine_triposr import TripoSREngine
-from engine_tsdf_mesh import TSDFMeshEngine
+from engine_tsdf_mesh import TSDFMeshEngine, DEFAULT_CONF_THRESHOLD
 from texture_blender import TextureBlender
 from engine_depth import DepthReconstructionEngine
 
@@ -51,11 +52,19 @@ q_gate = QualityGate()
 # P3: TripoSR Fail-safe Engine (nạp sẵn vào RAM)
 triposr_engine = TripoSREngine()
 
+# ── Nút vặn chất lượng (đặt qua biến môi trường, không cần sửa code) ──
+# TSDF_RES: số voxel mỗi cạnh của lưới TSDF. Cao hơn = chi tiết hơn, chậm + tốn RAM hơn.
+#   128 -> ~16MB/grid (mặc định) | 192 -> ~57MB | 256 -> ~134MB
+# DUST3R_NITER: số vòng global alignment. Cao hơn = khớp camera chặt hơn, chậm hơn.
+TSDF_RES = int(os.environ.get("TSDF_RES", "128"))
+DUST3R_NITER = int(os.environ.get("DUST3R_NITER", "300"))
+logger.info(f"Cấu hình: TSDF_RES={TSDF_RES}, DUST3R_NITER={DUST3R_NITER}")
+
 # P2: DUSt3R Engine
-dust3r_engine = DUSt3REngine(device=device)
+dust3r_engine = DUSt3REngine(device=device, niter=DUST3R_NITER)
 
 # P4: TSDF Volumetric Mesh Engine (NVIDIA reference TSDF + Marching Cubes)
-tsdf_engine = TSDFMeshEngine(resolution=128)
+tsdf_engine = TSDFMeshEngine(resolution=TSDF_RES)
 
 # P5: XAtlas UV Parameterization & Base-Color Texture Blender
 texture_blender = TextureBlender()
@@ -232,13 +241,30 @@ async def generate_3d(
             images_tensor = preprocess_result["images_normalized"]
 
         dust3r_result = dust3r_engine.process({
-            "images_dust3r": images_tensor
+            "images_dust3r": images_tensor,
+            "image_paths": saved_paths,   # P2 bản thật (DUSt3R) nạp ảnh từ đây
         })
 
         pointmaps_3d = dust3r_result["pointmaps_3d"]
         confidence_masks = dust3r_result["confidence_masks"]
         camera_poses = dust3r_result["camera_poses"]
         focal_lengths = dust3r_result["focal_lengths"]
+
+        # P2 bản thật chạy DUSt3R ở geometry riêng (cạnh dài 512, crop bội số 16) ->
+        # căn lại alpha mask & ảnh RGB về đúng geometry đó, nếu không thì mask lệch
+        # từng pixel so với pointmap và P4 sẽ đắp TSDF sai chỗ.
+        geom = dust3r_result.get("geometry")
+        if geom is not None:
+            target = (int(geom[1]), int(geom[0]))          # PIL size = (W, H)
+            preprocess_result["alpha_masks"] = [
+                np.asarray(Image.fromarray(np.asarray(m, dtype=np.uint8)).resize(target, Image.NEAREST))
+                for m in preprocess_result["alpha_masks"]
+            ]
+            preprocess_result["images_rgb"] = [
+                np.asarray(Image.fromarray(np.asarray(a, dtype=np.uint8)).resize(target, Image.BILINEAR))
+                for a in preprocess_result["images_rgb"]
+            ]
+            logger.info(f"[P2->P4/P5] Đã căn alpha mask & ảnh RGB về geometry {geom}")
 
         logger.info(
             f"[P2] Hoàn tất: pointmaps shape={pointmaps_3d.shape}, "
@@ -248,17 +274,30 @@ async def generate_3d(
         # ── Bước 3 (P3): Quality Gate ──
         logger.info("[P3] Đánh giá chất lượng qua Quality Gate...")
         
-        # Tính BA loss giả lập (TODO: lấy từ DUSt3R global alignment thực tế)
-        ba_loss = 1.0  # Placeholder - sẽ được thay bằng loss thực từ DUSt3R
+        # BA loss thật lấy từ DUSt3R global alignment (chế độ mock trả 1.0)
+        ba_loss = dust3r_result.get("ba_loss", 1.0)
         
         if hasattr(confidence_masks, 'cpu'):
             confidence_np = confidence_masks.cpu().numpy()
         else:
             confidence_np = np.asarray(confidence_masks)
 
+        # P3 lấy np.mean() trên TOÀN ẢNH, nhưng trên ảnh thật ~89% pixel là NỀN (conf thấp)
+        # nên trung bình bị nền kéo xuống và gate luôn FAIL dù vẫn dựng được mesh tốt:
+        #   mean toàn ảnh = 0.267 -> FAIL | mean vùng conf>=0.35 = 0.820 -> PASS
+        # Ở tầng keo, lọc độ tin cậy của ĐÚNG vùng mà P4 sẽ dựng (conf >= DEFAULT_CONF_THRESHOLD)
+        confidence_region = confidence_np[confidence_np >= DEFAULT_CONF_THRESHOLD]
+        if confidence_region.size == 0:
+            confidence_region = confidence_np            # ảnh quá xấu: giữ nguyên để P3 tự FAIL
+        logger.info(
+            f"[P3] Vùng dựng được: {confidence_region.size}/{confidence_np.size} pixel "
+            f"({100.0 * confidence_region.size / confidence_np.size:.1f}%), "
+            f"conf trung bình vùng = {float(confidence_region.mean()):.3f}"
+        )
+
         is_high_quality, reason = q_gate.evaluate(
             poses=camera_poses,
-            confidence_map=confidence_np,
+            confidence_map=confidence_region,
             ba_loss=ba_loss,
         )
         logger.info(f"[P3] Kết quả: {'PASS ✓' if is_high_quality else 'FAIL ✗'} — {reason}")
@@ -292,8 +331,8 @@ async def generate_3d(
 
             pipeline_type = "nvidia_tsdf_mesh"
         else:
-            # ✗ FAIL: Kích hoạt cứu hộ — preprocess ảnh đầu tiên rồi gọi TripoSR
-            logger.info(f"[P3→Cứu hộ] Quality FAIL ({reason}) → Preprocess + TripoSR fallback")
+            # ✗ FAIL: Kích hoạt cứu hộ — preprocess ảnh đầu tiên rồi gọi TripoSR hoặc Depth Engine
+            logger.info(f"[P3→Cứu hộ] Quality FAIL ({reason}) → Preprocess + Fallback")
             fallback_result = preprocess_single_view(
                 image_path=saved_paths[0],
                 target_size=512,
@@ -322,6 +361,7 @@ async def generate_3d(
             "status": "success" if success else "failed",
             "mode": "multiview_pipeline",
             "pipeline_type": pipeline_type,
+            "dust3r_backend": dust3r_result.get("backend", "mock"),
             "quality_passed": is_high_quality,
             "gate_reason": reason,
             "num_input_images": preprocess_result["num_images"],

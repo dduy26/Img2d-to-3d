@@ -36,6 +36,15 @@
 
       <div id="thumbs" class="grid grid-cols-4 gap-2 mt-4"></div>
 
+      <!-- Mode selection for single view -->
+      <div id="modeWrapper" class="mt-3 hidden">
+        <label class="text-xs text-slate-400 block mb-1">Thuật toán xử lý 1 ảnh:</label>
+        <select id="singleMode" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyan-400">
+          <option value="fast">🚀 TripoSR (Tốc độ cao ~2s — Feed-Forward)</option>
+          <option value="geometric">📐 Depth-Anything-V2 + Poisson (Tái tạo Hình học)</option>
+        </select>
+      </div>
+
       <button id="run" class="mt-4 w-full py-3 rounded-xl font-semibold bg-cyan-500 hover:bg-cyan-400 text-slate-900 disabled:opacity-40 disabled:cursor-not-allowed" disabled>
         Tạo mô hình 3D
       </button>
@@ -103,6 +112,23 @@ async function showGlb(url) {
   initViewer(); clearModel(); document.getElementById('viewerHint').textContent = '';
   const gltf = await new GLTFLoader().loadAsync(url);
   model = gltf.scene;
+
+  // Cấu hình vật liệu để render đúng màu sắc (không bị đen do thiếu vertexColors hoặc baseColorFactor)
+  model.traverse(o => {
+    if (o.isMesh && o.material) {
+      if (o.geometry.attributes.color) {
+        o.material.vertexColors = true;
+      }
+      o.material.side = THREE.DoubleSide;
+      if (o.material.color) {
+        o.material.color.setRGB(1, 1, 1);
+      }
+      o.material.roughness = 0.6;
+      o.material.metalness = 0.05;
+      o.material.needsUpdate = true;
+    }
+  });
+
   const box = new THREE.Box3().setFromObject(model);
   const size = box.getSize(new THREE.Vector3()).length() || 1;
   const center = box.getCenter(new THREE.Vector3());
@@ -136,19 +162,29 @@ function setFiles(list) {
     img.className = 'h-16 w-full object-cover rounded-lg border border-slate-700';
     thumbsEl.appendChild(img);
   });
-  runBtn.disabled = picked.length === 0 || picked.length === 2 || picked.length === 3;
-  statusEl.textContent = picked.length ? `${picked.length} ảnh` : '';
-  if (picked.length === 2 || picked.length === 3) {
-    statusEl.textContent = '⚠️ Cần 1 ảnh, hoặc 4–8 ảnh đa góc';
-    statusEl.className = 'mt-3 text-sm text-amber-400 h-5';
+  runBtn.disabled = picked.length === 0;
+  const modeWrapper = document.getElementById('modeWrapper');
+  if (picked.length === 1) {
+    statusEl.textContent = '1 ảnh đầu vào (Chọn thuật toán bên dưới)';
+    statusEl.className = 'mt-3 text-sm text-cyan-400 h-5';
+    modeWrapper.classList.remove('hidden');
+  } else if (picked.length >= 2) {
+    statusEl.textContent = `${picked.length} ảnh: Multi-view Full Pipeline`;
+    statusEl.className = 'mt-3 text-sm text-emerald-400 h-5';
+    modeWrapper.classList.add('hidden');
   } else {
-    statusEl.className = 'mt-3 text-sm text-slate-400 h-5';
+    statusEl.textContent = '';
+    modeWrapper.classList.add('hidden');
   }
 }
 
 runBtn.addEventListener('click', async () => {
   const fd = new FormData();
   picked.forEach(f => fd.append('files', f, f.name));
+  if (picked.length === 1) {
+    const singleMode = document.getElementById('singleMode')?.value || 'fast';
+    fd.append('mode', singleMode);
+  }
   runBtn.disabled = true;
   const t0 = performance.now();
   const tick = setInterval(() => statusEl.textContent = `⏳ Đang xử lý… ${((performance.now() - t0) / 1000).toFixed(1)}s`, 100);
