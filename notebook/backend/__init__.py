@@ -3,6 +3,7 @@
 
 from notebook.backend.preprocess import (
     preprocess_multiview,
+    preprocess_single_view,
     validate_and_load_images,
     subsample_images,
     dust3r_resize,
@@ -12,6 +13,7 @@ from notebook.backend.preprocess import (
 
 __all__ = [
     "preprocess_multiview",
+    "preprocess_single_view",
     "validate_and_load_images",
     "subsample_images",
     "dust3r_resize",

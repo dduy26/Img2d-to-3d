@@ -442,7 +442,24 @@ def extract_alpha_masks(
             masks.append(np.ones((h, w), dtype=np.uint8))
         return masks
 
-    # Tải model RMBG-2.0 an toàn
+    # Nếu không có HF token trong môi trường, ưu tiên dùng rembg (u2net) offline trực tiếp
+    # để tránh gọi briaai/RMBG-2.0 bị lỗi 401 Unauthorized (gated repo)
+    has_hf_token = bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+    if not has_hf_token:
+        try:
+            import rembg
+            logger.info("Chạy tách nền bằng rembg (u2net) offline...")
+            for img in pil_images:
+                rgba = rembg.remove(img)
+                alpha = np.array(rgba.split()[3])
+                mask = (alpha > int(threshold * 255)).astype(np.uint8)
+                masks.append(mask)
+            logger.info(f"  ✓ Đã trích xuất {len(masks)} Alpha Masks bằng rembg!")
+            return masks
+        except Exception as rembg_err:
+            logger.warning(f"rembg offline không khả dụng: {rembg_err}. Thử tải RMBG-2.0...")
+
+    # Tải model RMBG-2.0 an toàn (nếu có token hoặc rembg không có)
     logger.info(f"Đang tải model briaai/RMBG-2.0 trên {device}...")
     try:
         model = AutoModelForImageSegmentation.from_pretrained(
@@ -451,11 +468,22 @@ def extract_alpha_masks(
         model = model.to(device)
         model.eval()
     except Exception as e:
-        logger.warning(f"Không thể tải RMBG-2.0: {e}. Tạo mask giả lập (toàn 1).")
-        for img in pil_images:
-            w, h = img.size
-            masks.append(np.ones((h, w), dtype=np.uint8))
-        return masks
+        logger.warning(f"Không thể tải RMBG-2.0: {e}. Kích hoạt fallback sang rembg (u2net)...")
+        try:
+            import rembg
+            for img in pil_images:
+                rgba = rembg.remove(img)
+                alpha = np.array(rgba.split()[3])
+                mask = (alpha > int(threshold * 255)).astype(np.uint8)
+                masks.append(mask)
+            logger.info(f"  ✓ Đã trích xuất {len(masks)} Alpha Masks thành công bằng rembg!")
+            return masks
+        except Exception as rembg_err:
+            logger.warning(f"rembg fallback cũng thất bại: {rembg_err}. Tạo mask toàn 1.")
+            for img in pil_images:
+                w, h = img.size
+                masks.append(np.ones((h, w), dtype=np.uint8))
+            return masks
 
     transform = transforms.Compose([
         transforms.Resize((1024, 1024)),
@@ -710,6 +738,211 @@ def preprocess_multiview(
                 item["image"].close()
             except Exception:
                 pass
+
+
+# ============================================================================
+# HÀM 7: PREPROCESS SINGLE VIEW (ĐÓNG GÓI CHO KỊCH BẢN 1 ẢNH — F1.2A)
+# ============================================================================
+
+def _center_crop_and_pad(
+    image_rgb: np.ndarray,
+    alpha_mask: np.ndarray,
+    target_size: int = DEFAULT_TARGET_SIZE,
+    fill_ratio: float = 0.82,
+) -> Tuple[np.ndarray, np.ndarray, float, Tuple[float, float]]:
+    """
+    Canh tâm vật thể dựa trên Bounding Box của Alpha Mask, co dãn bảo toàn
+    Aspect Ratio để vật thể chiếm ~80-85% khung hình, rồi đặt vào
+    Square Letterbox Padding target_size × target_size.
+
+    Đặc tả F1.2A trong docs/plan.md:
+        Crop Bounding Box → Canh giữa tâm → Scale bảo toàn Aspect Ratio
+        → Square Letterbox Padding 512×512
+
+    Args:
+        image_rgb: Ảnh RGB (H, W, 3) uint8.
+        alpha_mask: Mask nhị phân (H, W) uint8 {0, 1}.
+        target_size: Kích thước khung vuông đầu ra (mặc định 512).
+        fill_ratio: Tỉ lệ vật thể chiếm trong khung (mặc định 0.82 ≈ 82%).
+
+    Returns:
+        Tuple gồm:
+            - image_padded: np.ndarray (target_size, target_size, 3) uint8
+            - mask_padded: np.ndarray (target_size, target_size) uint8
+            - crop_scale: float — hệ số co dãn khi scale vào khung
+            - offset: Tuple[float, float] — (delta_x, delta_y) dời tâm
+    """
+    h, w = image_rgb.shape[:2]
+
+    # Tìm Bounding Box của vật thể từ alpha mask
+    ys, xs = np.where(alpha_mask > 0)
+    if len(ys) == 0:
+        # Mask rỗng (không phát hiện được vật thể) → dùng toàn bộ ảnh
+        logger.warning("Alpha mask rỗng, sử dụng toàn bộ ảnh làm vùng quan tâm.")
+        x_min, y_min, x_max, y_max = 0, 0, w, h
+    else:
+        x_min, y_min = int(xs.min()), int(ys.min())
+        x_max, y_max = int(xs.max()) + 1, int(ys.max()) + 1
+
+    # Mở rộng Bounding Box thêm 5% margin mỗi chiều để tránh cắt sát mép
+    bbox_w = x_max - x_min
+    bbox_h = y_max - y_min
+    margin_x = int(bbox_w * 0.05)
+    margin_y = int(bbox_h * 0.05)
+    x_min = max(0, x_min - margin_x)
+    y_min = max(0, y_min - margin_y)
+    x_max = min(w, x_max + margin_x)
+    y_max = min(h, y_max + margin_y)
+
+    # Crop vùng chứa vật thể
+    cropped_rgb = image_rgb[y_min:y_max, x_min:x_max]
+    cropped_mask = alpha_mask[y_min:y_max, x_min:x_max]
+
+    crop_h, crop_w = cropped_rgb.shape[:2]
+
+    # Tính scale để vật thể chiếm fill_ratio khung target_size
+    scale_x = (target_size * fill_ratio) / crop_w
+    scale_y = (target_size * fill_ratio) / crop_h
+    crop_scale = min(scale_x, scale_y)  # Bảo toàn Aspect Ratio
+
+    new_w = max(1, int(round(crop_w * crop_scale)))
+    new_h = max(1, int(round(crop_h * crop_scale)))
+
+    # Resize ảnh crop
+    from PIL import Image as _PILImage
+    pil_cropped = _PILImage.fromarray(cropped_rgb)
+    pil_resized = pil_cropped.resize((new_w, new_h), _PILImage.LANCZOS)
+    resized_rgb = np.array(pil_resized)
+
+    # Resize mask crop (nearest neighbor để giữ nhị phân)
+    pil_mask_cropped = _PILImage.fromarray(cropped_mask * 255)
+    pil_mask_resized = pil_mask_cropped.resize((new_w, new_h), _PILImage.NEAREST)
+    resized_mask = (np.array(pil_mask_resized) > 127).astype(np.uint8)
+
+    # Letterbox Padding: đặt vật thể vào giữa khung vuông
+    image_padded = np.full((target_size, target_size, 3), 255, dtype=np.uint8)
+    mask_padded = np.zeros((target_size, target_size), dtype=np.uint8)
+
+    offset_x = (target_size - new_w) // 2
+    offset_y = (target_size - new_h) // 2
+
+    image_padded[offset_y:offset_y + new_h, offset_x:offset_x + new_w] = resized_rgb
+    mask_padded[offset_y:offset_y + new_h, offset_x:offset_x + new_w] = resized_mask
+
+    delta_x = float(offset_x - x_min * crop_scale)
+    delta_y = float(offset_y - y_min * crop_scale)
+
+    logger.debug(
+        f"Center crop: bbox=({x_min},{y_min},{x_max},{y_max}), "
+        f"crop=({crop_w}x{crop_h}), scale={crop_scale:.4f}, "
+        f"placed=({new_w}x{new_h}) at offset=({offset_x},{offset_y})"
+    )
+
+    return image_padded, mask_padded, crop_scale, (delta_x, delta_y)
+
+
+def preprocess_single_view(
+    image_path: Union[str, Path],
+    target_size: int = DEFAULT_TARGET_SIZE,
+    device: str = "cpu",
+) -> Dict[str, Any]:
+    """
+    Hàm tiền xử lý ảnh đơn (Single-view) cho Kịch bản 1 — Đặc tả F1.2A.
+
+    Quy trình tuần tự:
+        1. Validate & Load ảnh (tái sử dụng validate_and_load_images)
+        2. Resize giữ aspect ratio (tái sử dụng dust3r_resize)
+        3. Trích xuất Alpha Mask bằng RMBG-2.0 (tái sử dụng extract_alpha_masks)
+        4. Canh tâm & Scale Normalization: Crop BBox → Center → Letterbox Padding
+        5. Ước tính Camera Intrinsics (focal length) từ kích thước ảnh
+
+    Args:
+        image_path: Đường dẫn file ảnh đầu vào (1 file duy nhất).
+        target_size: Kích thước cạnh khung vuông đầu ra (mặc định 512).
+        device: Thiết bị chạy RMBG-2.0 ('cpu' hoặc 'cuda').
+
+    Returns:
+        Dict chứa các trường dữ liệu chuẩn:
+            'image_rgb': np.ndarray (H, W, 3) uint8 — ảnh gốc đã resize (chưa canh tâm)
+            'image_centered': np.ndarray (target_size, target_size, 3) uint8 — ảnh đã canh tâm + padding
+            'alpha_mask': np.ndarray (H, W) uint8 {0,1} — mask trên ảnh đã resize
+            'alpha_mask_centered': np.ndarray (target_size, target_size) uint8 {0,1} — mask đã canh tâm
+            'focal_length': Tuple[float, float] — Camera Intrinsics ước tính (fx, fy)
+            'camera_intrinsics': Dict — Ma trận K đầy đủ {'fx', 'fy', 'cx', 'cy'}
+            'original_size': Tuple[int, int] — (W, H) gốc
+            'scale_factor': float — tỉ lệ co dãn resize
+            'crop_scale': float — tỉ lệ co dãn khi canh tâm
+            'filename': str — tên file gốc
+    """
+    logger.info(f"═══ BẮT ĐẦU PREPROCESSING ĐƠN ẢNH: {image_path} ═══")
+
+    # --- Bước 1: Validate & Load ---
+    logger.info("[1/5] Kiểm tra & đọc ảnh...")
+    loaded = validate_and_load_images([str(image_path)])
+    item = loaded[0]
+
+    try:
+        # --- Bước 2: Resize giữ aspect ratio ---
+        logger.info("[2/5] Resize ảnh...")
+        resized_img, scale_factor = dust3r_resize(item["image"], target_size=target_size)
+        image_rgb = np.array(resized_img)
+
+        # --- Bước 3: Trích xuất Alpha Mask ---
+        logger.info("[3/5] Trích xuất Alpha Mask (RMBG-2.0)...")
+        masks = extract_alpha_masks([resized_img], device=device)
+        alpha_mask = masks[0]
+
+        # --- Bước 4: Canh tâm & Scale Normalization ---
+        logger.info("[4/5] Canh tâm & Scale Normalization (F1.2A)...")
+        image_centered, mask_centered, crop_scale, offset = _center_crop_and_pad(
+            image_rgb, alpha_mask, target_size=target_size
+        )
+
+        # --- Bước 5: Ước tính Camera Intrinsics ---
+        logger.info("[5/5] Ước tính Camera Intrinsics...")
+        # Theo tài liệu danh_gia_va_luong_hoat_dong_2d_to_3d.md:
+        # fx = fy = max(width, height) — focal length tương đối
+        # cx, cy = width/2, height/2 — principal point
+        h_img, w_img = image_rgb.shape[:2]
+        fx = fy = float(max(w_img, h_img))
+        cx, cy = w_img / 2.0, h_img / 2.0
+
+        # Cập nhật Camera Intrinsics K → K' theo crop_scale và offset (F1.2A)
+        fx_prime = fx * crop_scale
+        fy_prime = fy * crop_scale
+        cx_prime = cx * crop_scale + offset[0]
+        cy_prime = cy * crop_scale + offset[1]
+
+        result = {
+            "image_rgb": image_rgb,
+            "image_centered": image_centered,
+            "alpha_mask": alpha_mask,
+            "alpha_mask_centered": mask_centered,
+            "focal_length": (fx_prime, fy_prime),
+            "camera_intrinsics": {
+                "fx": fx_prime, "fy": fy_prime,
+                "cx": cx_prime, "cy": cy_prime,
+                "fx_original": fx, "fy_original": fy,
+                "cx_original": cx, "cy_original": cy,
+            },
+            "original_size": item["original_size"],
+            "scale_factor": scale_factor,
+            "crop_scale": crop_scale,
+            "filename": item["filename"],
+        }
+
+        logger.info(
+            f"═══ HOÀN THÀNH PREPROCESSING ĐƠN ẢNH: "
+            f"rgb={image_rgb.shape}, centered={image_centered.shape}, "
+            f"focal=({fx_prime:.1f}, {fy_prime:.1f}) ═══"
+        )
+        return result
+
+    finally:
+        try:
+            item["image"].close()
+        except Exception:
+            pass
 
 
 def _normalize_for_dust3r(images: List[np.ndarray]) -> np.ndarray:
