@@ -51,5 +51,7 @@ notebook/backend/tsr/
 *.onnx
 
 # Temp uploads & generated outputs (dữ liệu runtime)
+temp_uploads/
+outputs/
 notebook/backend/temp_uploads/
 notebook/backend/outputs/

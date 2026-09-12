@@ -303,3 +303,60 @@ class TripoSREngine:
         """
 ```
 
+---
+
+# 🚀 KẾ HOẠCH TRIỂN KHAI CHI TIẾT: THÀNH VIÊN 4 (NVIDIA 3D RECONSTRUCTION)
+## VỊ TRÍ: 3D VOLUMETRIC MESH & TEXTURE BLENDING ENGINEER
+
+> **Người thực hiện:** P4 (3D Mesh) & P5 (Texture Blending)  
+> **Lý thuyết nền tảng:** [docs/lythuyet.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/lythuyet.md), [docs/phan_tich_chuyen_sau_reference_repos.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/phan_tich_chuyen_sau_reference_repos.md) (Phần 4: Chi tiết thuật toán & bản chất toán học)  
+> **Căn cứ plan tổng thể:** [docs/plan.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/plan.md)  
+> **Phạm vi mã nguồn chịu trách nhiệm:**
+> - `notebook/backend/engine_tsdf_mesh.py` (Lõi P4: Lọc biên độ sâu, Pruning điểm nền, Voxel TSDF Grid, Marching Cubes).
+> - `notebook/backend/texture_blender.py` (Lõi P5: XAtlas UV Unwrapping, Angle-Weighted Color Blending, Xuất file .glb).
+> - `notebook/backend/test_tsdf_pipeline.py` (Test suite kiểm thử độc lập P4 & P5).
+> - `notebook/backend/app.py` (Nối P4 & P5 vào nhánh Quality PASS thay cho mock TripoSR).
+
+---
+
+## 📦 PHẦN 1: CẤU TRÚC FILE & HỢP ĐỒNG GIAO DIỆN (INTERFACE CONTRACT)
+
+### 1.1 Hợp đồng dữ liệu đầu vào (Nhận từ P1 Preprocess & P2 DUSt3R):
+- `pointmaps_3d`: np.ndarray hoặc Tensor $(N, H, W, 3)$ — Tọa độ điểm 3D trong hệ quy chiếu thế giới chung.
+- `confidence_masks`: np.ndarray hoặc Tensor $(N, H, W)$ — Bản đồ độ tin cậy từ DUSt3R.
+- `alpha_masks`: List[np.ndarray] $(N, H, W)$ giá trị $\{0, 1\}$ — Mặt nạ phân đoạn từ RMBG-2.0.
+- `images_rgb`: List[np.ndarray] $(N, H, W, 3)$ uint8 — Ảnh RGB gốc đã cân bằng sáng (dành cho texturing).
+- `camera_poses`: List[np.ndarray] ma trận $4 \times 4$ $[R_i \mid T_i]$ của từng góc nhìn.
+- `focal_lengths`: List[Tuple[float, float]] $(f_x, f_y)$ tiêu cự camera.
+
+### 1.2 Hợp đồng dữ liệu đầu ra:
+- `TSDFMeshEngine.reconstruct(...)`: Trả về `Trimesh` object chứa vertices $(V, 3)$, faces $(F, 3)$, vertex normals $(V, 3)$.
+- `TextureBlender.process_and_export(...)`: Trả về `(success: bool, glb_path: str)` — File `.glb` hoàn chỉnh có Base-Color UV Texture map $1024 \times 1024$.
+
+---
+
+## 🛠️ PHẦN 2: LỘ TRÌNH THỰC HIỆN TUẦN TỰ (4 THUẬT TOÁN)
+
+- [x] **Thuật toán 1 (Lọc viền độ sâu & Pruning điểm nền):**
+  - Cắt tỉa 100% pixel nền qua Alpha Mask $\mathbf{M}_i(u, v) = 0$.
+  - Lọc điểm nhiễu $\mathbf{C}_i(u, v) < \tau_{\text{conf}}$.
+  - Tính gradient độ sâu $G_x = |D(u+1, v) - D(u-1, v)|, G_y = |D(u, v+1) - D(u, v-1)|$, loại bỏ điểm mép rách $\max(G_x, G_y) > \tau \cdot D(u, v)$.
+- [x] **Thuật toán 2 (Lưới thể tích TSDF Volumetric Fusion):**
+  - Thiết lập Voxel grid 3D theo Bounding Box của điểm hợp lệ.
+  - Chiếu voxel $\mathbf{p}$ về ảnh camera $i$, tính khoảng cách có dấu $d_i(\mathbf{p}) = D_i(\mathbf{x}_i) - z$.
+  - Cắt ngắn $[-\mu, +\mu]$ thành $\text{tsdf}_i(\mathbf{p})$.
+  - Tích lũy liên tục có trọng số theo confidence: $D_{\text{new}}(\mathbf{p}), W_{\text{new}}(\mathbf{p})$.
+- [x] **Thuật toán 3 (Trích xuất Iso-surface Marching Cubes):**
+  - Quét 8 đỉnh của từng voxel qua Look-up Table 256 cấu hình tam giác tại $D = 0$.
+  - Nội suy vị trí đỉnh, tính toán vertex normals và dọn dẹp các mảnh tam giác rời rạc.
+- [x] **Thuật toán 4 (Trải UV XAtlas & Nướng màu Angle-Weighted Blending):**
+  - Tham số hóa UV vào khung $[0, 1] \times [0, 1]$.
+  - Tính vector nhìn $\vec{v}_i$, pháp tuyến $\vec{n}$, góc $\cos \theta_i = \max(0, \vec{n} \cdot \vec{v}_i)$.
+  - Trọng số $W_i = (\cos \theta_i)^\gamma$ ($\gamma \approx 2 \sim 4$), ray-cast kiểm tra che khuất.
+  - Hòa trộn màu albedo khuếch tán, xuất file `.glb` chuẩn qua Trimesh.
+- [x] **Kiểm thử & Nối luồng:**
+  - Viết `test_tsdf_pipeline.py` kiểm thử độc lập 100% pass trên dữ liệu mô phỏng.
+  - Nối vào `app.py`, hoàn thiện luồng End-to-End.
+
+
+

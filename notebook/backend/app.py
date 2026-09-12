@@ -5,15 +5,21 @@ import shutil
 import os
 import time
 import glob
-import torch
 import numpy as np
 import logging
+
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 # Import các module trong pipeline
 from preprocess import preprocess_multiview
 from engine_dust3r import DUSt3REngine
 from quality_gate import QualityGate
 from engine_triposr import TripoSREngine
+from engine_tsdf_mesh import TSDFMeshEngine
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO)
@@ -27,7 +33,7 @@ os.makedirs("outputs", exist_ok=True)
 # ============================================================================
 # KHỞI TẠO TẤT CẢ ENGINE (Chỉ chạy 1 lần lúc bật server)
 # ============================================================================
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda" if (HAS_TORCH and torch.cuda.is_available()) else "cpu"
 logger.info(f"Sử dụng device: {device}")
 
 # P3: Quality Gate
@@ -39,7 +45,11 @@ triposr_engine = TripoSREngine()
 # P2: DUSt3R Engine
 dust3r_engine = DUSt3REngine(device=device)
 
-logger.info("═══ TẤT CẢ ENGINE ĐÃ SẴN SÀNG ═══")
+# P4: TSDF Volumetric Mesh Engine (NVIDIA reference TSDF + Marching Cubes)
+tsdf_engine = TSDFMeshEngine(resolution=128)
+
+# Ghi chú: P5 (Texture Blender) sẽ do Thành viên 5 tự phát triển và tích hợp sau
+logger.info("═══ TẤT CẢ ENGINE P1-P4 ĐÃ SẴN SÀNG ═══")
 
 
 # ============================================================================
@@ -109,7 +119,10 @@ async def generate_3d(files: List[UploadFile] = File(...)):
 
         # ── Bước 2 (P2): DUSt3R Multi-view Reconstruction ──
         logger.info("[P2] Chạy DUSt3R pairwise matching + global alignment...")
-        images_tensor = torch.from_numpy(preprocess_result["images_normalized"]).to(device)
+        if HAS_TORCH:
+            images_tensor = torch.from_numpy(preprocess_result["images_normalized"]).to(device)
+        else:
+            images_tensor = preprocess_result["images_normalized"]
 
         dust3r_result = dust3r_engine.process({
             "images_dust3r": images_tensor
@@ -131,7 +144,11 @@ async def generate_3d(files: List[UploadFile] = File(...)):
         # Tính BA loss giả lập (TODO: lấy từ DUSt3R global alignment thực tế)
         ba_loss = 1.0  # Placeholder - sẽ được thay bằng loss thực từ DUSt3R
         
-        confidence_np = confidence_masks.cpu().numpy()
+        if hasattr(confidence_masks, 'cpu'):
+            confidence_np = confidence_masks.cpu().numpy()
+        else:
+            confidence_np = np.asarray(confidence_masks)
+
         is_high_quality, reason = q_gate.evaluate(
             poses=camera_poses,
             confidence_map=confidence_np,
@@ -141,30 +158,39 @@ async def generate_3d(files: List[UploadFile] = File(...)):
 
         # ── Bước 4: Phân luồng theo kết quả Quality Gate ──
         if is_high_quality:
-            # ✓ PASS: Dùng kết quả DUSt3R để tạo mesh
-            # TODO (P4): TSDF Fusion → Mesh → Texturing → Export .glb
-            # Hiện tại tạm dùng TripoSR vì chưa có P4 TSDF Mesh
-            logger.info("[P4] Quality PASS → Tạo mesh từ DUSt3R (tạm dùng TripoSR)")
-            success, model_path, exec_time = triposr_engine.run_fallback(
-                saved_paths[0], output_glb_path
+            # ✓ PASS: Chạy luồng NVIDIA P4 TSDF Mesh (Marching Cubes 360°)
+            logger.info("[P4] Quality PASS → Dựng Mesh TSDF 360°...")
+            mesh = tsdf_engine.reconstruct(
+                pointmaps_3d=pointmaps_3d,
+                alpha_masks=preprocess_result["alpha_masks"],
+                confidence_masks=confidence_masks,
+                camera_poses=camera_poses,
+                focal_lengths=focal_lengths,
             )
+            # Xuất trực tiếp file .glb thành phẩm từ lưới 3D kín nước của P4
+            # (TODO P5: Thành viên 5 sẽ kết nối TextureBlender để trải UV và nướng màu tại đây)
+            mesh.export(output_glb_path, file_type="glb")
+            success = os.path.exists(output_glb_path)
+            model_path = output_glb_path
+            pipeline_type = "nvidia_tsdf_mesh"
         else:
             # ✗ FAIL: Kích hoạt cứu hộ TripoSR
             logger.info(f"[P3→Cứu hộ] Quality FAIL ({reason}) → Gọi TripoSR fallback")
-            success, model_path, exec_time = triposr_engine.run_fallback(
+            success, model_path, _ = triposr_engine.run_fallback(
                 saved_paths[0], output_glb_path
             )
+            pipeline_type = "triposr_fallback"
 
         total_time = time.time() - pipeline_start
 
         return {
             "status": "success" if success else "failed",
             "mode": "multiview_pipeline",
+            "pipeline_type": pipeline_type,
             "quality_passed": is_high_quality,
             "gate_reason": reason,
             "num_input_images": preprocess_result["num_images"],
             "execution_time_seconds": round(total_time, 2),
-            "triposr_time_seconds": round(exec_time, 2),
             "output_file": model_path,
         }
 
