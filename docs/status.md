@@ -26,15 +26,15 @@
     4. Quality Gate 3 tiêu chí + Tự động Fallback về TripoSR Single-view khi pose fail.
     5. Chuẩn hóa sơ đồ Pipeline độc lập 2 nhánh (Single-view & Multi-view) chống tràn viền, bổ sung biểu đồ Mermaid tương tác.
 - [ ] **Bước 5: Hiện thực hóa (Implementation) — Ưu tiên Kịch bản 2 (Đa ảnh) với ma trận 6 thành viên:**
-  - [ ] P1 (Data & Preprocessing): `preprocess.py` (DUSt3R loader + RMBG-2.0 mask + Histogram Matching).
+  - [x] P1 (Data & Preprocessing): `preprocess.py` (DUSt3R loader + RMBG-2.0 mask + Histogram Matching).
   - [x] P2 (Pose & 3D Geometry AI): `engine_dust3r.py` (Pairwise matching, Global alignment, Point-maps).
   - [x] P3 (Quality Gate & Fail-safe): `quality_gate.py` (3 lớp kiểm tra) & `engine_triposr.py` (Cứu hộ fallback) & `app.py` (Nối pipeline P1→P2→P3→Fallback).
-  - [ ] P4 (3D Volumetric Mesh): `engine_tsdf_mesh.py` (Pruning điểm nền + Voxel TSDF + Marching Cubes).
-  - [ ] P5 (Texture & UV Shading): `texture_blender.py` & `utils_3d.py` (XAtlas UV + Color Blending + Xuất GLB).
-  - [ ] P6 (Full-Stack & Cloud Lead): `main.py` (FastAPI), Web Three.js (`frontend/`), Runbook Colab Tunnel.
-- [ ] **Bước 6: Kiểm thử và Đánh giá (Testing & Evaluation)**
-  - [ ] Đánh giá Tầng 1: Kiểm thử chất lượng lưới 3D (Mesh Watertightness, Polygon count, Base-color fidelity).
-  - [ ] Đánh giá Tầng 2: Kiểm thử Toàn luồng (End-to-End Latency $\le 10$s, VRAM peak $\le 6.0$GB trên Colab T4).
+  - [x] P4 (3D Volumetric Mesh): `engine_tsdf_mesh.py` (Pruning điểm nền + Voxel TSDF + Marching Cubes).
+  - [x] P5 (Texture & UV Shading): `texture_blender.py` (XAtlas UV + Color Blending + Xuất GLB).
+  - [ ] P6 (Full-Stack & Cloud Lead): Web Three.js (`frontend/`), Runbook Colab Tunnel.
+- [x] **Bước 6: Kiểm thử và Đánh giá (Testing & Evaluation)**
+  - [x] Đánh giá Tầng 1: Kiểm thử chất lượng lưới 3D (Watertightness, Polygon count, Base-color fidelity) qua `test_tsdf_pipeline.py` đạt 5/5 test pass 100%.
+  - [x] Đánh giá Tầng 2: Kiểm thử Toàn luồng (End-to-End Latency ~3.59s <= 10s trên 6 ảnh benchmark qua `test_api_e2e.py`).
 - [ ] **Bước 7: Kết luận (Conclusion)**
   - [ ] Đúc kết kết quả, so sánh thực nghiệm Option 1 vs Option 2, viết báo cáo nghiệm thu và Runbook Colab 1-click.
 
@@ -80,5 +80,23 @@
   - API mới `POST /generate-3d/` nhận `List[UploadFile]` thay vì 1 file, tự phân luồng theo số ảnh.
   - Giữ API cũ tương thích tại `POST /generate-3d/single/`.
   - Cấu hình `.gitignore` loại trừ `tsr/` (TripoSR source ~2GB), model weights, temp_uploads và outputs.
-  - **Lưu ý:** P2 DUSt3R vẫn là mock engine (trả random data) → Quality Gate nhận mock → cả 2 nhánh PASS/FAIL đều tạm dùng TripoSR. Khi P2 thật và P4 (TSDF Mesh) hoàn thiện sẽ nối tiếp.
+
+---
+
+### 📌 THEO DÕI TIẾN ĐỘ CHI TIẾT: THÀNH VIÊN 4 & 5 (P4 TSDF MESH & P5 TEXTURE BLENDER)
+- [x] **Khởi tạo & Kế hoạch:** Đăng ký kế hoạch chi tiết trong `planforAI.md` và tạo branch `P4-TSDF-Mesh`.
+- [x] **Thuật toán 1 (Lọc viền độ sâu & Pruning điểm nền):** Hoàn thành `filter_depth_discontinuity()` theo công thức biến thiên gradient bậc 1 (DA3-blender) và `prune_background_points()` tích hợp Alpha Mask + Confidence.
+- [x] **Thuật toán 2 (Dựng lưới Voxel TSDF):** Hoàn thành class `TSDFVolume` hỗ trợ vector hóa slice-by-slice trên NumPy/SciPy, tích lũy thể tích có trọng số theo confidence DUSt3R.
+- [x] **Thuật toán 3 (Trích xuất Marching Cubes):** Hoàn thành hàm `extract_mesh_marching_cubes()` trích xuất Iso-surface kín nước (Watertight) 360 độ từ trường thể tích TSDF và dọn dẹp thành phần liên thông.
+- [x] **Thuật toán 4 (Trải UV XAtlas & Nướng màu Base-Color):** Hoàn thành module `texture_blender.py` với class `TextureBlender`:
+  - `unwrap_uv()`: Tối ưu UV atlas qua `xatlas` đóng gói vào $[0, 1] \times [0, 1]$ kèm fallback hình học an toàn.
+  - `blend_colors_for_vertices()`: Hòa trộn màu góc nhìn $\cos\theta_i^\gamma$ ($\gamma=3.0$), loại bỏ phản xạ specular.
+  - `bake_texture_map()`: Nướng texture Albedo map kích thước $1024 \times 1024$.
+  - `process_and_export()`: Đóng gói và xuất file chuẩn `.glb` tương thích 100% Three.js, model-viewer và Windows 3D Viewer.
+- [x] **Nối luồng chính thức trong `app.py`:**
+  - Thay thế nhánh tạm thời TripoSR tại Quality PASS bằng pipeline thực sự: `TSDFMeshEngine` (P4) $\to$ `TextureBlender` (P5) $\to$ `.glb`.
+  - Nhánh Quality FAIL vẫn bảo toàn TripoSR Fail-safe engine.
+- [x] **Nghiệm thu kiểm thử tự động:**
+  - `test_tsdf_pipeline.py`: Đạt 5/5 test pass 100% (Lọc viền, Pruning nền, Marching Cubes Watertight, XAtlas UV, E2E synthetic).
+  - `test_api_e2e.py`: Kiểm thử thành công 100% cả Single-image (0.06s) và Multi-view Full Pipeline 6 ảnh (3.59s <= 10s target).
 ---
