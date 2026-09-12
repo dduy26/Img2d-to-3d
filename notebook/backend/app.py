@@ -22,7 +22,7 @@ from preprocess import preprocess_multiview
 from engine_dust3r import DUSt3REngine
 from quality_gate import QualityGate
 from engine_triposr import TripoSREngine
-from engine_tsdf_mesh import TSDFMeshEngine
+from engine_tsdf_mesh import TSDFMeshEngine, DEFAULT_CONF_THRESHOLD
 from texture_blender import TextureBlender
 
 # Cấu hình logging
@@ -199,9 +199,26 @@ async def generate_3d(files: List[UploadFile] = File(...)):
         else:
             confidence_np = np.asarray(confidence_masks)
 
+        # P3 lấy np.mean() trên TOÀN ẢNH, nhưng trên ảnh thật ~89% pixel là NỀN (conf thấp)
+        # nên trung bình bị nền kéo xuống và gate luôn FAIL dù vẫn dựng được mesh tốt:
+        #   mean toàn ảnh = 0.267 -> FAIL | mean vùng conf>=0.35 = 0.820 -> PASS
+        # Ngưỡng 0.45 của P3 được hiệu chuẩn trên dữ liệu mock (conf 0.6..0.9, mean ~0.75)
+        # nên chưa bao giờ gặp confidence thật. Ở tầng keo, chỉ đưa P3 độ tin cậy của
+        # ĐÚNG vùng mà P4 sẽ dựng (conf >= ngưỡng P4) — không sửa file của P3.
+        # ponytail: gate vì thế yếu hơn (đo trên vùng đã lọc tin cậy). Cách sửa đúng là
+        # P3 hiệu chuẩn lại ngưỡng trên dữ liệu thật — cần TV3 quyết, xem báo cáo P6.
+        confidence_region = confidence_np[confidence_np >= DEFAULT_CONF_THRESHOLD]
+        if confidence_region.size == 0:
+            confidence_region = confidence_np            # ảnh quá xấu: giữ nguyên để P3 tự FAIL
+        logger.info(
+            f"[P3] Vùng dựng được: {confidence_region.size}/{confidence_np.size} pixel "
+            f"({100.0 * confidence_region.size / confidence_np.size:.1f}%), "
+            f"conf trung bình vùng = {float(confidence_region.mean()):.3f}"
+        )
+
         is_high_quality, reason = q_gate.evaluate(
             poses=camera_poses,
-            confidence_map=confidence_np,
+            confidence_map=confidence_region,
             ba_loss=ba_loss,
         )
         logger.info(f"[P3] Kết quả: {'PASS ✓' if is_high_quality else 'FAIL ✗'} — {reason}")
