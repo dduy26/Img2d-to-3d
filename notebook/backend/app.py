@@ -306,10 +306,12 @@ async def generate_3d(
         )
         logger.info(f"[P3] Kết quả: {'PASS ✓' if is_high_quality else 'FAIL ✗'} — {reason}")
 
-        # ── Bước 4: Phân luồng theo kết quả Quality Gate ──
-        if is_high_quality:
-            # ✓ PASS: Chạy luồng NVIDIA P4 TSDF Mesh & P5 Texture Blender
-            logger.info("[P4] Quality PASS → Dựng Mesh TSDF 360°...")
+        # ── Bước 4: Tái tạo 3D Đa Góc Nhìn (N ảnh -> 1 model duy nhất) ──
+        # Luôn ưu tiên hợp nhất toàn bộ N ảnh qua P4 TSDF Mesh & P5 Texture Blender.
+        # Quality Gate đóng vai trò đánh giá chất lượng (quality score) và cảnh báo,
+        # không tự ý hủy bỏ dữ liệu N ảnh của người dùng.
+        logger.info(f"[P4] Bắt đầu hợp nhất {preprocess_result['num_images']} ảnh vào lưới TSDF 360°...")
+        try:
             mesh = tsdf_engine.reconstruct(
                 pointmaps_3d=pointmaps_3d,
                 alpha_masks=preprocess_result["alpha_masks"],
@@ -318,7 +320,7 @@ async def generate_3d(
                 focal_lengths=focal_lengths,
             )
 
-            logger.info("[P5] Trải UV XAtlas & Nướng màu Base-Color Texture vào Mesh...")
+            logger.info(f"[P5] Trải UV XAtlas & Nướng màu từ toàn bộ {len(preprocess_result['images_rgb'])} ảnh vào Mesh...")
             success, model_path = texture_blender.process_and_export(
                 mesh=mesh,
                 images_rgb=preprocess_result["images_rgb"],
@@ -326,17 +328,18 @@ async def generate_3d(
                 focal_lengths=focal_lengths,
                 output_path=output_glb_path,
             )
-            # Fallback an toàn nếu nướng texture gặp sự cố: xuất mesh thô trực tiếp
+            # Nếu nướng texture gặp sự cố, vẫn giữ nguyên mesh 360° dựng từ N ảnh và xuất trực tiếp
             if not success or not os.path.exists(output_glb_path):
-                logger.warning("[P5] Nướng texture không thành công, fallback xuất mesh thô của P4.")
+                logger.warning("[P5] Nướng texture không thành công, xuất mesh màu đỉnh 360° trực tiếp của P4.")
                 mesh.export(output_glb_path, file_type="glb")
                 success = os.path.exists(output_glb_path)
                 model_path = output_glb_path
 
-            pipeline_type = "nvidia_tsdf_mesh"
-        else:
-            # ✗ FAIL: Kích hoạt cứu hộ — preprocess ảnh đầu tiên rồi gọi TripoSR hoặc Depth Engine
-            logger.info(f"[P3→Cứu hộ] Quality FAIL ({reason}) → Preprocess + Fallback")
+            pipeline_type = "nvidia_tsdf_multiview"
+
+        except Exception as mv_err:
+            # Chỉ kích hoạt cứu hộ khi khối đa ảnh gặp lỗi ngoại lệ nghiêm trọng (VD: 0 điểm 3D hợp lệ)
+            logger.error(f"[P4/P5 Ngoại lệ: {mv_err}] → Kích hoạt cứu hộ khẩn cấp từ ảnh số 1...")
             fallback_result = preprocess_single_view(
                 image_path=saved_paths[0],
                 target_size=512,
@@ -348,16 +351,16 @@ async def generate_3d(
                     alpha_mask=fallback_result["alpha_mask_centered"],
                     output_glb_path=output_glb_path,
                 )
-                pipeline_type = "triposr_fallback"
+                pipeline_type = "triposr_emergency_fallback"
             else:
-                logger.info("[P3→Cứu hộ] TripoSR chưa có weights, chuyển sang Depth Engine...")
+                logger.info("[Cứu hộ khẩn cấp] Chuyển sang Depth Engine...")
                 success, model_path, _ = depth_engine.reconstruct(
                     image_rgb=fallback_result["image_centered"],
                     alpha_mask=fallback_result["alpha_mask_centered"],
                     focal_length=fallback_result["focal_length"],
                     output_path=output_glb_path,
                 )
-                pipeline_type = "depth_geometric_fallback"
+                pipeline_type = "depth_emergency_fallback"
 
         total_time = time.time() - pipeline_start
 
