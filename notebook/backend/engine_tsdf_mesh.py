@@ -17,6 +17,7 @@ Tài liệu tham khảo:
     - docs/lythuyet.md
 """
 
+import os
 import logging
 import time
 from typing import List, Tuple, Optional, Dict, Any, Union
@@ -255,15 +256,24 @@ class TSDFVolume:
         else:
             self.trunc_margin = float(trunc_margin)
 
-        # Lưới TSDF: khởi tạo 1.0 (free space / trống)
-        self.tsdf_grid = np.ones((resolution, resolution, resolution), dtype=np.float32)
+        # Lưới TSDF: Khởi tạo -1.0 (mặc định là thể tích đặc bên trong Bounding Box)
+        # Các tia quan sát từ camera sẽ gọt (carve) không gian trống thành +1.0
+        self.tsdf_grid = np.full((resolution, resolution, resolution), -1.0, dtype=np.float32)
 
         # Lưới trọng số tích lũy: khởi tạo 0.0
         self.weight_grid = np.zeros((resolution, resolution, resolution), dtype=np.float32)
 
+        # Đệm biên 1-voxel xung quanh 6 mặt ngoài để Marching Cubes tự động đóng kín đáy và các cạnh
+        self.tsdf_grid[0, :, :] = 1.0
+        self.tsdf_grid[-1, :, :] = 1.0
+        self.tsdf_grid[:, 0, :] = 1.0
+        self.tsdf_grid[:, -1, :] = 1.0
+        self.tsdf_grid[:, :, 0] = 1.0
+        self.tsdf_grid[:, :, -1] = 1.0
+
         logger.info(
             f"Khởi tạo TSDF Volume: {resolution}^3 voxels, "
-            f"vsize={self.voxel_size:.4f}m, trunc_margin={self.trunc_margin:.4f}m"
+            f"vsize={self.voxel_size:.4f}m, trunc_margin={self.trunc_margin:.4f}m (Solid Carving Mode)"
         )
 
     def integrate(
@@ -276,14 +286,14 @@ class TSDFVolume:
         focal_length: Tuple[float, float],
     ):
         """
-        Chiếu và tích lũy một góc quan sát camera vào thể tích Voxel TSDF bằng Space Carving.
+        Chiếu và tích lũy một góc quan sát camera vào thể tích Voxel TSDF bằng True Solid Space Carving.
 
-        Bản chất hình học:
-            1. Bất kỳ voxel nào chiếu vào hậu cảnh (alpha == 0) đều là KHOẢNG TRỐNG (+1.0) -> Gọt khối thể tích.
+        Bản chất hình học chuẩn (NVIDIA / Volumetric Reconstruction):
+            1. Voxel chiếu vào hậu cảnh (alpha == 0): Toàn bộ tia là KHÔNG GIAN TỰ DO (+1.0) -> Gọt khối thể tích.
             2. Voxel chiếu vào vật thể (alpha == 1):
-               - Phía trước bề mặt: khoảng trống (+1.0)
-               - Bề mặt: d_surface - z_cam == 0 (zero-crossing)
-               - Phía sau bề mặt: bên trong vật thể (-1.0) -> Ruột đặc 360 độ kín.
+               - Phía trước bề mặt (z_cam < d_surface - mu): Không gian nhìn xuyên thấu -> Carve thành +1.0.
+               - Lớp bề mặt (|z_cam - d_surface| <= mu): Chuyển tiếp tuyến tính qua 0.0 (Iso-surface).
+               - Phía sau bề mặt (z_cam > d_surface + mu): RUỘT ĐẶC VẬT THỂ (-1.0). Giữ nguyên âm để tạo khối kín.
         """
         h, w = alpha_mask.shape
         fx, fy = focal_length
@@ -312,7 +322,8 @@ class TSDFVolume:
 
         grid_x, grid_y = np.meshgrid(xs, ys, indexing='ij')
 
-        for k in range(self.resolution):
+        # Chỉ lặp các voxel bên trong (bỏ qua border 0 và resolution-1 để bảo vệ lớp đệm kín nước)
+        for k in range(1, self.resolution - 1):
             z_val = zs[k]
             pts_world_slice = np.stack([grid_x, grid_y, np.full_like(grid_x, z_val)], axis=-1)
 
@@ -333,11 +344,19 @@ class TSDFVolume:
                 continue
 
             valid_indices = np.where(in_image)[0]
+            # Bỏ qua các chỉ số ở biên X, Y để bảo tồn lớp đệm ngoài
+            i_coords = valid_indices // self.resolution
+            j_coords = valid_indices % self.resolution
+            inner_mask = (i_coords > 0) & (i_coords < self.resolution - 1) & (j_coords > 0) & (j_coords < self.resolution - 1)
+            valid_indices = valid_indices[inner_mask]
+            if len(valid_indices) == 0:
+                continue
+
             u_valid = u_proj[valid_indices]
             v_valid = v_proj[valid_indices]
             z_c_valid = z_cam[valid_indices]
 
-            # 1. Background Carving: Bất kỳ voxel nào chiếu vào hậu cảnh là KHOẢNG TRỐNG (TSDF = +1.0)
+            # 1. Background Carving: Voxel chiếu vào hậu cảnh -> Không khí tự do (+1.0)
             is_fg = (alpha_mask[v_valid, u_valid] > 0.5)
             bg_indices = valid_indices[~is_fg]
             if len(bg_indices) > 0:
@@ -347,10 +366,11 @@ class TSDFVolume:
                 old_tsdf = self.tsdf_grid[i_bg, j_bg, k]
                 old_w = self.weight_grid[i_bg, j_bg, k]
                 new_w = old_w + w_bg
+                # Tia nhìn xuyên thấu vào nền: chắc chắn là không khí (+1.0)
                 self.tsdf_grid[i_bg, j_bg, k] = (old_w * old_tsdf + w_bg * 1.0) / np.maximum(new_w, 1e-6)
                 self.weight_grid[i_bg, j_bg, k] = new_w
 
-            # 2. Object Pixels: Tính TSDF bề mặt và phần ruột bên trong
+            # 2. Object Pixels: Xử lý trước bề mặt, lớp bề mặt và phần ruột
             fg_indices = valid_indices[is_fg]
             if len(fg_indices) == 0:
                 continue
@@ -359,34 +379,54 @@ class TSDFVolume:
             v_sub = v_proj[fg_indices]
             z_c_sub = z_cam[fg_indices]
 
-            # Độ sâu quan sát được từ pointmap
             d_surface = depth_obs[v_sub, u_sub]
-
-            # Khoảng cách có dấu đến bề mặt: d(p) = d_surface - z_cam
-            # s > 0: trước bề mặt (+1.0)
-            # s = 0: bề mặt (0.0)
-            # s < 0: sau bề mặt (-1.0)
             signed_dist = d_surface - z_c_sub
-            tsdf_val = np.clip(signed_dist / self.trunc_margin, -1.0, 1.0)
-
-            # Trọng số theo confidence từ DUSt3R
-            weight = conf_map[v_sub, u_sub]
 
             i_idx = fg_indices // self.resolution
             j_idx = fg_indices % self.resolution
+            weight = conf_map[v_sub, u_sub]
 
-            old_tsdf = self.tsdf_grid[i_idx, j_idx, k]
-            old_w = self.weight_grid[i_idx, j_idx, k]
+            # (a) Phía trước bề mặt: Không gian trống (s > 0)
+            front_mask = signed_dist > self.trunc_margin
+            if np.any(front_mask):
+                i_f = i_idx[front_mask]
+                j_f = j_idx[front_mask]
+                w_f = weight[front_mask]
+                old_tsdf = self.tsdf_grid[i_f, j_f, k]
+                old_w = self.weight_grid[i_f, j_f, k]
+                new_w = old_w + w_f
+                self.tsdf_grid[i_f, j_f, k] = (old_w * old_tsdf + w_f * 1.0) / np.maximum(new_w, 1e-6)
+                self.weight_grid[i_f, j_f, k] = new_w
 
-            new_w = old_w + weight
-            new_tsdf = (old_w * old_tsdf + weight * tsdf_val) / np.maximum(new_w, 1e-6)
+            # (b) Vùng bề mặt (|s| <= trunc_margin): Nội suy tuyến tính qua 0
+            surf_mask = np.abs(signed_dist) <= self.trunc_margin
+            if np.any(surf_mask):
+                i_s = i_idx[surf_mask]
+                j_s = j_idx[surf_mask]
+                w_s = weight[surf_mask]
+                s_val = np.clip(signed_dist[surf_mask] / self.trunc_margin, -1.0, 1.0)
+                old_tsdf = self.tsdf_grid[i_s, j_s, k]
+                old_w = self.weight_grid[i_s, j_s, k]
+                new_w = old_w + w_s
+                self.tsdf_grid[i_s, j_s, k] = (old_w * old_tsdf + w_s * s_val) / np.maximum(new_w, 1e-6)
+                self.weight_grid[i_s, j_s, k] = new_w
 
-            self.tsdf_grid[i_idx, j_idx, k] = new_tsdf
-            self.weight_grid[i_idx, j_idx, k] = new_w
+            # (c) Phía sau bề mặt (s < -trunc_margin): Ruột đặc vật thể (-1.0)
+            back_mask = signed_dist < -self.trunc_margin
+            if np.any(back_mask):
+                i_b = i_idx[back_mask]
+                j_b = j_idx[back_mask]
+                w_b = weight[back_mask] * 0.2
+                old_tsdf = self.tsdf_grid[i_b, j_b, k]
+                old_w = self.weight_grid[i_b, j_b, k]
+                new_w = old_w + w_b
+                # Củng cố trạng thái ruột đặc (-1.0)
+                self.tsdf_grid[i_b, j_b, k] = (old_w * old_tsdf + w_b * (-1.0)) / np.maximum(new_w, 1e-6)
+                self.weight_grid[i_b, j_b, k] = new_w
 
 
 # ============================================================================
-# THUẬT TOÁN 3: TRÍCH XUẤT MẶT ĐẲNG TRỊ MARCHING CUBES
+# THUẬT TOÁN 3: TRÍCH XUẤT MẶT ĐẲNG TRỊ MARCHING CUBES (WATERTIGHT SOLID MESH)
 # ============================================================================
 
 def extract_mesh_marching_cubes(
@@ -394,29 +434,24 @@ def extract_mesh_marching_cubes(
     min_weight: float = DEFAULT_MIN_WEIGHT,
 ) -> trimesh.Trimesh:
     """
-    Thuật toán 3: Trích xuất mặt đẳng trị (Marching Cubes).
-
-    Quét qua các khối lập phương trong lưới Voxel TSDF:
-    Tìm vị trí bề mặt cắt ngang (nơi TSDF = 0), nội suy tuyến tính tạo các mặt tam giác 3D.
-
-    Args:
-        tsdf_volume: Đối tượng TSDFVolume đã tích lũy.
-        min_weight: Ngưỡng trọng số tối thiểu để voxel được công nhận là bề mặt.
-
-    Returns:
-        trimesh.Trimesh: Mô hình lưới tam giác kín 360°.
+    Trích xuất Iso-surface Marching Cubes đảm bảo tạo ra khối 3D KÍN NƯỚC (Watertight Solid).
+    Đã loại bỏ hoàn toàn lỗi tạo 2 lớp vỏ mỏng rỗng ruột và toác đáy.
     """
     if not HAS_SKIMAGE:
         raise ImportError("Cần cài scikit-image để chạy Marching Cubes: pip install scikit-image")
 
     volume = tsdf_volume.tsdf_grid.copy()
-    weights = tsdf_volume.weight_grid
 
-    # Những vùng chưa từng được camera nào quan sát sẽ đặt giá trị 1.0 (ngoài vật thể)
-    unobserved = weights < min_weight
-    volume[unobserved] = 1.0
+    # Bảo đảm 100% các mặt ngoài Bounding Box là Không gian tự do (+1.0)
+    # Lớp đệm này buộc Marching Cubes tự động đóng kín phẳng phần đáy và mọi mặt biên
+    volume[0, :, :] = 1.0
+    volume[-1, :, :] = 1.0
+    volume[:, 0, :] = 1.0
+    volume[:, -1, :] = 1.0
+    volume[:, :, 0] = 1.0
+    volume[:, :, -1] = 1.0
 
-    # Marching Cubes tìm iso-surface tại level = 0.0
+    # Marching Cubes tìm ranh giới Iso-surface giữa Không khí (+1.0) và Ruột đặc (-1.0) tại level = 0.0
     try:
         verts, faces, normals, _ = measure.marching_cubes(
             volume=volume,
@@ -433,10 +468,10 @@ def extract_mesh_marching_cubes(
             allow_degenerate=False,
         )
 
-    # Chuyển đổi tọa độ từ Voxel Grid Index sang Tọa độ Không gian Thực (World Coordinates)
+    # Chuyển đổi tọa độ sang Tọa độ Thế giới thực (World Coordinates)
     verts_world = verts + tsdf_volume.bounds_min
 
-    # Đóng gói đối tượng Trimesh
+    # Tạo Mesh Trimesh và chuẩn hóa hình học
     mesh = trimesh.Trimesh(
         vertices=verts_world,
         faces=faces,
@@ -444,17 +479,87 @@ def extract_mesh_marching_cubes(
         process=True,
     )
 
-    # Dọn dẹp lưới: Giữ lại thành phần liên thông lớn nhất (loại bỏ các cụm vụn nổi lơ lửng)
+    # Hàn các đỉnh trùng và sửa chữa mặt lưới
+    mesh.merge_vertices()
+    mesh.update_faces(mesh.nondegenerate_faces())
+    mesh.update_faces(mesh.unique_faces())
+    try:
+        trimesh.repair.fix_normals(mesh)
+        trimesh.repair.fix_winding(mesh)
+        trimesh.repair.fill_holes(mesh)
+    except Exception as rep_err:
+        logger.warning(f"Mesh repair: {rep_err}")
+
+    # Giữ lại thành phần liên thông lớn nhất
     components = mesh.split(only_watertight=False)
     if components and len(components) > 1:
-        largest = max(components, key=lambda m: len(m.vertices))
-        mesh = largest
+        mesh = max(components, key=lambda m: len(m.vertices))
 
     logger.info(
         f"Marching Cubes hoàn thành: Sinh mesh với {len(mesh.vertices)} đỉnh, "
-        f"{len(mesh.faces)} tam giác (Watertight: {mesh.is_watertight})."
+        f"{len(mesh.faces)} tam giác (Watertight: {mesh.is_watertight}, Thể tích: {mesh.volume:.6f})."
     )
     return mesh
+
+
+# ============================================================================
+# PHÉP KIỂM HÌNH HỌC THẬT (dùng cho log + test)
+# ============================================================================
+
+def mesh_health(mesh: trimesh.Trimesh, decimals: int = 6) -> dict:
+    """
+    Đo hình học THẬT của mesh: kín hay hở, mấy mảnh, bao nhiêu cạnh biên.
+
+    PHẢI HÀN ĐỈNH TRƯỚC KHI KIỂM. Mesh có texture bị XAtlas chia đỉnh tại mọi đường
+    seam UV — đó là chuyện BÌNH THƯỜNG và không làm hỏng hình. Nhưng trimesh đếm mảnh
+    theo chart UV (face_adjacency dựa trên chỉ số đỉnh), nên `mesh.split()` báo "hàng
+    nghìn mảnh rời" cho một khối hoàn toàn lành. Hàn đỉnh theo toạ độ rồi mới đo.
+    """
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    if len(vertices) == 0 or len(faces) == 0:
+        return {"vertices": 0, "faces": 0, "watertight": False, "winding_consistent": False,
+                "components": 0, "boundary_edges": 0, "volume": 0.0,
+                "duplicated_vertices": 0}
+
+    unique_vertices, inverse = np.unique(np.round(vertices, decimals), axis=0, return_inverse=True)
+    welded = trimesh.Trimesh(vertices=unique_vertices, faces=inverse[faces], process=True)
+    welded.update_faces(welded.nondegenerate_faces())
+    welded.update_faces(welded.unique_faces())
+
+    edges = welded.edges_sorted
+    if len(edges):
+        _, counts = np.unique(edges, axis=0, return_counts=True)
+        boundary = int(np.count_nonzero(counts == 1))
+    else:
+        boundary = 0
+
+    return {
+        "vertices": len(vertices),
+        "faces": len(faces),
+        "duplicated_vertices": len(vertices) - len(unique_vertices),
+        "watertight": bool(welded.is_watertight),
+        "winding_consistent": bool(welded.is_winding_consistent),
+        "components": len(welded.split(only_watertight=False)),
+        "boundary_edges": boundary,
+        "volume": float(welded.volume),
+    }
+
+
+def log_mesh_health(mesh: trimesh.Trimesh, label: str = "mesh") -> dict:
+    """In kết quả mesh_health ra log. Hở (boundary_edges > 0) thì cảnh báo rõ."""
+    health = mesh_health(mesh)
+    logger.info(
+        f"[KIỂM HÌNH HỌC] {label}: {health['vertices']} đỉnh ({health['duplicated_vertices']} "
+        f"đỉnh trùng do seam UV), {health['faces']} mặt | sau khi hàn: "
+        f"{health['components']} mảnh, {health['boundary_edges']} cạnh biên, "
+        f"watertight={health['watertight']}, thể tích={health['volume']:.6f}"
+    )
+    if health["boundary_edges"] > 0:
+        logger.warning(
+            f"[KIỂM HÌNH HỌC] {label} HỞ: {health['boundary_edges']} cạnh biên."
+        )
+    return health
 
 
 # ============================================================================
@@ -464,7 +569,7 @@ def extract_mesh_marching_cubes(
 class TSDFMeshEngine:
     """
     Lớp điều phối toàn bộ chu trình P4:
-    Lọc viền độ sâu -> Pruning điểm nền -> Tích lũy Voxel TSDF -> Trích xuất Marching Cubes.
+    Lọc viền độ sâu -> Pruning điểm nền -> Tích lũy Voxel TSDF True Space Carving -> Trích xuất Marching Cubes Kín Nước.
     """
 
     def __init__(
@@ -472,10 +577,12 @@ class TSDFMeshEngine:
         resolution: int = DEFAULT_VOXEL_RESOLUTION,
         tau_conf: float = DEFAULT_CONF_THRESHOLD,
         tau_edge: float = DEFAULT_DEPTH_EDGE_TAU,
+        smooth_iterations: int = 10,
     ):
         self.resolution = resolution
         self.tau_conf = tau_conf
         self.tau_edge = tau_edge
+        self.smooth_iterations = int(os.environ.get("TSDF_SMOOTH_ITER", smooth_iterations))
 
     def reconstruct(
         self,
@@ -496,10 +603,10 @@ class TSDFMeshEngine:
             focal_lengths: List N cặp tiêu cự (fx, fy).
 
         Returns:
-            trimesh.Trimesh: Lưới tam giác hoàn chỉnh 360°.
+            trimesh.Trimesh: Lưới tam giác hoàn chỉnh 360° kín nước.
         """
         t0 = time.time()
-        logger.info("═══ [P4] BẮT ĐẦU TÁI TẠO LƯỚI 3D (TSDF + MARCHING CUBES) ═══")
+        logger.info("═══ [P4] BẮT ĐẦU TÁI TẠO LƯỚI 3D (TSDF TRUE SPACE CARVING + MARCHING CUBES) ═══")
 
         # Chuyển đổi tensor sang numpy nếu cần
         if hasattr(pointmaps_3d, 'cpu'):
@@ -534,7 +641,7 @@ class TSDFMeshEngine:
         p_min = np.percentile(all_valid_pts, 0.5, axis=0)
         p_max = np.percentile(all_valid_pts, 99.5, axis=0)
 
-        # Thêm padding 20% vào bounding box để tránh chạm biên
+        # Thêm padding 25% vào bounding box để bao trọn vật thể
         center = (p_min + p_max) / 2.0
         extent = (p_max - p_min) * 1.25
         bounds_min = center - extent / 2.0
@@ -546,7 +653,7 @@ class TSDFMeshEngine:
             resolution=self.resolution,
         )
 
-        # ── Bước 3: Tích lũy đa góc nhìn vào Voxel Grid ──
+        # ── Bước 3: Tích lũy đa góc nhìn vào Voxel Grid (True Space Carving) ──
         for i in range(n_views):
             logger.info(f"[P4] Tích lũy TSDF góc nhìn #{i+1}/{n_views}...")
             tsdf_vol.integrate(
@@ -559,16 +666,35 @@ class TSDFMeshEngine:
             )
 
         # ── Bước 4: Trích xuất Iso-surface Marching Cubes ──
-        logger.info("[P4] Trích xuất bề mặt Marching Cubes...")
+        logger.info("[P4] Trích xuất bề mặt Marching Cubes kín nước...")
         try:
             mesh = extract_mesh_marching_cubes(tsdf_vol)
         except Exception as mc_err:
-            logger.warning(f"[P4] Marching Cubes gặp sự cố ({mc_err}), kích hoạt Multi-View Point Cloud Fusion...")
+            logger.warning(f"[P4] Marching Cubes gặp sự cố ({mc_err}), kích hoạt Convex Hull Fallback...")
             mesh = trimesh.convex.convex_hull(all_valid_pts)
+
+        if len(mesh.faces) < 50 or not mesh.is_watertight:
+            logger.info("[P4] Gia cố độ kín nước cho mesh (fill_holes)...")
+            try:
+                trimesh.repair.fill_holes(mesh)
+                mesh.merge_vertices()
+            except Exception:
+                pass
 
         if len(mesh.faces) < 50:
             logger.warning("[P4] Mesh Marching Cubes quá ít mặt, kích hoạt Multi-View Point Cloud Fusion...")
             mesh = trimesh.convex.convex_hull(all_valid_pts)
+
+        # ── Bước 5: Làm mượt Taubin (giảm sần do nhiễu sensor, bảo toàn thể tích) ──
+        if self.smooth_iterations > 0 and len(mesh.vertices) > 0:
+            try:
+                from trimesh.smoothing import filter_taubin
+                filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=self.smooth_iterations)
+                logger.info(f"[P4] Làm mượt Taubin xong ({self.smooth_iterations} vòng).")
+            except Exception as e:
+                logger.warning(f"[P4] Bỏ qua làm mượt Taubin: {e}")
+
+        log_mesh_health(mesh, "P4 Watertight Solid Mesh")
 
         elapsed = time.time() - t0
         logger.info(f"═══ [P4] HOÀN THÀNH TÁI TẠO MESH TRONG {elapsed:.2f} GIÂY ═══")
