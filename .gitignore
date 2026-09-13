@@ -43,6 +43,7 @@ output/*
 # Không push vào repo vì nặng (~2GB model weights) và có .git riêng
 # ============================================================================
 notebook/backend/tsr/
+notebook/backend/dust3r/
 
 # Model weights & checkpoints (tự tải từ HuggingFace)
 *.ckpt

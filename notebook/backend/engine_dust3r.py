@@ -14,12 +14,25 @@ Bật chế độ thật trên Colab:
     export PYTHONPATH=/content/dust3r               # (notebook P6 set sẵn khi spawn uvicorn)
 """
 
+import sys
+import os
+from pathlib import Path
+
+# Tự động nạp đường dẫn dust3r và croco (hỗ trợ cả chạy local trong notebook/backend/dust3r và /content/dust3r trên Colab)
+_backend_dir = Path(__file__).resolve().parent
+_dust3r_dir = _backend_dir / "dust3r"
+_croco_dir = _dust3r_dir / "croco"
+for _p in [_dust3r_dir, _croco_dir, Path("/content/dust3r"), Path("/content/dust3r/croco")]:
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
 try:
     import torch
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
 
+DUST3R_IMPORT_ERROR = None
 try:
     from dust3r.inference import inference
     from dust3r.model import AsymmetricCroCo3DStereo
@@ -27,8 +40,9 @@ try:
     from dust3r.image_pairs import make_pairs
     from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
     HAS_DUST3R = True
-except ImportError:
+except Exception as e:
     HAS_DUST3R = False
+    DUST3R_IMPORT_ERROR = e
 
 import numpy as np
 import logging
@@ -90,9 +104,10 @@ class DUSt3REngine:
     def load_model(self):
         """Nạp model DUSt3R thật từ HuggingFace weights. Đã xóa bỏ hoàn toàn mock data."""
         if not HAS_DUST3R:
+            err_detail = f" (Chi tiết lỗi: {DUST3R_IMPORT_ERROR})" if DUST3R_IMPORT_ERROR else ""
             raise RuntimeError(
-                "Không tìm thấy package 'dust3r'. Đã gỡ bỏ hoàn toàn chế độ mock data; "
-                "vui lòng kiểm tra cài đặt dust3r hoặc chạy trên môi trường có GPU/dust3r."
+                f"Không tìm thấy hoặc không thể import package 'dust3r'{err_detail}. "
+                "Đã gỡ bỏ hoàn toàn chế độ mock data; vui lòng kiểm tra cài đặt dust3r hoặc chạy trên môi trường có GPU/dust3r."
             )
         self.logger.info(f"Đang nạp DUSt3R weights {self.weights} trên {self.device}...")
         self.model = AsymmetricCroCo3DStereo.from_pretrained(self.weights).to(self.device)
@@ -129,9 +144,6 @@ class DUSt3REngine:
 
         pts = [_to_map(p, 3) for p in scene.get_pts3d()]              # mỗi view (H_i, W_i, 3)
         conf = [_conf_to_unit(_to_map(c, 2)) for c in scene.get_conf(mode="id")]
-        poses = scene.get_im_poses().detach().cpu().numpy()
-        focals = np.atleast_2d(scene.get_focals().detach().cpu().numpy())
-
         # Các view có thể lệch kích thước -> pad về (H, W) lớn nhất.
         n = len(pts)
         h = max(p.shape[0] for p in pts)
@@ -143,8 +155,21 @@ class DUSt3REngine:
             pointmaps_3d[i, :hi, :wi] = p
             confidence_masks[i, :hi, :wi] = c
 
+        poses = scene.get_im_poses().detach().cpu().numpy()
+        raw_focals = scene.get_focals().detach().cpu().numpy()
+        raw_focals = np.squeeze(raw_focals)
+        focal_lengths = []
+        for i in range(n):
+            if raw_focals.ndim == 0:
+                f_val = float(raw_focals)
+                focal_lengths.append((f_val, f_val))
+            elif raw_focals.ndim == 1:
+                f_val = float(raw_focals[i])
+                focal_lengths.append((f_val, f_val))
+            else:
+                focal_lengths.append((float(raw_focals[i, 0]), float(raw_focals[i, -1])))
+
         camera_poses = [np.asarray(poses[i], dtype=np.float32) for i in range(n)]
-        focal_lengths = [(float(focals[i][0]), float(focals[i][-1])) for i in range(n)]
 
         self.logger.info(
             f"[P2] XONG trong {time.time() - t0:.1f}s — {n} view, pointmap {pointmaps_3d.shape}, "

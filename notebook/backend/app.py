@@ -25,7 +25,7 @@ except ImportError:
 
 # Import các module trong pipeline
 from preprocess import preprocess_multiview, preprocess_single_view
-from engine_dust3r import DUSt3REngine
+from engine_dust3r import DUSt3REngine, DUST3R_IMPORT_ERROR, HAS_DUST3R
 from quality_gate import QualityGate
 from engine_triposr import TripoSREngine
 from engine_tsdf_mesh import TSDFMeshEngine, DEFAULT_CONF_THRESHOLD
@@ -119,6 +119,8 @@ async def health():
         "engines": {
             "triposr": triposr_engine.model is not None,
             "dust3r": dust3r_engine.model is not None,
+            "has_dust3r": HAS_DUST3R,
+            "dust3r_import_error": str(DUST3R_IMPORT_ERROR) if DUST3R_IMPORT_ERROR else None,
             "depth": depth_engine.depth_model is not None,
         },
     }
@@ -358,29 +360,12 @@ async def generate_3d(
             pipeline_type = "nvidia_tsdf_multiview"
 
         except Exception as mv_err:
-            # Chỉ kích hoạt cứu hộ khi khối đa ảnh gặp lỗi ngoại lệ nghiêm trọng (VD: 0 điểm 3D hợp lệ)
-            logger.error(f"[P4/P5 Ngoại lệ: {mv_err}] → Kích hoạt cứu hộ khẩn cấp từ ảnh số 1...")
-            fallback_result = preprocess_single_view(
-                image_path=saved_paths[0],
-                target_size=512,
-                device=device,
+            logger.error(f"[LỖI TÁI TẠO ĐA ẢNH 360° (P4/P5)]: {mv_err}", exc_info=True)
+            # TUYỆT ĐỐI KHÔNG âm thầm hạ cấp về single-view 2.5D khi người dùng upload N ảnh!
+            raise HTTPException(
+                status_code=500,
+                detail=f"Lỗi tái tạo 3D từ {len(saved_paths)} ảnh tại khối P4/P5: {mv_err}. Vui lòng kiểm tra log server!"
             )
-            if triposr_engine.model is not None:
-                success, model_path, _ = triposr_engine.run_from_preprocessed(
-                    image_rgb=fallback_result["image_centered"],
-                    alpha_mask=fallback_result["alpha_mask_centered"],
-                    output_glb_path=output_glb_path,
-                )
-                pipeline_type = "triposr_emergency_fallback"
-            else:
-                logger.info("[Cứu hộ khẩn cấp] Chuyển sang Depth Engine...")
-                success, model_path, _ = depth_engine.reconstruct(
-                    image_rgb=fallback_result["image_centered"],
-                    alpha_mask=fallback_result["alpha_mask_centered"],
-                    focal_length=fallback_result["focal_length"],
-                    output_path=output_glb_path,
-                )
-                pipeline_type = "depth_emergency_fallback"
 
         total_time = time.time() - pipeline_start
 
