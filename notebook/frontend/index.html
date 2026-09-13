@@ -154,9 +154,22 @@ runBtn.addEventListener('click', async () => {
   const tick = setInterval(() => statusEl.textContent = `⏳ Đang xử lý… ${((performance.now() - t0) / 1000).toFixed(1)}s`, 100);
   metaEl.textContent = '';
   try {
-    const res = await fetch('/generate-3d/', { method: 'POST', body: fd });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || res.statusText);
+    // POST trả job_id NGAY -> mọi request đều ngắn, KHÔNG bị Cloudflare cắt ở mốc ~100s
+    const res = await fetch('/generate-3d/job/', { method: 'POST', body: fd });
+    const txt = await res.text();   // đọc TEXT trước: proxy có thể trả HTML chứ không phải JSON
+    if (!res.ok) throw new Error(`HTTP ${res.status} — ${txt.slice(0, 200)}`);
+    const job = JSON.parse(txt);
+
+    let cur = job;                  // hỏi lại trạng thái mỗi 2s cho tới khi xong
+    while (cur.status === 'running') {
+      await new Promise(r => setTimeout(r, 2000));
+      const s = await fetch('/generate-3d/job/' + job.job_id);
+      const stxt = await s.text();
+      if (!s.ok) throw new Error(`HTTP ${s.status} — ${stxt.slice(0, 200)}`);
+      cur = JSON.parse(stxt);
+    }
+    if (cur.status !== 'done') throw new Error(cur.error || `trạng thái lạ: ${cur.status}`);
+    const data = cur.result;
     statusEl.textContent = data.status === 'success' ? `✅ Xong trong ${data.execution_time_seconds}s` : '❌ Thất bại';
     metaEl.textContent = [
       `mode: ${data.mode}`,

@@ -7,6 +7,9 @@ import shutil
 import os
 import time
 import glob
+import asyncio
+import threading
+import uuid
 import numpy as np
 import logging
 from PIL import Image
@@ -284,6 +287,57 @@ async def generate_3d(files: List[UploadFile] = File(...)):
     except Exception as e:
         logger.error(f"Pipeline lỗi: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# API 1b (P6): chạy NỀN + hỏi trạng thái — vì proxy cắt request dài
+# ============================================================================
+# VÌ SAO CẦN: Cloudflare Tunnel cắt request sau ~100s. Pipeline đa ảnh chạy 1–5 phút
+# -> proxy trả TRANG HTML lỗi của nó (524) thay vì JSON -> frontend vỡ với
+#    "Unexpected token '<', "<!DOCTYPE "... is not valid JSON".
+# Cách chữa: POST trả job_id NGAY, frontend hỏi lại trạng thái mỗi 2s (request ngắn
+# nên không bao giờ bị cắt). Pipeline bên dưới dùng LẠI đúng hàm generate_3d ở trên
+# -> không có đường code thứ hai để lệch kết quả.
+JOBS = {}   # ponytail: để trong RAM, mất khi Restart Runtime — đủ cho demo, cần thì đổi sang file/Redis
+
+
+@app.post("/generate-3d/job/")
+async def generate_3d_job(files: List[UploadFile] = File(...)):
+    """Nhận ảnh -> lưu -> trả job_id ngay. Pipeline chạy ở luồng nền."""
+    job_id = uuid.uuid4().hex[:12]
+    saved_paths = []
+    for f in files:
+        p = f"temp_uploads/{f.filename}"
+        with open(p, "wb") as buffer:
+            shutil.copyfileobj(f.file, buffer)
+        saved_paths.append(p)
+
+    JOBS[job_id] = {"status": "running", "num_images": len(saved_paths), "started": time.time()}
+
+    def worker():
+        try:
+            again = [UploadFile(filename=os.path.basename(p), file=open(p, "rb"))
+                     for p in saved_paths]
+            JOBS[job_id] = {"status": "done", "result": asyncio.run(generate_3d(files=again))}
+        except HTTPException as e:
+            JOBS[job_id] = {"status": "error", "error": str(e.detail)}
+        except Exception as e:
+            logger.error(f"Job {job_id} lỗi: {e}", exc_info=True)
+            JOBS[job_id] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"job_id": job_id, "status": "running", "num_images": len(saved_paths)}
+
+
+@app.get("/generate-3d/job/{job_id}")
+async def generate_3d_job_status(job_id: str):
+    """Trạng thái job: running | done | error | not_found. Kèm số giây đã chạy."""
+    job = JOBS.get(job_id)
+    if not job:
+        return {"status": "not_found"}
+    if job["status"] == "running":
+        return {**job, "elapsed_seconds": round(time.time() - job["started"], 1)}
+    return job
 
 
 # ============================================================================
