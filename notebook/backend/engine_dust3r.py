@@ -47,7 +47,7 @@ try:
     from dust3r.image_pairs import make_pairs
     from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
     HAS_DUST3R = True
-except ImportError as e:
+except Exception as e:
     HAS_DUST3R = False
     _dust3r_import_error = str(e)
 
