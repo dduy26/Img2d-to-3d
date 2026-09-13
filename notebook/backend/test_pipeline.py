@@ -51,6 +51,19 @@ from starlette.testclient import TestClient
 
 
 # ==============================================================================
+# ẢNH TEST: ưu tiên data/gso (ảnh chụp THẬT, 5 góc cùng 1 vật) rồi mới tới
+# data/input/multi_view (ảnh VẼ bằng generate_test_images.py — không có parallax thật,
+# DUSt3R đoán sai camera -> hình dẹt). Đặt ảnh GSO vào data/gso/ là test dùng ảnh thật.
+# ==============================================================================
+def test_images_dir() -> Path:
+    """Thư mục ảnh test: data/gso nếu có >=4 ảnh, ngược lại data/input/multi_view."""
+    for d in (Path("data/gso"), Path("data/input/multi_view")):
+        if len(list(d.glob("view_*.jpg"))) >= 4:
+            return d
+    return Path("data/input/multi_view")
+
+
+# ==============================================================================
 # NHÓM 1: KIỂM THỬ THUẬT TOÁN HÌNH HỌC P4 (TSDF MESH)
 # ==============================================================================
 
@@ -196,7 +209,7 @@ def test_05_api_single_image_triposr():
     """Test 5: API POST /generate-3d/single/ (Chế độ 1 ảnh cứu hộ)."""
     print("\n[TEST 5/7] Kiểm thử API /generate-3d/single/ qua TestClient...")
     client = TestClient(app)
-    test_img = Path("data/input/multi_view/view_01_front.jpg")
+    test_img = sorted(test_images_dir().glob("view_*.jpg"))[0]
     assert test_img.exists(), f"Thiếu ảnh test: {test_img}"
 
     with open(test_img, "rb") as f:
@@ -215,8 +228,8 @@ def test_06_api_multiview_full_pipeline():
     """Test 6: API POST /generate-3d/ (Toàn chu trình Đa ảnh P1 -> P2 -> P3 -> P4 -> P5)."""
     print("\n[TEST 6/7] Kiểm thử API /generate-3d/ (Full Pipeline 6 ảnh)...")
     client = TestClient(app)
-    img_paths = sorted(list(Path("data/input/multi_view").glob("view_*.jpg")))
-    assert len(img_paths) >= 4, f"Cần ít nhất 4 ảnh benchmark, tìm thấy {len(img_paths)}"
+    img_paths = sorted(test_images_dir().glob("view_*.jpg"))
+    assert len(img_paths) >= 4, f"Cần ít nhất 4 ảnh benchmark trong {test_images_dir()}, tìm thấy {len(img_paths)}"
 
     file_handles = [open(p, "rb") for p in img_paths]
     files = [("files", (p.name, fh, "image/jpeg")) for p, fh in zip(img_paths, file_handles)]
