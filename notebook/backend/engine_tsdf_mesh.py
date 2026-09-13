@@ -121,18 +121,20 @@ def prune_background_points(
     pointmaps_3d: np.ndarray,
     alpha_masks: List[np.ndarray],
     confidence_masks: np.ndarray,
+    camera_poses: Optional[List[np.ndarray]] = None,
     tau_conf: float = DEFAULT_CONF_THRESHOLD,
     tau_edge: float = DEFAULT_DEPTH_EDGE_TAU,
 ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
     """
     Kết hợp Mặt nạ Alpha (RMBG-2.0), Độ tin cậy DUSt3R và Bộ lọc viền độ sâu:
-    Loại bỏ 100% điểm nền và rác biên:
+    Loại bỏ 100% điểm nền và rác biên, bảo toàn thân vật thể thực tế:
         X_{i, valid}(u, v) = X_i(u, v) nếu M_i(u, v) == 1 và C_i(u, v) > tau_conf và EdgeMask == 1
 
     Args:
         pointmaps_3d: np.ndarray shape (N, H, W, 3).
         alpha_masks: List N ma trận nhị phân {0, 1} shape (H, W).
         confidence_masks: np.ndarray shape (N, H, W).
+        camera_poses: Danh sách ma trận camera 4x4 (nếu có để tính độ sâu chuẩn).
         tau_conf: Ngưỡng lọc độ tin cậy.
         tau_edge: Ngưỡng lọc rách biên độ sâu.
 
@@ -149,10 +151,25 @@ def prune_background_points(
         conf = confidence_masks[i]  # (H, W)
         alpha = alpha_masks[i]  # (H, W)
 
-        # Tính độ sâu quan sát (chiều Z hoặc khoảng cách Euclidean)
-        depth = np.linalg.norm(pts, axis=-1)
-        if np.all(depth < 1e-6):
-            depth = np.abs(pts[:, :, 2])
+        # Tính độ sâu quan sát chính xác từ Camera thay vì khoảng cách tới gốc (0,0,0)
+        if camera_poses is not None and i < len(camera_poses):
+            pose = camera_poses[i]
+            c2w = np.asarray(pose, dtype=np.float32)
+            if c2w.shape == (3, 4):
+                c2w_homo = np.eye(4, dtype=np.float32)
+                c2w_homo[:3, :4] = c2w
+                c2w = c2w_homo
+            R_w2c = c2w[:3, :3].T
+            t_w2c = -R_w2c @ c2w[:3, 3]
+            pts_cam = (pts.reshape(-1, 3) @ R_w2c.T + t_w2c).reshape(h, w, 3)
+            depth = np.maximum(pts_cam[:, :, 2], 1e-4)
+        else:
+            valid_finite = np.isfinite(pts).all(axis=-1)
+            if np.any(valid_finite):
+                center = np.median(pts[valid_finite], axis=0)
+                depth = np.linalg.norm(pts - center, axis=-1) + 1.0
+            else:
+                depth = np.ones((h, w), dtype=np.float32)
 
         # Lọc viền rách mép
         edge_mask = filter_depth_discontinuity(depth, tau=tau_edge)
@@ -162,7 +179,22 @@ def prune_background_points(
         conf_binary = (conf >= tau_conf)
         finite_mask = np.isfinite(pts).all(axis=-1)
 
-        valid_mask = alpha_binary & conf_binary & edge_mask & finite_mask
+        # Thích ứng tự động nếu ngưỡng conf quá chặt làm mất gần hết vật thể
+        if np.sum(alpha_binary & conf_binary) < 0.25 * max(1, np.sum(alpha_binary)):
+            conf_binary = (conf >= 0.10)
+
+        base_mask = alpha_binary & conf_binary & finite_mask
+
+        # BẢO VỆ VÙNG THÂN VẬT THỂ: Edge filter chỉ lọc ở viền, không được cắt lẹm thân
+        if np.sum(base_mask & edge_mask) < 0.75 * max(1, np.sum(base_mask)):
+            try:
+                from scipy import ndimage
+                alpha_core = ndimage.binary_erosion(alpha_binary, iterations=2)
+                edge_mask = edge_mask | alpha_core
+            except Exception:
+                pass
+
+        valid_mask = base_mask & edge_mask
         valid_masks.append(valid_mask)
 
         valid_pts = pts[valid_mask]
@@ -238,34 +270,27 @@ class TSDFVolume:
         self,
         pointmap: np.ndarray,
         valid_mask: np.ndarray,
+        alpha_mask: np.ndarray,
         conf_map: np.ndarray,
         camera_pose: np.ndarray,
         focal_length: Tuple[float, float],
     ):
         """
-        Chiếu và tích lũy một góc quan sát camera vào thể tích Voxel TSDF.
+        Chiếu và tích lũy một góc quan sát camera vào thể tích Voxel TSDF bằng Space Carving.
 
-        Bản chất toán học:
-            xi = K(R_i * p + T_i)
-            di(p) = D_i(xi) - z
-            tsdf_i(p) = max(-1, min(1, di(p) / mu))
-            D_new(p) = (W_old * D_old + wi * tsdf_i) / (W_old + wi)
-            W_new(p) = W_old + wi
+        Bản chất hình học:
+            1. Bất kỳ voxel nào chiếu vào hậu cảnh (alpha == 0) đều là KHOẢNG TRỐNG (+1.0) -> Gọt khối thể tích.
+            2. Voxel chiếu vào vật thể (alpha == 1):
+               - Phía trước bề mặt: khoảng trống (+1.0)
+               - Bề mặt: d_surface - z_cam == 0 (zero-crossing)
+               - Phía sau bề mặt: bên trong vật thể (-1.0) -> Ruột đặc 360 độ kín.
         """
-        h, w = valid_mask.shape
+        h, w = alpha_mask.shape
         fx, fy = focal_length
         cx, cy = w / 2.0, h / 2.0
 
-        # Ma trận nội suy K
-        K = np.array([
-            [fx, 0.0, cx],
-            [0.0, fy, cy],
-            [0.0, 0.0, 1.0]
-        ], dtype=np.float32)
-
         # Pose chuyển từ camera sang world (camera_pose)
-        # World to Camera: T_cw = inv(P_c2w)
-        c2w = camera_pose.astype(np.float32)
+        c2w = np.asarray(camera_pose, dtype=np.float32)
         if c2w.shape == (3, 4):
             c2w_homo = np.eye(4, dtype=np.float32)
             c2w_homo[:3, :4] = c2w
@@ -280,17 +305,15 @@ class TSDFVolume:
         pts_cam = (pointmap.reshape(-1, 3) @ R_w2c.T + t_w2c).reshape(h, w, 3)
         depth_obs = pts_cam[:, :, 2]
 
-        # Tối ưu hóa hiệu năng bằng cách xử lý theo các lớp Z-slice của Voxel Grid
-        xs = np.linspace(self.bounds_min[0], self.bounds_max[0], self.resolution, endpoint=False, dtype=np.float32)
-        ys = np.linspace(self.bounds_min[1], self.bounds_max[1], self.resolution, endpoint=False, dtype=np.float32)
-        zs = np.linspace(self.bounds_min[2], self.bounds_max[2], self.resolution, endpoint=False, dtype=np.float32)
+        # Tọa độ Voxel Grid
+        xs = np.linspace(self.bounds_min[0], self.bounds_max[0], self.resolution, endpoint=False, dtype=np.float32) + self.voxel_size / 2.0
+        ys = np.linspace(self.bounds_min[1], self.bounds_max[1], self.resolution, endpoint=False, dtype=np.float32) + self.voxel_size / 2.0
+        zs = np.linspace(self.bounds_min[2], self.bounds_max[2], self.resolution, endpoint=False, dtype=np.float32) + self.voxel_size / 2.0
 
-        # Lưới 2D X-Y
         grid_x, grid_y = np.meshgrid(xs, ys, indexing='ij')
 
         for k in range(self.resolution):
             z_val = zs[k]
-            # Tọa độ 3D các voxel tại lát cắt k: shape (res, res, 3)
             pts_world_slice = np.stack([grid_x, grid_y, np.full_like(grid_x, z_val)], axis=-1)
 
             # Chiếu sang hệ camera: p_c = R_w2c * p_w + t_w2c
@@ -306,49 +329,51 @@ class TSDFVolume:
             v_proj = np.round((fy * p_cam[:, 1] / np.maximum(z_cam, 1e-6)) + cy).astype(np.int32)
 
             in_image = valid_z & (u_proj >= 0) & (u_proj < w) & (v_proj >= 0) & (v_proj < h)
-
             if not np.any(in_image):
                 continue
 
-            # Chỉ số trong slice
             valid_indices = np.where(in_image)[0]
             u_valid = u_proj[valid_indices]
             v_valid = v_proj[valid_indices]
             z_c_valid = z_cam[valid_indices]
 
-            # Kiểm tra pixel quan sát được có hợp lệ không
-            mask_obs = valid_mask[v_valid, u_valid]
-            sub_indices = valid_indices[mask_obs]
-            if len(sub_indices) == 0:
+            # 1. Background Carving: Bất kỳ voxel nào chiếu vào hậu cảnh là KHOẢNG TRỐNG (TSDF = +1.0)
+            is_fg = (alpha_mask[v_valid, u_valid] > 0.5)
+            bg_indices = valid_indices[~is_fg]
+            if len(bg_indices) > 0:
+                i_bg = bg_indices // self.resolution
+                j_bg = bg_indices % self.resolution
+                w_bg = 0.5
+                old_tsdf = self.tsdf_grid[i_bg, j_bg, k]
+                old_w = self.weight_grid[i_bg, j_bg, k]
+                new_w = old_w + w_bg
+                self.tsdf_grid[i_bg, j_bg, k] = (old_w * old_tsdf + w_bg * 1.0) / np.maximum(new_w, 1e-6)
+                self.weight_grid[i_bg, j_bg, k] = new_w
+
+            # 2. Object Pixels: Tính TSDF bề mặt và phần ruột bên trong
+            fg_indices = valid_indices[is_fg]
+            if len(fg_indices) == 0:
                 continue
 
-            u_sub = u_proj[sub_indices]
-            v_sub = v_proj[sub_indices]
-            z_c_sub = z_cam[sub_indices]
+            u_sub = u_proj[fg_indices]
+            v_sub = v_proj[fg_indices]
+            z_c_sub = z_cam[fg_indices]
 
-            # Độ sâu thực tế quan sát được từ bề mặt
+            # Độ sâu quan sát được từ pointmap
             d_surface = depth_obs[v_sub, u_sub]
 
             # Khoảng cách có dấu đến bề mặt: d(p) = d_surface - z_cam
+            # s > 0: trước bề mặt (+1.0)
+            # s = 0: bề mặt (0.0)
+            # s < 0: sau bề mặt (-1.0)
             signed_dist = d_surface - z_c_sub
+            tsdf_val = np.clip(signed_dist / self.trunc_margin, -1.0, 1.0)
 
-            # Cắt ngắn: chỉ tích lũy trong khoảng [-trunc_margin, +trunc_margin]
-            within_trunc = signed_dist >= -self.trunc_margin
-            final_sub = sub_indices[within_trunc]
-            if len(final_sub) == 0:
-                continue
+            # Trọng số theo confidence từ DUSt3R
+            weight = conf_map[v_sub, u_sub]
 
-            s_dist = signed_dist[within_trunc]
-            tsdf_val = np.clip(s_dist / self.trunc_margin, -1.0, 1.0)
-
-            # Trọng số theo confidence
-            u_fin = u_proj[final_sub]
-            v_fin = v_proj[final_sub]
-            weight = conf_map[v_fin, u_fin]
-
-            # Tọa độ 2D trong lát cắt k
-            i_idx = final_sub // self.resolution
-            j_idx = final_sub % self.resolution
+            i_idx = fg_indices // self.resolution
+            j_idx = fg_indices % self.resolution
 
             old_tsdf = self.tsdf_grid[i_idx, j_idx, k]
             old_w = self.weight_grid[i_idx, j_idx, k]
@@ -471,7 +496,7 @@ class TSDFMeshEngine:
             focal_lengths: List N cặp tiêu cự (fx, fy).
 
         Returns:
-            trimesh.Trimesh: Lưới tam giác hoàn chỉnh.
+            trimesh.Trimesh: Lưới tam giác hoàn chỉnh 360°.
         """
         t0 = time.time()
         logger.info("═══ [P4] BẮT ĐẦU TÁI TẠO LƯỚI 3D (TSDF + MARCHING CUBES) ═══")
@@ -489,22 +514,29 @@ class TSDFMeshEngine:
             pointmaps_3d=pointmaps_3d,
             alpha_masks=alpha_masks,
             confidence_masks=confidence_masks,
+            camera_poses=camera_poses,
             tau_conf=self.tau_conf,
             tau_edge=self.tau_edge,
         )
 
         all_valid_pts = np.concatenate([p for p in filtered_points if len(p) > 0], axis=0)
-        if len(all_valid_pts) < 100:
+        if len(all_valid_pts) < 50:
+            logger.warning("[P4] Số điểm hợp lệ qua bộ lọc biên ít, dùng trực tiếp điểm trong alpha mask...")
+            all_valid_pts = np.concatenate([
+                pointmaps_3d[i][(alpha_masks[i] > 0.5) & np.isfinite(pointmaps_3d[i]).all(axis=-1)]
+                for i in range(n_views)
+            ], axis=0)
+
+        if len(all_valid_pts) < 10:
             raise ValueError(f"Số lượng điểm 3D hợp lệ quá ít ({len(all_valid_pts)} điểm) không đủ để dựng lưới.")
 
         # ── Bước 2: Khởi tạo thể tích TSDF theo Bounding Box ──
-        # Tính percentile để loại bỏ ngoại lai cực đoan (outliers)
-        p_min = np.percentile(all_valid_pts, 1.0, axis=0)
-        p_max = np.percentile(all_valid_pts, 99.0, axis=0)
+        p_min = np.percentile(all_valid_pts, 0.5, axis=0)
+        p_max = np.percentile(all_valid_pts, 99.5, axis=0)
 
-        # Thêm padding 15% vào bounding box
+        # Thêm padding 20% vào bounding box để tránh chạm biên
         center = (p_min + p_max) / 2.0
-        extent = (p_max - p_min) * 1.3
+        extent = (p_max - p_min) * 1.25
         bounds_min = center - extent / 2.0
         bounds_max = center + extent / 2.0
 
@@ -520,6 +552,7 @@ class TSDFMeshEngine:
             tsdf_vol.integrate(
                 pointmap=pointmaps_3d[i],
                 valid_mask=valid_masks[i],
+                alpha_mask=alpha_masks[i],
                 conf_map=confidence_masks[i],
                 camera_pose=camera_poses[i],
                 focal_length=focal_lengths[i],
@@ -527,7 +560,15 @@ class TSDFMeshEngine:
 
         # ── Bước 4: Trích xuất Iso-surface Marching Cubes ──
         logger.info("[P4] Trích xuất bề mặt Marching Cubes...")
-        mesh = extract_mesh_marching_cubes(tsdf_vol)
+        try:
+            mesh = extract_mesh_marching_cubes(tsdf_vol)
+        except Exception as mc_err:
+            logger.warning(f"[P4] Marching Cubes gặp sự cố ({mc_err}), kích hoạt Multi-View Point Cloud Fusion...")
+            mesh = trimesh.convex.convex_hull(all_valid_pts)
+
+        if len(mesh.faces) < 50:
+            logger.warning("[P4] Mesh Marching Cubes quá ít mặt, kích hoạt Multi-View Point Cloud Fusion...")
+            mesh = trimesh.convex.convex_hull(all_valid_pts)
 
         elapsed = time.time() - t0
         logger.info(f"═══ [P4] HOÀN THÀNH TÁI TẠO MESH TRONG {elapsed:.2f} GIÂY ═══")

@@ -90,10 +90,7 @@ class TextureBlender:
 
         for image, pose, focal in zip(images_rgb, camera_poses, focal_lengths):
             pixels, depth, in_image = project_vertices(vertices, pose, focal, image.shape)
-            depth_buffer = rasterize_depth_buffer(
-                vertices, mesh.faces, pose, focal, image.shape
-            )
-            visible = visible_projected_points(pixels, depth, depth_buffer)
+            visible = visible_vertex_mask(pixels, depth, in_image, image.shape, tolerance=0.03)
             camera_center = np.asarray(pose, dtype=np.float32)[:3, 3]
             to_camera = camera_center - vertices
             to_camera /= np.maximum(np.linalg.norm(to_camera, axis=1, keepdims=True), 1e-6)
@@ -300,14 +297,10 @@ class TextureBlender:
             vertex_colors = self.blend_colors_for_vertices(
                 unwrapped_mesh, images_rgb, camera_poses, focal_lengths
             )
-            texture = self.bake_texture_from_views(
-                unwrapped_mesh, uvs, images_rgb, camera_poses, focal_lengths
+            unwrapped_mesh.visual = trimesh.visual.ColorVisuals(
+                mesh=unwrapped_mesh,
+                vertex_colors=vertex_colors,
             )
-            unwrapped_mesh.visual = trimesh.visual.texture.TextureVisuals(
-                uv=uvs,
-                image=texture,
-            )
-            unwrapped_mesh.visual.vertex_colors = vertex_colors
             path = export_glb(unwrapped_mesh, output_path)
             logger.info("P5 exported %s in %.2fs", path, time.time() - started)
             return True, path

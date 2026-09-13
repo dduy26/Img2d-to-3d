@@ -32,9 +32,10 @@ Thumbs.db
 # Node
 node_modules/
 
-# Thư mục Input & Output duy nhất (chỉ track file .gitkeep, không track dữ liệu người dùng)
+# Thư mục Input & Output duy nhất (track sample images và .gitkeep)
 input/*
 !input/.gitkeep
+!input/view_*.jpg
 output/*
 !output/.gitkeep
 
@@ -58,4 +59,11 @@ temp_uploads/
 outputs/
 notebook/backend/temp_uploads/
 notebook/backend/outputs/
-data/
+
+# Dữ liệu ảnh benchmark (track bộ ảnh thật)
+data/*
+!data/gso/
+!data/gso/view_*.jpg
+!data/input/
+!data/input/multi_view/
+!data/input/multi_view/view_*.jpg

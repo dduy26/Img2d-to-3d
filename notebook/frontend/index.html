@@ -187,12 +187,33 @@ runBtn.addEventListener('click', async () => {
   }
   runBtn.disabled = true;
   const t0 = performance.now();
-  const tick = setInterval(() => statusEl.textContent = `⏳ Đang xử lý… ${((performance.now() - t0) / 1000).toFixed(1)}s`, 100);
+  const tick = setInterval(() => {
+    const s = ((performance.now() - t0) / 1000).toFixed(1);
+    statusEl.textContent = `⏳ Đang xử lý… ${s}s`;
+  }, 100);
   metaEl.textContent = '';
   try {
-    const res = await fetch('/generate-3d/', { method: 'POST', body: fd });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || res.statusText);
+    // 1. Gửi tới endpoint /generate-3d/job/ nhận job_id ngay (<100ms), không bị Cloudflare 100s ngắt kết nối
+    const res = await fetch('/generate-3d/job/', { method: 'POST', body: fd });
+    const txt = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${txt.slice(0, 300)}`);
+    const job = JSON.parse(txt);
+
+    // 2. Polling trạng thái job mỗi 1.5s
+    let cur = job;
+    while (cur.status === 'running') {
+      await new Promise(r => setTimeout(r, 1500));
+      const sRes = await fetch('/generate-3d/job/' + job.job_id);
+      const sTxt = await sRes.text();
+      if (!sRes.ok) throw new Error(`HTTP ${sRes.status}: ${sTxt.slice(0, 300)}`);
+      cur = JSON.parse(sTxt);
+    }
+
+    if (cur.status !== 'done') {
+      throw new Error(cur.error || `Trạng thái xử lý không hợp lệ: ${cur.status}`);
+    }
+
+    const data = cur.result;
     statusEl.textContent = data.status === 'success' ? `✅ Xong trong ${data.execution_time_seconds}s` : '❌ Thất bại';
     metaEl.textContent = [
       `mode: ${data.mode}`,

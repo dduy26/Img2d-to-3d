@@ -442,9 +442,9 @@ def extract_alpha_masks(
             masks.append(np.ones((h, w), dtype=np.uint8))
         return masks
 
-    # Nếu không có HF token trong môi trường, ưu tiên dùng rembg (u2net) offline trực tiếp
-    # để tránh gọi briaai/RMBG-2.0 bị lỗi 401 Unauthorized (gated repo)
-    has_hf_token = bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+    # Đọc token từ biến môi trường (Colab userdata hoặc os.environ)
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    has_hf_token = bool(hf_token)
     if not has_hf_token:
         try:
             import rembg
@@ -463,7 +463,7 @@ def extract_alpha_masks(
     logger.info(f"Đang tải model briaai/RMBG-2.0 trên {device}...")
     try:
         model = AutoModelForImageSegmentation.from_pretrained(
-            "briaai/RMBG-2.0", trust_remote_code=True
+            "briaai/RMBG-2.0", trust_remote_code=True, token=hf_token
         )
         model = model.to(device)
         model.eval()
@@ -700,6 +700,8 @@ def preprocess_multiview(
             original_sizes.append(item["original_size"])
             filenames.append(item["filename"])
 
+        image_paths_out: List[str] = [item["path"] for item in filtered]
+
         # Chuyển sang numpy array RGB
         images_rgb: List[np.ndarray] = [np.array(img) for img in resized_images]
 
@@ -721,6 +723,7 @@ def preprocess_multiview(
             "original_sizes": original_sizes,
             "scale_factors": scale_factors,
             "filenames": filenames,
+            "image_paths": image_paths_out,
             "num_images": len(images_rgb_matched),
         }
 
