@@ -201,9 +201,10 @@ runBtn.addEventListener('click', async () => {
       `số ảnh: ${data.num_input_images ?? 1}`,
     ].filter(Boolean).join('\n');
     if (data.status === 'success' && data.output_file) {
-      const url = '/outputs/' + data.output_file.split(/[\\/]/).pop();
+      const filename = data.output_file.split(/[\\/]/).pop();
+      const url = '/output/' + filename;
       await showGlb(url);
-      const dl = document.getElementById('dl'); dl.href = url; dl.download = 'model.glb'; dl.classList.remove('hidden');
+      const dl = document.getElementById('dl'); dl.href = url; dl.download = filename; dl.classList.remove('hidden');
       for (const id of ['wire', 'spin']) document.getElementById(id).disabled = false;
     }
   } catch (err) {

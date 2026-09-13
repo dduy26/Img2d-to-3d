@@ -101,12 +101,9 @@ class DepthReconstructionEngine:
         self._load_depth_model()
 
     def _load_depth_model(self):
-        """Nạp model Depth-Anything-V2-Small từ HuggingFace. Mock nếu không có thư viện."""
+        """Nạp model Depth-Anything-V2-Small từ HuggingFace."""
         if not HAS_TORCH:
-            logger.warning(
-                "Không tìm thấy PyTorch. Kích hoạt Depth Engine Mock Mode "
-                "(tạo depth map giả lập để tiếp tục pipeline)."
-            )
+            logger.warning("Không tìm thấy PyTorch. Cần PyTorch để chạy Depth Engine.")
             return
 
         try:
@@ -124,10 +121,7 @@ class DepthReconstructionEngine:
             logger.info("Depth-Anything-V2-Small loaded successfully.")
 
         except Exception as e:
-            logger.warning(
-                f"Không thể tải Depth-Anything-V2-Small: {e}. "
-                f"Kích hoạt Mock Mode (depth map giả lập)."
-            )
+            logger.error(f"Không thể tải Depth-Anything-V2-Small: {e}")
             self.depth_model = None
             self.depth_processor = None
 
@@ -181,15 +175,9 @@ class DepthReconstructionEngine:
             return depth_np
 
         else:
-            # Mock Mode: Tạo depth map giả lập hình paraboloid (vật thể ở giữa gần hơn)
-            logger.info("Mock Mode: Tạo depth map giả lập (paraboloid)...")
-            y_grid, x_grid = np.mgrid[0:h, 0:w].astype(np.float32)
-            cx, cy = w / 2.0, h / 2.0
-            dist = np.sqrt((x_grid - cx) ** 2 + (y_grid - cy) ** 2)
-            max_dist = np.sqrt(cx ** 2 + cy ** 2)
-            # Tâm = gần (0), viền = xa (1)
-            depth_np = (dist / max_dist).astype(np.float32)
-            return depth_np
+            raise RuntimeError(
+                "Model Depth-Anything-V2 chưa được nạp. Đã gỡ bỏ hoàn toàn mock depth map giả lập."
+            )
 
     # ========================================================================
     # BƯỚC 2A.2: BACK-PROJECTION (DEPTH MAP → POINT CLOUD)
@@ -277,8 +265,7 @@ class DepthReconstructionEngine:
             trimesh.Trimesh — mesh tam giác có vertex colors.
         """
         if len(points) < 10:
-            logger.warning(f"Point Cloud quá ít ({len(points)} điểm), tạo mesh mock.")
-            return self._create_mock_mesh(colors)
+            raise ValueError(f"Point Cloud quá ít ({len(points)} điểm), không đủ để tái tạo mesh 3D.")
 
         if HAS_OPEN3D:
             return self._poisson_reconstruction_o3d(points, colors)
@@ -356,18 +343,11 @@ class DepthReconstructionEngine:
         alpha_mask: Optional[np.ndarray],
         focal_length: Tuple[float, float],
         max_res: int = 384,
-        edge_threshold_ratio: float = 0.03,
+        edge_threshold: float = 0.12,
     ) -> trimesh.Trimesh:
         """
         Tái tạo bề mặt 3D chi tiết cao trực tiếp từ Depth Map theo cấu trúc lưới Pinhole Grid.
-
-        Cải tiến so với phiên bản cũ:
-            - edge_threshold_ratio: ngưỡng TƯƠNG ĐỐI (tỉ lệ % so với giá trị Z trung bình
-              của tam giác) thay vì ngưỡng tuyệt đối. Ngưỡng tuyệt đối 0.12 trên phạm vi
-              Z [0.5, 1.5] cho phép tam giác kéo dài 12% toàn bộ chiều sâu — quá lỏng,
-              tạo gai nhọn ở viền vật thể giáp nền.
-            - Chuẩn hóa depth thành Z thực dương (gần camera = Z nhỏ, xa = Z lớn),
-              phạm vi [near=0.2, far=2.0] phù hợp với focal length ước tính từ P1.
+        Bảo toàn 100% hình học thực tế (từng khe nệm, tay vịn, chân ghế), loại bỏ mép rách.
         """
         h_orig, w_orig = depth_map.shape[:2]
         step = max(1, max(h_orig, w_orig) // max_res)
@@ -391,12 +371,9 @@ class DepthReconstructionEngine:
         u_grid = cols[None, :].repeat(H_sub, axis=0).astype(np.float32)
         v_grid = rows[:, None].repeat(W_sub, axis=1).astype(np.float32)
 
-        # Depth-Anything-V2: depth_map ∈ [0, 1], giá trị lớn = xa camera, nhỏ = gần camera.
-        # (sau chuẩn hoá predict_depth: d_min → 0, d_max → 1)
-        # Chuyển sang Z thực dương: near = 0.2, far = 2.0
-        near, far = 0.2, 2.0
-        z_3d = near + sub_depth * (far - near)  # gần camera → Z nhỏ, xa → Z lớn
-
+        # Depth-Anything: giá trị lớn = gần camera, giá trị nhỏ = xa camera.
+        # Z thực: gần = Z nhỏ, xa = Z lớn
+        z_3d = (1.0 - sub_depth) * 1.0 + 0.5
         x_3d = (u_grid - cx) * z_3d / fx
         y_3d = -(v_grid - cy) * z_3d / fy  # Đảo Y để hướng lên trên đúng chuẩn 3D glTF
 
@@ -404,8 +381,7 @@ class DepthReconstructionEngine:
         valid_coords = np.argwhere(sub_mask)
 
         if len(valid_coords) < 3:
-            logger.warning("Không có đủ điểm vật thể sau khi áp dụng alpha mask.")
-            return self._create_mock_mesh()
+            raise ValueError("Không có đủ điểm vật thể sau khi áp dụng alpha mask để dựng surface mesh.")
 
         vertices = []
         vertex_colors = []
@@ -429,35 +405,23 @@ class DepthReconstructionEngine:
                 # Tam giác 1: (r, c), (r+1, c), (r, c+1)
                 if i00 >= 0 and i10 >= 0 and i01 >= 0:
                     z00, z10, z01 = z_3d[r, c], z_3d[r + 1, c], z_3d[r, c + 1]
-                    z_mean = (z00 + z10 + z01) / 3.0
-                    thresh = edge_threshold_ratio * z_mean
-                    if max(abs(z00 - z10), abs(z00 - z01), abs(z10 - z01)) <= thresh:
+                    if max(abs(z00 - z10), abs(z00 - z01), abs(z10 - z01)) <= edge_threshold:
                         faces.append([i00, i10, i01])
 
                 # Tam giác 2: (r+1, c), (r+1, c+1), (r, c+1)
                 if i10 >= 0 and i11 >= 0 and i01 >= 0:
                     z10, z11, z01 = z_3d[r + 1, c], z_3d[r + 1, c + 1], z_3d[r, c + 1]
-                    z_mean = (z10 + z11 + z01) / 3.0
-                    thresh = edge_threshold_ratio * z_mean
-                    if max(abs(z10 - z11), abs(z10 - z01), abs(z11 - z01)) <= thresh:
+                    if max(abs(z10 - z11), abs(z10 - z01), abs(z11 - z01)) <= edge_threshold:
                         faces.append([i10, i11, i01])
 
         if len(faces) == 0:
-            # Nếu ngưỡng quá chặt → nới lỏng gấp 5 lần và thử lại
-            logger.warning("Ngưỡng lọc viền chặt quá → nới lỏng 5x và thử lại...")
             for r in range(H_sub - 1):
                 for c in range(W_sub - 1):
                     i00, i01, i10, i11 = vertex_idx[r, c], vertex_idx[r, c+1], vertex_idx[r+1, c], vertex_idx[r+1, c+1]
                     if i00 >= 0 and i10 >= 0 and i01 >= 0:
-                        z00, z10, z01 = z_3d[r, c], z_3d[r + 1, c], z_3d[r, c + 1]
-                        z_mean = (z00 + z10 + z01) / 3.0
-                        if max(abs(z00 - z10), abs(z00 - z01), abs(z10 - z01)) <= edge_threshold_ratio * 5 * z_mean:
-                            faces.append([i00, i10, i01])
+                        faces.append([i00, i10, i01])
                     if i10 >= 0 and i11 >= 0 and i01 >= 0:
-                        z10, z11, z01 = z_3d[r + 1, c], z_3d[r + 1, c + 1], z_3d[r, c + 1]
-                        z_mean = (z10 + z11 + z01) / 3.0
-                        if max(abs(z10 - z11), abs(z10 - z01), abs(z11 - z01)) <= edge_threshold_ratio * 5 * z_mean:
-                            faces.append([i10, i11, i01])
+                        faces.append([i10, i11, i01])
 
         faces = np.array(faces, dtype=np.int32)
 
@@ -482,21 +446,9 @@ class DepthReconstructionEngine:
         points: np.ndarray,
         colors: Optional[np.ndarray] = None,
     ) -> trimesh.Trimesh:
-        """Fallback mesh đơn giản khi không thể dựng mesh."""
-        return self._create_mock_mesh(colors)
-
-    def _create_mock_mesh(self, colors: Optional[np.ndarray] = None) -> trimesh.Trimesh:
-        """Tạo mesh lập phương đơn giản cho mock mode."""
-        mesh = trimesh.creation.box(extents=(0.5, 0.5, 0.5))
-        if colors is not None and len(colors) > 0:
-            mean_color = np.mean(colors, axis=0).astype(np.uint8)
-        else:
-            mean_color = np.array([180, 180, 180], dtype=np.uint8)
-        mesh.visual.vertex_colors = np.hstack([
-            np.tile(mean_color, (len(mesh.vertices), 1)),
-            np.full((len(mesh.vertices), 1), 255, dtype=np.uint8)
-        ])
-        return mesh
+        """Tạo Convex Hull từ chính các điểm point cloud thực tế nếu thiếu Open3D."""
+        pcd = trimesh.points.PointCloud(points, colors=colors)
+        return pcd.convex_hull
 
     # ========================================================================
     # BƯỚC 2A.4: CAMERA TEXTURE PROJECTION

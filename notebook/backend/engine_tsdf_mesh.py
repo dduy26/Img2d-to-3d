@@ -140,7 +140,7 @@ def prune_background_points(
         valid_masks: List N boolean masks (H, W).
         filtered_points_list: List N mảng điểm 3D (K_i, 3) hợp lệ.
     """
-    n_views = len(pointmaps_3d)
+    n_views, h, w, _ = pointmaps_3d.shape
     valid_masks = []
     filtered_points_list = []
 
@@ -148,22 +148,6 @@ def prune_background_points(
         pts = pointmaps_3d[i]  # (H, W, 3)
         conf = confidence_masks[i]  # (H, W)
         alpha = alpha_masks[i]  # (H, W)
-
-        # Đảm bảo alpha mask khớp shape với pts
-        if alpha.shape[:2] != pts.shape[:2]:
-            from PIL import Image
-            alpha = np.asarray(
-                Image.fromarray(alpha.astype(np.uint8)).resize(
-                    (pts.shape[1], pts.shape[0]), Image.NEAREST
-                )
-            )
-        if conf.shape[:2] != pts.shape[:2]:
-            from PIL import Image
-            conf = np.asarray(
-                Image.fromarray(conf.astype(np.float32)).resize(
-                    (pts.shape[1], pts.shape[0]), Image.BILINEAR
-                )
-            )
 
         # Tính độ sâu quan sát (chiều Z hoặc khoảng cách Euclidean)
         depth = np.linalg.norm(pts, axis=-1)
@@ -407,24 +391,22 @@ def extract_mesh_marching_cubes(
     unobserved = weights < min_weight
     volume[unobserved] = 1.0
 
-    # Marching Cubes tìm iso-surface tại level = 0.0 (với fallback các mức lân cận)
-    verts = faces = normals = None
-    last_err = None
-    for lvl in [0.0, 0.05, -0.05, 0.1]:
-        try:
-            verts, faces, normals, _ = measure.marching_cubes(
-                volume=volume,
-                level=lvl,
-                spacing=(tsdf_volume.voxel_size, tsdf_volume.voxel_size, tsdf_volume.voxel_size),
-                allow_degenerate=False,
-            )
-            break
-        except Exception as e:
-            last_err = e
-            continue
-
-    if verts is None or len(verts) == 0:
-        raise ValueError(f"Marching Cubes không trích xuất được bề mặt: {last_err}")
+    # Marching Cubes tìm iso-surface tại level = 0.0
+    try:
+        verts, faces, normals, _ = measure.marching_cubes(
+            volume=volume,
+            level=0.0,
+            spacing=(tsdf_volume.voxel_size, tsdf_volume.voxel_size, tsdf_volume.voxel_size),
+            allow_degenerate=False,
+        )
+    except Exception as e:
+        logger.warning(f"Marching Cubes level 0.0 gặp lỗi ({e}), thử level 0.05...")
+        verts, faces, normals, _ = measure.marching_cubes(
+            volume=volume,
+            level=0.05,
+            spacing=(tsdf_volume.voxel_size, tsdf_volume.voxel_size, tsdf_volume.voxel_size),
+            allow_degenerate=False,
+        )
 
     # Chuyển đổi tọa độ từ Voxel Grid Index sang Tọa độ Không gian Thực (World Coordinates)
     verts_world = verts + tsdf_volume.bounds_min
@@ -511,23 +493,8 @@ class TSDFMeshEngine:
             tau_edge=self.tau_edge,
         )
 
-        valid_pts_list = [p for p in filtered_points if len(p) > 0]
-        all_valid_pts = np.concatenate(valid_pts_list, axis=0) if valid_pts_list else np.zeros((0, 3), dtype=np.float32)
+        all_valid_pts = np.concatenate([p for p in filtered_points if len(p) > 0], axis=0)
         if len(all_valid_pts) < 100:
-            logger.warning(
-                f"[P4] Số lượng điểm 3D với tau_conf={self.tau_conf} ít ({len(all_valid_pts)} điểm) → Nới lỏng ngưỡng lọc..."
-            )
-            valid_masks, filtered_points = prune_background_points(
-                pointmaps_3d=pointmaps_3d,
-                alpha_masks=alpha_masks,
-                confidence_masks=confidence_masks,
-                tau_conf=0.15,
-                tau_edge=self.tau_edge * 2.0,
-            )
-            valid_pts_list = [p for p in filtered_points if len(p) > 0]
-            all_valid_pts = np.concatenate(valid_pts_list, axis=0) if valid_pts_list else np.zeros((0, 3), dtype=np.float32)
-
-        if len(all_valid_pts) < 30:
             raise ValueError(f"Số lượng điểm 3D hợp lệ quá ít ({len(all_valid_pts)} điểm) không đủ để dựng lưới.")
 
         # ── Bước 2: Khởi tạo thể tích TSDF theo Bounding Box ──
@@ -560,16 +527,7 @@ class TSDFMeshEngine:
 
         # ── Bước 4: Trích xuất Iso-surface Marching Cubes ──
         logger.info("[P4] Trích xuất bề mặt Marching Cubes...")
-        try:
-            mesh = extract_mesh_marching_cubes(tsdf_vol)
-        except Exception as mc_err:
-            logger.warning(
-                f"[P4] Marching Cubes TSDF gặp lỗi ({mc_err}) → Dựng mesh từ toàn bộ đám mây điểm đa ảnh..."
-            )
-            pcd = trimesh.PointCloud(vertices=all_valid_pts)
-            mesh = pcd.convex_hull
-            if len(mesh.faces) == 0:
-                raise ValueError(f"Không thể tái tạo lưới từ đám mây điểm đa ảnh: {mc_err}")
+        mesh = extract_mesh_marching_cubes(tsdf_vol)
 
         elapsed = time.time() - t0
         logger.info(f"═══ [P4] HOÀN THÀNH TÁI TẠO MESH TRONG {elapsed:.2f} GIÂY ═══")

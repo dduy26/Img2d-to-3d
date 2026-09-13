@@ -21,11 +21,15 @@ try:
 except ImportError:
     HAS_TRIPOSR = False
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 class TripoSREngine:
     def __init__(self):
         # Khởi tạo mô hình ngay khi boot server để không mất thời gian load lại (đảm bảo <= 2s)
         if HAS_TRIPOSR:
-            print("Loading TripoSR Fail-safe Model...")
+            logger.info("Loading TripoSR Fail-safe Model...")
             self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
             try:
                 self.model = TSR.from_pretrained(
@@ -35,12 +39,11 @@ class TripoSREngine:
                 )
                 self.model.to(self.device)
                 self.model.eval()
-                print("TripoSR loaded successfully.")
+                logger.info("TripoSR loaded successfully.")
             except Exception as e:
-                print(f"Cảnh báo: Không thể nạp weights TripoSR ({e}), sử dụng mock fallback.")
+                logger.warning(f"Chua the nap weights TripoSR: {e}")
                 self.model = None
         else:
-            print("Chưa có TSR/Torch/Rembg, kích hoạt TripoSR Mock Fallback Engine.")
             self.model = None
 
     def preprocess_image(self, image_path):
@@ -72,28 +75,24 @@ class TripoSREngine:
             img_rgba = self.preprocess_image(image_path)
             
             # 2. Tạo 3D
-            if self.model is not None and HAS_TRIPOSR:
-                with torch.no_grad():
-                    scene_codes = self.model(img_rgba, device=self.device)
-                meshes = self.model.extract_mesh(scene_codes, has_vertex_color=True, resolution=128)
-                mesh = meshes[0]
-            else:
-                # Mock fallback: tạo mesh lập phương tròn góc có màu từ ảnh
-                mesh = trimesh.creation.box(extents=(0.8, 0.8, 0.8))
-                img_arr = np.array(img_rgba)
-                mean_color = np.mean(img_arr, axis=(0, 1))[:3].astype(np.uint8)
-                mesh.visual.vertex_colors = np.hstack([np.tile(mean_color, (len(mesh.vertices), 1)), np.full((len(mesh.vertices), 1), 255, dtype=np.uint8)])
+            if self.model is None or not HAS_TRIPOSR:
+                raise RuntimeError("TripoSR chưa được nạp weights hoặc thiếu thư viện. Đã gỡ bỏ hoàn toàn mock box fallback.")
+
+            with torch.no_grad():
+                scene_codes = self.model(img_rgba, device=self.device)
+            meshes = self.model.extract_mesh(scene_codes, has_vertex_color=True, resolution=128)
+            mesh = meshes[0]
             
             # 3. Lưu ra định dạng .glb
             mesh.export(output_glb_path)
             
             execution_time = time.time() - start_time
-            print(f"Rescue successful! Model generated in {execution_time:.2f}s")
+            print(f"TripoSR: Model generated in {execution_time:.2f}s")
             
             return True, output_glb_path, execution_time
             
         except Exception as e:
-            print(f"TripoSR Fallback failed: {e}")
+            print(f"TripoSR failed: {e}")
             return False, None, time.time() - start_time
 
     def run_from_preprocessed(self, image_rgb, alpha_mask, output_glb_path):
@@ -134,20 +133,13 @@ class TripoSREngine:
                 pil_img = Image.fromarray(img_arr.astype(np.uint8))
 
             # 2. Tạo 3D
-            if self.model is not None and HAS_TRIPOSR:
-                with torch.no_grad():
-                    scene_codes = self.model(pil_img, device=self.device)
-                meshes = self.model.extract_mesh(scene_codes, has_vertex_color=True, resolution=128)
-                mesh = meshes[0]
-            else:
-                # Mock fallback
-                mesh = trimesh.creation.box(extents=(0.8, 0.8, 0.8))
-                img_arr = np.array(pil_img)
-                mean_color = np.mean(img_arr, axis=(0, 1))[:3].astype(np.uint8)
-                mesh.visual.vertex_colors = np.hstack([
-                    np.tile(mean_color, (len(mesh.vertices), 1)),
-                    np.full((len(mesh.vertices), 1), 255, dtype=np.uint8)
-                ])
+            if self.model is None or not HAS_TRIPOSR:
+                raise RuntimeError("TripoSR chưa được nạp weights. Đã xóa bỏ hoàn toàn mock box fallback.")
+
+            with torch.no_grad():
+                scene_codes = self.model(pil_img, device=self.device)
+            meshes = self.model.extract_mesh(scene_codes, has_vertex_color=True, resolution=128)
+            mesh = meshes[0]
 
             # 3. Lưu ra .glb
             mesh.export(output_glb_path)
