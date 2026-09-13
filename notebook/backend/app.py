@@ -62,6 +62,10 @@ logger.info(f"Cấu hình: TSDF_RES={TSDF_RES}, DUST3R_NITER={DUST3R_NITER}")
 
 # P2: DUSt3R Engine
 dust3r_engine = DUSt3REngine(device=device, niter=DUST3R_NITER)
+try:
+    dust3r_engine.load_model()
+except Exception as e:
+    logger.warning(f"Chưa nạp được weights DUSt3R lúc boot: {e}")
 
 # P4: TSDF Volumetric Mesh Engine (NVIDIA reference TSDF + Marching Cubes)
 tsdf_engine = TSDFMeshEngine(resolution=TSDF_RES)

@@ -5,11 +5,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 class QualityGate:
-    def __init__(self, min_confidence=0.45, max_loss=2.5, min_angle_deg=5.0, max_angle_deg=120.0):
+    def __init__(self, min_confidence=0.45, max_loss=2.5, min_angle_deg=0.0, max_angle_deg=120.0):
         # Thiết lập các hằng số làm ngưỡng đánh giá
         self.min_confidence = min_confidence
         self.max_loss = max_loss
-        self.min_angle = min_angle_deg
+        self.min_angle = min_angle_deg  # 0.0 để 2 góc chụp gần nhau không bị loại khỏi đồ thị liên thông
         self.max_angle = max_angle_deg
 
     def build_covisibility_graph(self, poses):
