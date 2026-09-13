@@ -11,6 +11,7 @@ import asyncio
 import threading
 import uuid
 import numpy as np
+import trimesh
 import logging
 from PIL import Image
 
@@ -25,7 +26,13 @@ from preprocess import preprocess_multiview
 from engine_dust3r import DUSt3REngine
 from quality_gate import QualityGate
 from engine_triposr import TripoSREngine
-from engine_tsdf_mesh import TSDFMeshEngine, DEFAULT_CONF_THRESHOLD
+from engine_tsdf_mesh import (
+    TSDFMeshEngine,
+    DEFAULT_CONF_THRESHOLD,
+    DEFAULT_TRUNC_FRACTION,
+    DEFAULT_SMOOTH_ITERATIONS,
+    log_mesh_health,
+)
 from texture_blender import TextureBlender
 
 # Cấu hình logging
@@ -60,13 +67,25 @@ triposr_engine = TripoSREngine()
 # DUST3R_NITER: số vòng global alignment. Cao hơn = khớp camera chặt hơn, chậm hơn.
 TSDF_RES = int(os.environ.get("TSDF_RES", "128"))
 DUST3R_NITER = int(os.environ.get("DUST3R_NITER", "300"))
-logger.info(f"Cấu hình: TSDF_RES={TSDF_RES}, DUST3R_NITER={DUST3R_NITER}")
+# TSDF_TRUNC_FRAC: mu cắt ngắn = tỉ lệ này × cạnh lớn nhất của vật. KHÔNG theo resolution
+#   (đo Chamfer: gắn vào voxel_size làm res cao LỆCH hơn; xem ghi chú ở engine_tsdf_mesh).
+# TSDF_SMOOTH_ITER: số vòng làm mượt Taubin sau Marching Cubes. 0 = tắt.
+TSDF_TRUNC_FRAC = float(os.environ.get("TSDF_TRUNC_FRAC", str(DEFAULT_TRUNC_FRACTION)))
+TSDF_SMOOTH_ITER = int(os.environ.get("TSDF_SMOOTH_ITER", str(DEFAULT_SMOOTH_ITERATIONS)))
+logger.info(
+    f"Cấu hình: TSDF_RES={TSDF_RES}, DUST3R_NITER={DUST3R_NITER}, "
+    f"TSDF_TRUNC_FRAC={TSDF_TRUNC_FRAC}, TSDF_SMOOTH_ITER={TSDF_SMOOTH_ITER}"
+)
 
 # P2: DUSt3R Engine
 dust3r_engine = DUSt3REngine(device=device, niter=DUST3R_NITER)
 
 # P4: TSDF Volumetric Mesh Engine (NVIDIA reference TSDF + Marching Cubes)
-tsdf_engine = TSDFMeshEngine(resolution=TSDF_RES)
+tsdf_engine = TSDFMeshEngine(
+    resolution=TSDF_RES,
+    trunc_fraction=TSDF_TRUNC_FRAC,
+    smooth_iterations=TSDF_SMOOTH_ITER,
+)
 
 # P5: XAtlas UV Parameterization & Base-Color Texture Blender
 texture_blender = TextureBlender()
@@ -262,6 +281,16 @@ async def generate_3d(files: List[UploadFile] = File(...)):
                 model_path = output_glb_path
 
             pipeline_type = "nvidia_tsdf_mesh"
+
+            # Kiểm tra hình học THẬT của file xuất ra. PHẢI hàn đỉnh trước khi đo:
+            # XAtlas chia đỉnh tại mọi seam UV (bình thường), mà trimesh đếm mảnh theo
+            # chart UV -> mesh lành vẫn bị báo "hàng nghìn mảnh rời" nếu đo sai cách.
+            if success and os.path.exists(output_glb_path):
+                try:
+                    log_mesh_health(trimesh.load(output_glb_path, force="mesh"),
+                                    "GLB xuất ra (sau P5)")
+                except Exception as e:
+                    logger.warning(f"Không kiểm được hình học GLB: {type(e).__name__}: {e}")
         else:
             # ✗ FAIL: Kích hoạt cứu hộ TripoSR
             logger.info(f"[P3→Cứu hộ] Quality FAIL ({reason}) → Gọi TripoSR fallback")

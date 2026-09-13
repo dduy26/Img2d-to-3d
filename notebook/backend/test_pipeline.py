@@ -39,6 +39,7 @@ from engine_tsdf_mesh import (
     TSDFVolume,
     extract_mesh_marching_cubes,
     TSDFMeshEngine,
+    mesh_health,
 )
 try:
     from texture_blender import TextureBlender
@@ -258,10 +259,33 @@ def test_06_api_multiview_full_pipeline():
         total_verts = sum(len(m.vertices) for m in meshes)
         total_faces = sum(len(m.faces) for m in meshes)
     else:
+        meshes = [loaded]
         total_verts = len(loaded.vertices)
         total_faces = len(loaded.faces)
 
     assert total_verts > 0 and total_faces > 0
+
+    # ── Kiểm tra HÌNH HỌC THẬT của file xuất ra ──
+    # PHẢI hàn đỉnh trước khi đo (mesh_health làm việc đó). XAtlas chia đỉnh tại mọi
+    # seam UV — bình thường — nhưng mesh.split() đếm mảnh theo chart UV nên sẽ báo
+    # "hàng nghìn mảnh rời" cho một khối hoàn toàn lành. Đây là phép kiểm chặn bẫy đó.
+    exported = meshes[0] if len(meshes) == 1 else trimesh.util.concatenate(meshes)
+    health = mesh_health(exported)
+    print(
+        f"  [HÌNH HỌC] {health['vertices']} đỉnh ({health['duplicated_vertices']} đỉnh trùng do "
+        f"seam UV) | sau khi hàn: {health['components']} mảnh, {health['boundary_edges']} cạnh biên, "
+        f"watertight={health['watertight']}"
+    )
+    # Chỉ khẳng định khi P2 là DUSt3R thật: chế độ MOCK sinh đám mây điểm ngẫu nhiên nên
+    # hình học vô nghĩa theo thiết kế — assert vào đó là bắt lỗi sai đối tượng.
+    # Số dưới đây là ĐÃ ĐO trên GLB thật (5 ảnh GSO, res128).
+    if data.get("dust3r_backend") == "dust3r-real":
+        assert health["components"] == 1, f"Mesh vỡ thành {health['components']} mảnh rời"
+        assert health["boundary_edges"] == 0, (
+            f"Có {health['boundary_edges']} cạnh biên -> mesh HỞ (vùng không camera nào thấy). "
+            f"Cần chụp thêm góc, nhất là mặt dưới."
+        )
+
     print(f"  ✅ PASS: Full Multi-view Pipeline hoàn thành trong {total_time:.2f}s! ({total_verts} đỉnh, {total_faces} tam giác).")
 
 

@@ -61,6 +61,23 @@ DEFAULT_VOXEL_RESOLUTION: int = 128
 # Bán kính cắt ngắn TSDF (Truncation margin factor so với voxel size)
 DEFAULT_TRUNC_MARGIN_FACTOR: float = 3.0
 
+# ── SỬA (P6, đo được): trunc_margin gắn SAI đại lượng ──
+# Cũ: trunc_margin = voxel_size * 3  -> tăng resolution là margin TỰ CO.
+#      Nhưng mu (truncation) phải phản ánh ĐỘ NHIỄU CỦA CẢM BIẾN, không phải kích thước voxel.
+#      Margin co lại => mỗi voxel chỉ tin 1 điểm đo => mất tác dụng trung bình hoá của TSDF
+#      => bề mặt bám theo nhiễu DUSt3R => resolution cao lại LỆCH hơn.
+# ĐO ĐƯỢC (Chamfer distance tới ground truth GSO, res128 tốt nhất):
+#      res128 = 0.16209 | res192 = 0.17599 (+8.6%) | res256 = 0.18002 (+11.1%)
+# Mới: trunc_margin = trunc_fraction * cạnh lớn nhất của vật -> KHÔNG phụ thuộc resolution,
+#      nên tăng resolution chỉ tăng chi tiết, không còn làm lệch bề mặt.
+DEFAULT_TRUNC_FRACTION: float = 0.02
+
+# ── SỬA (P6): làm mượt Taubin sau Marching Cubes ──
+# Marching Cubes trên TSDF nhiễu cho bề mặt sần ("gồ ghề"). Taubin không co khối
+# (khác Laplacian thuần), nên giữ hình dạng mà giảm nhiễu tần số cao.
+# 0 = tắt. Dùng trimesh.smoothing.filter_taubin (KHÔNG phải smooth_taubin — tên đó không có).
+DEFAULT_SMOOTH_ITERATIONS: int = 5
+
 # Ngưỡng trọng số tối thiểu để coi voxel đã được quan sát (Min accumulated weight)
 DEFAULT_MIN_WEIGHT: float = 0.15
 
@@ -192,6 +209,7 @@ class TSDFVolume:
         bounds_max: np.ndarray,
         resolution: int = DEFAULT_VOXEL_RESOLUTION,
         trunc_margin: Optional[float] = None,
+        trunc_fraction: float = DEFAULT_TRUNC_FRACTION,
     ):
         """
         Khởi tạo lưới thể tích Voxel TSDF.
@@ -200,7 +218,8 @@ class TSDFVolume:
             bounds_min: Tọa độ nhỏ nhất [X_min, Y_min, Z_min] của thể tích.
             bounds_max: Tọa độ lớn nhất [X_max, Y_max, Z_max] của thể tích.
             resolution: Số ô voxel mỗi cạnh (mặc định 128).
-            trunc_margin: Khoảng cách cắt ngắn mu (nếu None sẽ tự động tính theo voxel size).
+            trunc_margin: Khoảng cách cắt ngắn mu, ghim cứng (ưu tiên cao nhất; test/đo dùng cái này).
+            trunc_fraction: Tỉ lệ cạnh lớn nhất của vật dùng làm mu khi trunc_margin=None.
         """
         self.bounds_min = bounds_min.astype(np.float32)
         self.bounds_max = bounds_max.astype(np.float32)
@@ -217,11 +236,12 @@ class TSDFVolume:
         self.bounds_max = (center + half_cube).astype(np.float32)
         self.extent = self.bounds_max - self.bounds_min
 
-        # Truncation margin mu
-        if trunc_margin is None:
-            self.trunc_margin = float(self.voxel_size * DEFAULT_TRUNC_MARGIN_FACTOR)
+        # Truncation margin mu — gắn với ĐỘ NHIỄU / KÍCH THƯỚC VẬT, KHÔNG theo voxel size
+        # (xem ghi chú ở DEFAULT_TRUNC_FRACTION: đây là nguyên nhân resolution cao lại lệch hơn)
+        if trunc_margin is not None:
+            self.trunc_margin = float(trunc_margin)        # ghim cứng (test/đo)
         else:
-            self.trunc_margin = float(trunc_margin)
+            self.trunc_margin = float(trunc_fraction * max_extent)
 
         # Lưới TSDF: khởi tạo 1.0 (free space / trống)
         self.tsdf_grid = np.ones((resolution, resolution, resolution), dtype=np.float32)
@@ -433,6 +453,67 @@ def extract_mesh_marching_cubes(
 
 
 # ============================================================================
+# PHÉP KIỂM HÌNH HỌC THẬT (dùng cho log + test)
+# ============================================================================
+
+def mesh_health(mesh: trimesh.Trimesh, decimals: int = 6) -> dict:
+    """
+    Đo hình học THẬT của mesh: kín hay hở, mấy mảnh, bao nhiêu cạnh biên.
+
+    PHẢI HÀN ĐỈNH TRƯỚC KHI KIỂM. Mesh có texture bị XAtlas chia đỉnh tại mọi đường
+    seam UV — đó là chuyện BÌNH THƯỜNG và không làm hỏng hình. Nhưng trimesh đếm mảnh
+    theo chart UV (face_adjacency dựa trên chỉ số đỉnh), nên `mesh.split()` báo "hàng
+    nghìn mảnh rời" cho một khối hoàn toàn lành. Hàn đỉnh theo toạ độ rồi mới đo.
+    """
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    if len(vertices) == 0 or len(faces) == 0:
+        return {"vertices": 0, "faces": 0, "watertight": False, "winding_consistent": False,
+                "components": 0, "boundary_edges": 0, "volume": 0.0,
+                "duplicated_vertices": 0}
+
+    unique_vertices, inverse = np.unique(np.round(vertices, decimals), axis=0, return_inverse=True)
+    welded = trimesh.Trimesh(vertices=unique_vertices, faces=inverse[faces], process=True)
+    welded.update_faces(welded.nondegenerate_faces())
+    welded.update_faces(welded.unique_faces())
+
+    edges = welded.edges_sorted
+    if len(edges):
+        _, counts = np.unique(edges, axis=0, return_counts=True)
+        boundary = int(np.count_nonzero(counts == 1))
+    else:
+        boundary = 0
+
+    return {
+        "vertices": len(vertices),
+        "faces": len(faces),
+        "duplicated_vertices": len(vertices) - len(unique_vertices),
+        "watertight": bool(welded.is_watertight),
+        "winding_consistent": bool(welded.is_winding_consistent),
+        "components": len(welded.split(only_watertight=False)),
+        "boundary_edges": boundary,
+        "volume": float(welded.volume),
+    }
+
+
+def log_mesh_health(mesh: trimesh.Trimesh, label: str = "mesh") -> dict:
+    """In kết quả mesh_health ra log. Hở (boundary_edges > 0) thì cảnh báo rõ."""
+    health = mesh_health(mesh)
+    logger.info(
+        f"[KIỂM HÌNH HỌC] {label}: {health['vertices']} đỉnh ({health['duplicated_vertices']} "
+        f"đỉnh trùng do seam UV), {health['faces']} mặt | sau khi hàn: "
+        f"{health['components']} mảnh, {health['boundary_edges']} cạnh biên, "
+        f"watertight={health['watertight']}, thể tích={health['volume']:.6f}"
+    )
+    if health["boundary_edges"] > 0:
+        logger.warning(
+            f"[KIỂM HÌNH HỌC] {label} HỞ: {health['boundary_edges']} cạnh biên -> có vùng "
+            f"không camera nào quan sát. Cần chụp thêm góc (nhất là mặt dưới)."
+        )
+    return health
+
+
+# ============================================================================
 # ĐỘNG CƠ TỔNG HỢP: TSDFMeshEngine (GIAO DIỆN BÀN GIAO CHO APP)
 # ============================================================================
 
@@ -447,10 +528,14 @@ class TSDFMeshEngine:
         resolution: int = DEFAULT_VOXEL_RESOLUTION,
         tau_conf: float = DEFAULT_CONF_THRESHOLD,
         tau_edge: float = DEFAULT_DEPTH_EDGE_TAU,
+        trunc_fraction: float = DEFAULT_TRUNC_FRACTION,
+        smooth_iterations: int = DEFAULT_SMOOTH_ITERATIONS,
     ):
         self.resolution = resolution
         self.tau_conf = tau_conf
         self.tau_edge = tau_edge
+        self.trunc_fraction = trunc_fraction
+        self.smooth_iterations = int(smooth_iterations)
 
     def reconstruct(
         self,
@@ -512,6 +597,7 @@ class TSDFMeshEngine:
             bounds_min=bounds_min,
             bounds_max=bounds_max,
             resolution=self.resolution,
+            trunc_fraction=self.trunc_fraction,
         )
 
         # ── Bước 3: Tích lũy đa góc nhìn vào Voxel Grid ──
@@ -528,6 +614,17 @@ class TSDFMeshEngine:
         # ── Bước 4: Trích xuất Iso-surface Marching Cubes ──
         logger.info("[P4] Trích xuất bề mặt Marching Cubes...")
         mesh = extract_mesh_marching_cubes(tsdf_vol)
+
+        # ── Bước 5: Làm mượt Taubin (giảm sần do nhiễu DUSt3R, KHÔNG co khối) ──
+        if self.smooth_iterations > 0:
+            try:
+                from trimesh.smoothing import filter_taubin
+                filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=self.smooth_iterations)
+                logger.info(f"[P4] Làm mượt Taubin xong ({self.smooth_iterations} vòng).")
+            except Exception as e:
+                logger.warning(f"[P4] Bỏ qua làm mượt Taubin: {type(e).__name__}: {e}")
+
+        log_mesh_health(mesh, "P4 mesh (trước P5)")
 
         elapsed = time.time() - t0
         logger.info(f"═══ [P4] HOÀN THÀNH TÁI TẠO MESH TRONG {elapsed:.2f} GIÂY ═══")
