@@ -156,6 +156,30 @@ class DUSt3REngine:
         camera_poses = [np.asarray(poses[i], dtype=np.float32) for i in range(n)]
         focal_lengths = [(float(focals[i][0]), float(focals[i][-1])) for i in range(n)]
 
+        # ── CHẨN ĐOÁN (P6): align có thật sự tản quanh vật không? ──
+        # 5 ảnh chụp quanh vật mà align hỏng thì 5 tâm camera dồn cục một chỗ -> P4 chỉ
+        # fuse được ~1 góc -> hình ra "chỉ 1 mặt". Log này phân biệt được ngay 2 khả năng:
+        #   - tâm camera TẢN quanh gốc, bán kính đều  -> align OK, thiếu là do độ phủ ảnh
+        #   - tâm camera DỒN CỤC / bán kính lệch nhau -> align hỏng, phải sửa P2 trước
+        centers = np.stack([p[:3, 3] for p in camera_poses])
+        radii = np.linalg.norm(centers, axis=1)
+        spread = centers.max(axis=0) - centers.min(axis=0)
+        self.logger.info(
+            f"[P2-CHẨN ĐOÁN] Tâm camera (world) bán kính: {np.round(radii, 3).tolist()}"
+        )
+        self.logger.info(
+            f"[P2-CHẨN ĐOÁN] Độ tản tâm camera (max-min): {spread.round(3).tolist()} | "
+            f"bán kính lệch {float(radii.max() - radii.min()):.3f}"
+        )
+        # Vật có rộng hơn khoảng cách camera không? (nếu có -> bounding box bị thổi phồng)
+        pts_all = np.concatenate([p.reshape(-1, 3) for p in pts], axis=0)
+        valid = np.isfinite(pts_all).all(axis=1)
+        obj_extent = pts_all[valid].max(axis=0) - pts_all[valid].min(axis=0) if valid.any() else np.zeros(3)
+        self.logger.info(
+            f"[P2-CHẨN ĐOÁN] Kích thước point cloud: {obj_extent.round(3).tolist()} | "
+            f"đường kính camera ~{float(2 * radii.mean()):.3f}"
+        )
+
         self.logger.info(
             f"[P2] XONG trong {time.time() - t0:.1f}s — {n} view, pointmap {pointmaps_3d.shape}, "
             f"ba_loss={float(ba_loss):.4f}, focal~{focal_lengths[0][0]:.0f}px, "

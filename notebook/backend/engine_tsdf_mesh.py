@@ -249,6 +249,10 @@ class TSDFVolume:
         # Lưới trọng số tích lũy: khởi tạo 0.0
         self.weight_grid = np.zeros((resolution, resolution, resolution), dtype=np.float32)
 
+        # Lưới đếm số GÓC NHÌN đã chạm tới mỗi voxel — dùng để đo độ phủ.
+        # Voxel chỉ 1 view xác nhận = có thể là nhiễu; >=2 view = đáng tin.
+        self.view_count_grid = np.zeros((resolution, resolution, resolution), dtype=np.uint8)
+
         logger.info(
             f"Khởi tạo TSDF Volume: {resolution}^3 voxels, "
             f"vsize={self.voxel_size:.4f}m, trunc_margin={self.trunc_margin:.4f}m"
@@ -378,6 +382,8 @@ class TSDFVolume:
 
             self.tsdf_grid[i_idx, j_idx, k] = new_tsdf
             self.weight_grid[i_idx, j_idx, k] = new_w
+            # Đếm số góc nhìn đã chạm voxel này (mỗi voxel chỉ được ghi 1 lần / 1 view)
+            self.view_count_grid[i_idx, j_idx, k] += 1
 
 
 # ============================================================================
@@ -411,6 +417,45 @@ def extract_mesh_marching_cubes(
     unobserved = weights < min_weight
     volume[unobserved] = 1.0
 
+    # ── LẤP RUỘT BẰNG FLOOD FILL QUA VÙNG DƯƠNG (P6, đo được) — TRƯỚC Marching Cubes ──
+    # VẤN ĐỀ: TSDF một phía chỉ tích luỹ trong dải [-trunc_margin, +...] sau bề mặt; ruột
+    # sâu hơn giữ nguyên +1 — GIỐNG HỆT vùng trống. Nên mỗi bên bề mặt có HAI lần đổi
+    # dấu, Marching Cubes dựng thêm MỘT MẶT BÊN TRONG -> mesh thành vỏ rỗng dày đúng
+    # bằng trunc_margin. ĐO ĐƯỢC trên ellipsoid tổng hợp (14 camera, pointmap chính xác,
+    # không nhiễu): thể tích chỉ còn 19.9% vật đặc (-80.1%) dù kích thước đúng 0.4%.
+    #
+    # CÁCH VÁ: đi lan truyền từ vùng trống ĐÃ ĐƯỢC QUAN SÁT (weight đủ và tsdf > 0), chỉ
+    # bước qua voxel dương — dải bề mặt (âm) là tường. Vùng dương nào không tới được chính
+    # là ruột vật (bị dải bề mặt bao kín) -> ép về -1.
+    #
+    # VÌ SAO KHÔNG dùng "bị che ở mọi view" (đã thử, SAI): góc hộp bao cũng "bị che" mà
+    # chưa từng được thấy là vùng trống, nên bị lấp oan -> vật phình bằng cả hộp bao.
+    # Cũng KHÔNG cắt mặt ở tầng MC: mặt ở rìa silhouette bị bỏ oan -> mesh hở.
+    # GIỚI HẠN: nếu vật còn mặt chưa ai thấy (vd đáy) thì lớp bề mặt bị hở -> lan truyền
+    # chảy vào ruột -> không lấp được. Log sẽ báo rõ trường hợp này.
+    try:
+        from scipy import ndimage
+
+        free_observed = (weights >= min_weight) & (volume > 0.0)
+        passable = volume >= 0.0          # không xuyên qua dải bề mặt (giá trị âm)
+        filled = 0
+        if free_observed.any():
+            reached = ndimage.binary_propagation(free_observed, mask=passable)
+            carved_inside = passable & ~reached
+            filled = int(np.count_nonzero(carved_inside))
+            if filled:
+                volume[carved_inside] = -1.0
+                logger.info(
+                    f"[P4] Lấp ruột: {filled} voxel nằm trong vật -> -1 (chống vỏ rỗng)."
+                )
+        if filled == 0 or not free_observed.any():
+            logger.warning(
+                "[P4] Không lấp được ruột: lớp bề mặt đang HỞ (vật có mặt chưa ai thấy, "
+                "thường là ĐÁY). Mesh sẽ là vỏ mỏng, thể tích không dùng được."
+            )
+    except ImportError:
+        logger.warning("[P4] Thiếu scipy -> không lấp được ruột, mesh có thể thành vỏ rỗng.")
+
     # Marching Cubes tìm iso-surface tại level = 0.0
     try:
         verts, faces, normals, _ = measure.marching_cubes(
@@ -438,6 +483,7 @@ def extract_mesh_marching_cubes(
         vertex_normals=normals,
         process=True,
     )
+    mesh.remove_unreferenced_vertices()
 
     # Dọn dẹp lưới: Giữ lại thành phần liên thông lớn nhất (loại bỏ các cụm vụn nổi lơ lửng)
     components = mesh.split(only_watertight=False)
@@ -511,6 +557,63 @@ def log_mesh_health(mesh: trimesh.Trimesh, label: str = "mesh") -> dict:
             f"không camera nào quan sát. Cần chụp thêm góc (nhất là mặt dưới)."
         )
     return health
+
+
+def coverage_report(tsdf_volume: "TSDFVolume") -> dict:
+    """
+    Đo ĐỘ PHỦ: bao nhiêu phần khối được bao nhiêu góc nhìn xác nhận.
+
+    ĐO CẢ HAI, vì con số gộp dễ gây hiểu nhầm: phần lớn khối tích luỹ là KHÔNG GIAN TRỐNG
+    trước vật, mỗi view một khác, nên tỉ lệ >=2 view luôn thấp kể cả khi dữ liệu hoàn hảo
+    (đo được 23.7% với 14 camera tổng hợp, pointmap chính xác). Con số có nghĩa là trên
+    DẢI BỀ MẶT (|tsdf| < 0.9 = gần mặt vật thật).
+      - `band_multi` thấp  -> bề mặt ít góc nhìn xác nhận: chỗ dễ sai/bịa
+      - `touched` nhỏ      -> ít khối được quan sát
+    """
+    counts = tsdf_volume.view_count_grid
+    touched = counts > 0
+    n_touched = int(np.count_nonzero(touched))
+    if n_touched == 0:
+        return {"touched": 0, "single_only": 0, "multi": 0, "pct_multi": 0.0,
+                "max_views": 0, "band": 0, "band_multi": 0, "pct_band_multi": 0.0}
+    single = int(np.count_nonzero(counts == 1))
+    multi = int(np.count_nonzero(counts >= 2))
+
+    band = (counts > 0) & (np.abs(tsdf_volume.tsdf_grid) < 0.9)
+    n_band = int(np.count_nonzero(band))
+    band_multi = int(np.count_nonzero(band & (counts >= 2)))
+    return {
+        "touched": n_touched,
+        "single_only": single,
+        "multi": multi,
+        "pct_multi": 100.0 * multi / n_touched,
+        "max_views": int(counts.max()),
+        "band": n_band,
+        "band_multi": band_multi,
+        "pct_band_multi": (100.0 * band_multi / n_band) if n_band else 0.0,
+    }
+
+
+def log_coverage(tsdf_volume: "TSDFVolume") -> dict:
+    """In độ phủ ra log, kèm cảnh báo khi bề mặt ít góc nhìn xác nhận."""
+    report = coverage_report(tsdf_volume)
+    total_voxels = tsdf_volume.resolution ** 3
+    logger.info(
+        f"[ĐỘ PHỦ] {report['touched']}/{total_voxels} voxel được quan sát "
+        f"({100.0 * report['touched'] / total_voxels:.2f}% thể tích) | nhiều view nhất: "
+        f"{report['max_views']}"
+    )
+    logger.info(
+        f"[ĐỘ PHỦ] Trên DẢI BỀ MẶT: {report['band_multi']}/{report['band']} voxel được "
+        f">=2 góc nhìn xác nhận ({report['pct_band_multi']:.1f}%)"
+    )
+    if report["band"] and report["pct_band_multi"] < 50.0:
+        logger.warning(
+            f"[ĐỘ PHỦ] Chỉ {report['pct_band_multi']:.1f}% dải bề mặt được >=2 góc nhìn "
+            f"xác nhận -> các view gần như CHỒNG LÊN NHAU, hoặc ảnh chỉ phủ một phía của "
+            f"vật. Kiểm tra dòng [P2-CHẨN ĐOÁN] ở trên trước khi nghi P4."
+        )
+    return report
 
 
 # ============================================================================
@@ -610,6 +713,10 @@ class TSDFMeshEngine:
                 camera_pose=camera_poses[i],
                 focal_length=focal_lengths[i],
             )
+
+        # Đo độ phủ TRƯỚC khi dựng mesh: nói được bề mặt có bao nhiêu góc nhìn xác nhận,
+        # và phân biệt "align hỏng" (view chồng nhau) với "ảnh thiếu góc".
+        log_coverage(tsdf_vol)
 
         # ── Bước 4: Trích xuất Iso-surface Marching Cubes ──
         logger.info("[P4] Trích xuất bề mặt Marching Cubes...")

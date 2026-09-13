@@ -50,6 +50,11 @@ except ImportError:
 from app import app
 from starlette.testclient import TestClient
 
+# Test 5/6 lưu đường dẫn .glb vừa sinh để test 7 dùng lại. KHÔNG hardcode tên file:
+# tên .glb sinh theo tên ẢNH ĐẦU TIÊN, mà thư mục ảnh đổi tuỳ máy (data/gso hay
+# data/input/multi_view) -> hardcode là test 7 tự bắn vào chân.
+LAST_OUTPUT_GLB = None
+
 
 # ==============================================================================
 # ẢNH TEST: ưu tiên data/gso (ảnh chụp THẬT, 5 góc cùng 1 vật) rồi mới tới
@@ -222,7 +227,13 @@ def test_05_api_single_image_triposr():
     data = response.json()
     assert data["status"] == "success"
     assert os.path.exists(data["output_file"])
+
+    # Lưu lại để test 7 dùng: tên file .glb sinh theo tên ẢNH ĐẦU TIÊN, mà thư mục ảnh
+    # đổi tuỳ máy (data/gso hay data/input/multi_view) -> test 7 không được hardcode tên.
+    global LAST_OUTPUT_GLB
+    LAST_OUTPUT_GLB = data["output_file"]
     print(f"  ✅ PASS: Single-image API thành công trong {latency:.2f}s! Model: {data['output_file']}")
+
 
 
 def test_06_api_multiview_full_pipeline():
@@ -304,8 +315,11 @@ def test_07_frontend_and_static_outputs():
     assert r.json()["frontend"] is True
 
     # .glb phải tải được qua /outputs/ (đúng tên file, không lộ path tuyệt đối)
-    out_file = Path("outputs/result_view_01_front.glb")
-    assert out_file.exists(), "Chưa có .glb — test 6 phải chạy trước"
+    out_file = LAST_OUTPUT_GLB if LAST_OUTPUT_GLB is not None else max(
+        Path("outputs").glob("*.glb"), key=lambda p: p.stat().st_mtime, default=None
+    )
+    assert out_file is not None and Path(out_file).exists(), "Chưa có .glb — test 6 phải chạy trước"
+    out_file = Path(out_file)
     r = client.get(f"/outputs/{out_file.name}")
     assert r.status_code == 200 and r.content[:4] == b"glTF", "Static /outputs phải trả file GLB hợp lệ"
     print(f"  ✅ PASS: Web UI + Static GLB OK ({len(r.content)} bytes, magic=glTF).")
