@@ -356,11 +356,18 @@ class DepthReconstructionEngine:
         alpha_mask: Optional[np.ndarray],
         focal_length: Tuple[float, float],
         max_res: int = 384,
-        edge_threshold: float = 0.12,
+        edge_threshold_ratio: float = 0.03,
     ) -> trimesh.Trimesh:
         """
         Tái tạo bề mặt 3D chi tiết cao trực tiếp từ Depth Map theo cấu trúc lưới Pinhole Grid.
-        Bảo toàn 100% hình học thực tế (từng khe nệm, tay vịn, chân ghế), loại bỏ mép rách.
+
+        Cải tiến so với phiên bản cũ:
+            - edge_threshold_ratio: ngưỡng TƯƠNG ĐỐI (tỉ lệ % so với giá trị Z trung bình
+              của tam giác) thay vì ngưỡng tuyệt đối. Ngưỡng tuyệt đối 0.12 trên phạm vi
+              Z [0.5, 1.5] cho phép tam giác kéo dài 12% toàn bộ chiều sâu — quá lỏng,
+              tạo gai nhọn ở viền vật thể giáp nền.
+            - Chuẩn hóa depth thành Z thực dương (gần camera = Z nhỏ, xa = Z lớn),
+              phạm vi [near=0.2, far=2.0] phù hợp với focal length ước tính từ P1.
         """
         h_orig, w_orig = depth_map.shape[:2]
         step = max(1, max(h_orig, w_orig) // max_res)
@@ -384,9 +391,12 @@ class DepthReconstructionEngine:
         u_grid = cols[None, :].repeat(H_sub, axis=0).astype(np.float32)
         v_grid = rows[:, None].repeat(W_sub, axis=1).astype(np.float32)
 
-        # Depth-Anything: giá trị lớn = gần camera, giá trị nhỏ = xa camera.
-        # Z thực: gần = Z nhỏ, xa = Z lớn
-        z_3d = (1.0 - sub_depth) * 1.0 + 0.5
+        # Depth-Anything-V2: depth_map ∈ [0, 1], giá trị lớn = xa camera, nhỏ = gần camera.
+        # (sau chuẩn hoá predict_depth: d_min → 0, d_max → 1)
+        # Chuyển sang Z thực dương: near = 0.2, far = 2.0
+        near, far = 0.2, 2.0
+        z_3d = near + sub_depth * (far - near)  # gần camera → Z nhỏ, xa → Z lớn
+
         x_3d = (u_grid - cx) * z_3d / fx
         y_3d = -(v_grid - cy) * z_3d / fy  # Đảo Y để hướng lên trên đúng chuẩn 3D glTF
 
@@ -419,23 +429,35 @@ class DepthReconstructionEngine:
                 # Tam giác 1: (r, c), (r+1, c), (r, c+1)
                 if i00 >= 0 and i10 >= 0 and i01 >= 0:
                     z00, z10, z01 = z_3d[r, c], z_3d[r + 1, c], z_3d[r, c + 1]
-                    if max(abs(z00 - z10), abs(z00 - z01), abs(z10 - z01)) <= edge_threshold:
+                    z_mean = (z00 + z10 + z01) / 3.0
+                    thresh = edge_threshold_ratio * z_mean
+                    if max(abs(z00 - z10), abs(z00 - z01), abs(z10 - z01)) <= thresh:
                         faces.append([i00, i10, i01])
 
                 # Tam giác 2: (r+1, c), (r+1, c+1), (r, c+1)
                 if i10 >= 0 and i11 >= 0 and i01 >= 0:
                     z10, z11, z01 = z_3d[r + 1, c], z_3d[r + 1, c + 1], z_3d[r, c + 1]
-                    if max(abs(z10 - z11), abs(z10 - z01), abs(z11 - z01)) <= edge_threshold:
+                    z_mean = (z10 + z11 + z01) / 3.0
+                    thresh = edge_threshold_ratio * z_mean
+                    if max(abs(z10 - z11), abs(z10 - z01), abs(z11 - z01)) <= thresh:
                         faces.append([i10, i11, i01])
 
         if len(faces) == 0:
+            # Nếu ngưỡng quá chặt → nới lỏng gấp 5 lần và thử lại
+            logger.warning("Ngưỡng lọc viền chặt quá → nới lỏng 5x và thử lại...")
             for r in range(H_sub - 1):
                 for c in range(W_sub - 1):
                     i00, i01, i10, i11 = vertex_idx[r, c], vertex_idx[r, c+1], vertex_idx[r+1, c], vertex_idx[r+1, c+1]
                     if i00 >= 0 and i10 >= 0 and i01 >= 0:
-                        faces.append([i00, i10, i01])
+                        z00, z10, z01 = z_3d[r, c], z_3d[r + 1, c], z_3d[r, c + 1]
+                        z_mean = (z00 + z10 + z01) / 3.0
+                        if max(abs(z00 - z10), abs(z00 - z01), abs(z10 - z01)) <= edge_threshold_ratio * 5 * z_mean:
+                            faces.append([i00, i10, i01])
                     if i10 >= 0 and i11 >= 0 and i01 >= 0:
-                        faces.append([i10, i11, i01])
+                        z10, z11, z01 = z_3d[r + 1, c], z_3d[r + 1, c + 1], z_3d[r, c + 1]
+                        z_mean = (z10 + z11 + z01) / 3.0
+                        if max(abs(z10 - z11), abs(z10 - z01), abs(z11 - z01)) <= edge_threshold_ratio * 5 * z_mean:
+                            faces.append([i10, i11, i01])
 
         faces = np.array(faces, dtype=np.int32)
 

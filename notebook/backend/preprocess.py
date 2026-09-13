@@ -714,6 +714,17 @@ def preprocess_multiview(
         # --- Chuẩn hóa Tensor cho DUSt3R ViT ---
         images_normalized = _normalize_for_dust3r(images_rgb_matched)
 
+        # Lưu ảnh đã tiền xử lý ra đĩa để P2 (DUSt3R) nạp trực tiếp đúng kích thước chuẩn
+        import uuid
+        temp_prep_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_uploads", "preprocessed")
+        os.makedirs(temp_prep_dir, exist_ok=True)
+        batch_id = uuid.uuid4().hex[:8]
+        preprocessed_paths: List[str] = []
+        for idx, img_arr in enumerate(images_rgb_matched):
+            p_out = os.path.join(temp_prep_dir, f"prep_{batch_id}_{idx:02d}.png")
+            Image.fromarray(img_arr).save(p_out, format="PNG")
+            preprocessed_paths.append(p_out)
+
         result = {
             "images_rgb": images_rgb_matched,
             "images_normalized": images_normalized,
@@ -722,6 +733,7 @@ def preprocess_multiview(
             "scale_factors": scale_factors,
             "filenames": filenames,
             "num_images": len(images_rgb_matched),
+            "preprocessed_paths": preprocessed_paths,
         }
 
         logger.info(

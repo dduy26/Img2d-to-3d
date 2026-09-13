@@ -17,12 +17,29 @@ Bật chế độ thật trên Colab:
     export PYTHONPATH=/content/dust3r               # (notebook P6 set sẵn khi spawn uvicorn)
 """
 
+import os
+import sys
+from pathlib import Path
+
+# Đảm bảo đường dẫn của dust3r và croco submodule được nạp vào sys.path
+for dust3r_dir in [
+    "/content/dust3r",
+    str(Path(__file__).resolve().parent / "dust3r"),
+    str(Path(__file__).resolve().parent.parent / "dust3r"),
+]:
+    if os.path.isdir(dust3r_dir) and dust3r_dir not in sys.path:
+        sys.path.insert(0, dust3r_dir)
+    croco_dir = os.path.join(dust3r_dir, "croco")
+    if os.path.isdir(croco_dir) and croco_dir not in sys.path:
+        sys.path.insert(0, croco_dir)
+
 try:
     import torch
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
 
+_dust3r_import_error = None
 try:
     from dust3r.inference import inference
     from dust3r.model import AsymmetricCroCo3DStereo
@@ -30,8 +47,9 @@ try:
     from dust3r.image_pairs import make_pairs
     from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
     HAS_DUST3R = True
-except ImportError:
+except ImportError as e:
     HAS_DUST3R = False
+    _dust3r_import_error = str(e)
 
 import numpy as np
 import logging
@@ -90,16 +108,20 @@ class DUSt3REngine:
         self.model = None
         self.logger = logging.getLogger(__name__)
 
+    @property
+    def is_real(self) -> bool:
+        return bool(HAS_DUST3R and self.model is not None and not isinstance(self.model, str))
+
     def load_model(self):
         """
         Nạp DUSt3R thật nếu có package; ngược lại đánh dấu mock để pipeline vẫn chạy.
         """
         if not HAS_DUST3R:
-            self.model = "Mock DUSt3R Model"
             self.logger.warning(
-                "Chưa cài package `dust3r` -> chạy MOCK: hình dạng 3D là NGẪU NHIÊN, "
+                f"Chưa cài package `dust3r` ({_dust3r_import_error}) -> DUSt3R chạy MOCK: hình dạng 3D là NGẪU NHIÊN, "
                 "không lấy từ ảnh. Xem docstring đầu file để bật chế độ thật."
             )
+            self.model = None
             return
         self.logger.info(f"Đang nạp DUSt3R weights {self.weights} trên {self.device}...")
         self.model = AsymmetricCroCo3DStereo.from_pretrained(self.weights).to(self.device)
@@ -130,7 +152,7 @@ class DUSt3REngine:
 
         self.logger.info(f"[P2] Global alignment (PointCloudOptimizer, niter={self.niter})...")
         scene = global_aligner(output, device=self.device,
-                               mode=GlobalAlignerMode.PointCloudOptimizer)
+                                mode=GlobalAlignerMode.PointCloudOptimizer)
         ba_loss = scene.compute_global_alignment(init="mst", niter=self.niter,
                                                  schedule="cosine", lr=0.01)
 
@@ -139,7 +161,6 @@ class DUSt3REngine:
         # để lấy confidence thô dương, rồi tự quy về [0,1] cho P3/P4.
         conf = [_conf_to_unit(_to_map(c, 2)) for c in scene.get_conf(mode="id")]
         poses = scene.get_im_poses().detach().cpu().numpy()
-        focals = np.atleast_2d(scene.get_focals().detach().cpu().numpy())
 
         # Các view có thể lệch kích thước -> pad về (H, W) lớn nhất.
         # Vùng pad có confidence = 0 nên P4 tự loại, không phải sửa P4.
@@ -148,13 +169,28 @@ class DUSt3REngine:
         w = max(p.shape[1] for p in pts)
         pointmaps_3d = np.zeros((n, h, w, 3), dtype=np.float32)
         confidence_masks = np.zeros((n, h, w), dtype=np.float32)
+        view_shapes = []
         for i, (p, c) in enumerate(zip(pts, conf)):
             hi, wi = p.shape[:2]
             pointmaps_3d[i, :hi, :wi] = p
             confidence_masks[i, :hi, :wi] = c
+            view_shapes.append((hi, wi))
 
         camera_poses = [np.asarray(poses[i], dtype=np.float32) for i in range(n)]
-        focal_lengths = [(float(focals[i][0]), float(focals[i][-1])) for i in range(n)]
+
+        # Xử lý an toàn focal lengths tránh IndexError bất kể shape trả về là (N,), (N,1), (N,2) hay scalar
+        focals_raw = scene.get_focals().detach().cpu().numpy()
+        focal_lengths = []
+        for i in range(n):
+            if np.ndim(focals_raw) == 0:
+                f_val = float(focals_raw)
+                focal_lengths.append((f_val, f_val))
+            elif np.ndim(focals_raw) == 1:
+                f_val = float(focals_raw[i])
+                focal_lengths.append((f_val, f_val))
+            else:
+                row = focals_raw[i].ravel()
+                focal_lengths.append((float(row[0]), float(row[-1])))
 
         self.logger.info(
             f"[P2] XONG trong {time.time() - t0:.1f}s — {n} view, pointmap {pointmaps_3d.shape}, "
@@ -167,6 +203,7 @@ class DUSt3REngine:
             "camera_poses": camera_poses,
             "focal_lengths": focal_lengths,
             "geometry": (pointmaps_3d.shape[1], pointmaps_3d.shape[2]),
+            "view_shapes": view_shapes,
             "ba_loss": float(ba_loss),
             "backend": "dust3r-real",
         }

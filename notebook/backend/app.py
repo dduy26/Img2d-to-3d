@@ -98,9 +98,10 @@ async def health():
         "device": device,
         "frontend": os.path.exists(FRONTEND_INDEX),
         "engines": {
+            "dust3r": dust3r_engine.is_real,
             "triposr": triposr_engine.model is not None,
-            "dust3r": dust3r_engine.model is not None,
             "depth": depth_engine.depth_model is not None,
+            "tsdf": True,
         },
     }
 
@@ -244,31 +245,68 @@ async def generate_3d(
         else:
             images_tensor = preprocess_result["images_normalized"]
 
+        # Sử dụng đúng đường dẫn ảnh đã tiền xử lý từ P1 (đã resize chuẩn và cân bằng sáng)
+        dust3r_input_paths = preprocess_result.get("preprocessed_paths", saved_paths)
+
         dust3r_result = dust3r_engine.process({
             "images_dust3r": images_tensor,
-            "image_paths": saved_paths,   # P2 bản thật (DUSt3R) nạp ảnh từ đây
+            "image_paths": dust3r_input_paths,
         })
+
+        # ── KIỂM TRA QUAN TRỌNG: Không để pipeline tiếp tục với dữ liệu NGẪU NHIÊN ──
+        # DUSt3R mock trả pointmap random (không dựa trên ảnh) → TSDF fuse ra mesh vô nghĩa
+        # Phải phát hiện và DỪNG ngay ở đây thay vì để pipeline chạy tiếp âm thầm.
+        if dust3r_result.get("backend") == "mock":
+            logger.error(
+                "╔══════════════════════════════════════════════════════════════╗\n"
+                "║  LỖI: DUSt3R đang chạy ở chế độ MOCK (dữ liệu NGẪU NHIÊN) ║\n"
+                "║  Pipeline đa ảnh CẦN package `dust3r` thật.                 ║\n"
+                "║  → Trên Colab: kiểm tra Cell 1 có clone dust3r không        ║\n"
+                "║  → PYTHONPATH có chứa /content/dust3r và croco không         ║\n"
+                "╚══════════════════════════════════════════════════════════════╝"
+            )
+            raise ValueError(
+                "DUSt3R chạy ở chế độ MOCK — pipeline đa ảnh yêu cầu package `dust3r` thật. "
+                "Kiểm tra: (1) git clone --recursive dust3r, "
+                "(2) PYTHONPATH bao gồm /content/dust3r và /content/dust3r/croco, "
+                "(3) pip install roma tqdm einops."
+            )
 
         pointmaps_3d = dust3r_result["pointmaps_3d"]
         confidence_masks = dust3r_result["confidence_masks"]
         camera_poses = dust3r_result["camera_poses"]
         focal_lengths = dust3r_result["focal_lengths"]
 
-        # P2 bản thật chạy DUSt3R ở geometry riêng (cạnh dài 512, crop bội số 16) ->
-        # căn lại alpha mask & ảnh RGB về đúng geometry đó, nếu không thì mask lệch
-        # từng pixel so với pointmap và P4 sẽ đắp TSDF sai chỗ.
-        geom = dust3r_result.get("geometry")
-        if geom is not None:
-            target = (int(geom[1]), int(geom[0]))          # PIL size = (W, H)
-            preprocess_result["alpha_masks"] = [
-                np.asarray(Image.fromarray(np.asarray(m, dtype=np.uint8)).resize(target, Image.NEAREST))
-                for m in preprocess_result["alpha_masks"]
-            ]
-            preprocess_result["images_rgb"] = [
-                np.asarray(Image.fromarray(np.asarray(a, dtype=np.uint8)).resize(target, Image.BILINEAR))
-                for a in preprocess_result["images_rgb"]
-            ]
-            logger.info(f"[P2->P4/P5] Đã căn alpha mask & ảnh RGB về geometry {geom}")
+        # Căn chỉnh kích thước alpha_masks và images_rgb cho khớp từng pixel với pointmaps_3d
+        view_shapes = dust3r_result.get("view_shapes")
+        h_pad, w_pad = pointmaps_3d.shape[1], pointmaps_3d.shape[2]
+
+        aligned_masks = []
+        aligned_rgbs = []
+        for i in range(len(preprocess_result["alpha_masks"])):
+            m = preprocess_result["alpha_masks"][i]
+            rgb = preprocess_result["images_rgb"][i]
+            hi, wi = view_shapes[i] if (view_shapes and i < len(view_shapes)) else (h_pad, w_pad)
+
+            if m.shape[:2] != (hi, wi):
+                m = np.asarray(Image.fromarray(m.astype(np.uint8)).resize((wi, hi), Image.NEAREST))
+            if rgb.shape[:2] != (hi, wi):
+                rgb = np.asarray(Image.fromarray(rgb.astype(np.uint8)).resize((wi, hi), Image.BILINEAR))
+
+            if (hi, wi) != (h_pad, w_pad):
+                m_pad = np.zeros((h_pad, w_pad), dtype=np.uint8)
+                m_pad[:hi, :wi] = m
+                rgb_pad = np.zeros((h_pad, w_pad, 3), dtype=np.uint8)
+                rgb_pad[:hi, :wi] = rgb
+                aligned_masks.append(m_pad)
+                aligned_rgbs.append(rgb_pad)
+            else:
+                aligned_masks.append(m)
+                aligned_rgbs.append(rgb)
+
+        preprocess_result["alpha_masks"] = aligned_masks
+        preprocess_result["images_rgb"] = aligned_rgbs
+        logger.info(f"[P2->P4/P5] Đã căn alpha mask & ảnh RGB về shape ({h_pad}, {w_pad})")
 
         logger.info(
             f"[P2] Hoàn tất: pointmaps shape={pointmaps_3d.shape}, "
@@ -277,22 +315,18 @@ async def generate_3d(
 
         # ── Bước 3 (P3): Quality Gate ──
         logger.info("[P3] Đánh giá chất lượng qua Quality Gate...")
-        
+
         # BA loss thật lấy từ DUSt3R global alignment (chế độ mock trả 1.0)
         ba_loss = dust3r_result.get("ba_loss", 1.0)
-        
+
         if hasattr(confidence_masks, 'cpu'):
             confidence_np = confidence_masks.cpu().numpy()
         else:
             confidence_np = np.asarray(confidence_masks)
 
-        # P3 lấy np.mean() trên TOÀN ẢNH, nhưng trên ảnh thật ~89% pixel là NỀN (conf thấp)
-        # nên trung bình bị nền kéo xuống và gate luôn FAIL dù vẫn dựng được mesh tốt:
-        #   mean toàn ảnh = 0.267 -> FAIL | mean vùng conf>=0.35 = 0.820 -> PASS
-        # Ở tầng keo, lọc độ tin cậy của ĐÚNG vùng mà P4 sẽ dựng (conf >= DEFAULT_CONF_THRESHOLD)
         confidence_region = confidence_np[confidence_np >= DEFAULT_CONF_THRESHOLD]
         if confidence_region.size == 0:
-            confidence_region = confidence_np            # ảnh quá xấu: giữ nguyên để P3 tự FAIL
+            confidence_region = confidence_np
         logger.info(
             f"[P3] Vùng dựng được: {confidence_region.size}/{confidence_np.size} pixel "
             f"({100.0 * confidence_region.size / confidence_np.size:.1f}%), "
@@ -306,21 +340,20 @@ async def generate_3d(
         )
         logger.info(f"[P3] Kết quả: {'PASS ✓' if is_high_quality else 'FAIL ✗'} — {reason}")
 
-        # ── Bước 4: Tái tạo 3D Đa Góc Nhìn (N ảnh -> 1 model duy nhất) ──
-        # Luôn ưu tiên hợp nhất toàn bộ N ảnh qua P4 TSDF Mesh & P5 Texture Blender.
-        # Quality Gate đóng vai trò đánh giá chất lượng (quality score) và cảnh báo,
-        # không tự ý hủy bỏ dữ liệu N ảnh của người dùng.
+        # ── Bước 4: Tái tạo 3D Đa Góc Nhìn (N ảnh -> 1 model duy nhất, KHÔNG bypass sang 1 ảnh) ──
         logger.info(f"[P4] Bắt đầu hợp nhất {preprocess_result['num_images']} ảnh vào lưới TSDF 360°...")
-        try:
-            mesh = tsdf_engine.reconstruct(
-                pointmaps_3d=pointmaps_3d,
-                alpha_masks=preprocess_result["alpha_masks"],
-                confidence_masks=confidence_masks,
-                camera_poses=camera_poses,
-                focal_lengths=focal_lengths,
-            )
+        mesh = tsdf_engine.reconstruct(
+            pointmaps_3d=pointmaps_3d,
+            alpha_masks=preprocess_result["alpha_masks"],
+            confidence_masks=confidence_masks,
+            camera_poses=camera_poses,
+            focal_lengths=focal_lengths,
+        )
 
-            logger.info(f"[P5] Trải UV XAtlas & Nướng màu từ toàn bộ {len(preprocess_result['images_rgb'])} ảnh vào Mesh...")
+        logger.info(f"[P5] Trải UV XAtlas & Nướng màu từ toàn bộ {len(preprocess_result['images_rgb'])} ảnh vào Mesh...")
+        success = False
+        model_path = output_glb_path
+        try:
             success, model_path = texture_blender.process_and_export(
                 mesh=mesh,
                 images_rgb=preprocess_result["images_rgb"],
@@ -328,39 +361,17 @@ async def generate_3d(
                 focal_lengths=focal_lengths,
                 output_path=output_glb_path,
             )
-            # Nếu nướng texture gặp sự cố, vẫn giữ nguyên mesh 360° dựng từ N ảnh và xuất trực tiếp
-            if not success or not os.path.exists(output_glb_path):
-                logger.warning("[P5] Nướng texture không thành công, xuất mesh màu đỉnh 360° trực tiếp của P4.")
-                mesh.export(output_glb_path, file_type="glb")
-                success = os.path.exists(output_glb_path)
-                model_path = output_glb_path
+        except Exception as tex_err:
+            logger.warning(f"[P5] Nướng texture UV gặp lỗi ({tex_err}) → Xuất mesh 360° màu đỉnh trực tiếp từ P4.")
 
-            pipeline_type = "nvidia_tsdf_multiview"
+        # Nếu nướng texture không thành công, vẫn giữ nguyên mesh 360° dựng từ N ảnh và xuất trực tiếp
+        if not success or not os.path.exists(output_glb_path):
+            logger.info("[P5] Xuất mesh màu đỉnh 360° trực tiếp của P4.")
+            mesh.export(output_glb_path, file_type="glb")
+            success = os.path.exists(output_glb_path)
+            model_path = output_glb_path
 
-        except Exception as mv_err:
-            # Chỉ kích hoạt cứu hộ khi khối đa ảnh gặp lỗi ngoại lệ nghiêm trọng (VD: 0 điểm 3D hợp lệ)
-            logger.error(f"[P4/P5 Ngoại lệ: {mv_err}] → Kích hoạt cứu hộ khẩn cấp từ ảnh số 1...")
-            fallback_result = preprocess_single_view(
-                image_path=saved_paths[0],
-                target_size=512,
-                device=device,
-            )
-            if triposr_engine.model is not None:
-                success, model_path, _ = triposr_engine.run_from_preprocessed(
-                    image_rgb=fallback_result["image_centered"],
-                    alpha_mask=fallback_result["alpha_mask_centered"],
-                    output_glb_path=output_glb_path,
-                )
-                pipeline_type = "triposr_emergency_fallback"
-            else:
-                logger.info("[Cứu hộ khẩn cấp] Chuyển sang Depth Engine...")
-                success, model_path, _ = depth_engine.reconstruct(
-                    image_rgb=fallback_result["image_centered"],
-                    alpha_mask=fallback_result["alpha_mask_centered"],
-                    focal_length=fallback_result["focal_length"],
-                    output_path=output_glb_path,
-                )
-                pipeline_type = "depth_emergency_fallback"
+        pipeline_type = "nvidia_tsdf_multiview"
 
         total_time = time.time() - pipeline_start
 
