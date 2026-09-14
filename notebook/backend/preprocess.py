@@ -825,6 +825,40 @@ def classify_viewpoints(
                     ang_diff = abs((angle - az + 180.0) % 360.0 - 180.0)
                     score_matrix[i, j] = max(0.0, 1.0 - ang_diff / 90.0)
 
+    # Kiểm tra xem có ảnh nào thực sự là góc chụp từ trên đỉnh (TOP) không
+    has_real_top = False
+    top_idx = -1
+    if explicit:
+        for idx, (face, az, el, conf) in explicit.items():
+            if face == "top":
+                has_real_top = True
+                top_idx = idx
+                break
+    elif has_dl:
+        for idx in range(n):
+            if score_matrix[idx, 4] > 0.80:
+                has_real_top = True
+                top_idx = idx
+                break
+
+    # Nếu KHÔNG CÓ ảnh nào chụp từ đỉnh đầu:
+    # Toàn bộ N ảnh là chuỗi chụp xoay vòng quanh vật thể (Turntable Orbit quanh trục Y)
+    # Tuyệt đối không ép ảnh góc ngang thành góc chiếu từ trên trời xuống làm chém cụt mô hình!
+    if not has_real_top and n >= 3:
+        logger.info(
+            "✓ Toàn bộ %d ảnh là chuỗi chụp xoay vòng quanh vật thể (Turntable Orbit 360° quanh trục Y).", n
+        )
+        return [
+            {
+                "index": i,
+                "face": f"orbit_{i+1}",
+                "azimuth": float((i * 360.0 / n) % 360.0),
+                "elevation": 15.0,
+                "confidence": 1.0,
+            }
+            for i in range(n)
+        ]
+
     # Đưa các nhãn explicit đã biết vào ma trận điểm
     for idx, (face, az, el, conf) in explicit.items():
         for col_idx, (cface, _, _) in enumerate(CANONICAL_FACES):
