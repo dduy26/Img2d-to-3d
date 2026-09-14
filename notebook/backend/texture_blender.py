@@ -49,7 +49,8 @@ class TextureBlender:
         vertices = np.asarray(mesh.vertices, dtype=np.float32)
         faces = np.asarray(mesh.faces, dtype=np.int32)
 
-        if xatlas is not None:
+        # XAtlas là O(N^2) chart merging: chỉ chạy khi faces <= 40,000 để tránh treo CPU
+        if xatlas is not None and len(faces) <= 40000:
             try:
                 atlas = xatlas.Atlas()
                 atlas.add_mesh(vertices, faces)
@@ -289,19 +290,31 @@ class TextureBlender:
         focal_lengths: Sequence[Tuple[float, float]],
         output_path: str,
     ) -> Tuple[bool, str]:
-        """Run P5: unwrap, blend, bake and export one binary GLB."""
+        """Run P5: multi-view color blending and binary GLB export."""
         started = time.time()
         try:
             validate_multiview_inputs(images_rgb, camera_poses, focal_lengths)
-            unwrapped_mesh, uvs = self.unwrap_uv(mesh)
+
+            # Tối ưu hóa số lượng tam giác: nếu mesh quá nặng (> 60,000 faces),
+            # decimate về ~50,000 faces để Three.js render 60fps mượt mà và chống treo bộ nhớ
+            export_mesh = mesh
+            if len(mesh.faces) > 60000:
+                try:
+                    logger.info("Mesh gốc có %d mặt, đơn giản hóa về ~50,000 mặt để render web mượt mà...", len(mesh.faces))
+                    export_mesh = mesh.simplify_quadric_decimation(face_count=50000)
+                    logger.info("Sau khi tối ưu: %d đỉnh, %d mặt.", len(export_mesh.vertices), len(export_mesh.faces))
+                except Exception as dec_err:
+                    logger.warning("Decimation không khả dụng: %s", dec_err)
+                    export_mesh = mesh
+
             vertex_colors = self.blend_colors_for_vertices(
-                unwrapped_mesh, images_rgb, camera_poses, focal_lengths
+                export_mesh, images_rgb, camera_poses, focal_lengths
             )
-            unwrapped_mesh.visual = trimesh.visual.ColorVisuals(
-                mesh=unwrapped_mesh,
+            export_mesh.visual = trimesh.visual.ColorVisuals(
+                mesh=export_mesh,
                 vertex_colors=vertex_colors,
             )
-            path = export_glb(unwrapped_mesh, output_path)
+            path = export_glb(export_mesh, output_path)
             logger.info("P5 exported %s in %.2fs", path, time.time() - started)
             return True, path
         except Exception:
