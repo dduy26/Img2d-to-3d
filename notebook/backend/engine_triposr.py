@@ -15,6 +15,12 @@ if _triposr_sub.exists() and str(_triposr_sub) not in sys.path:
 
 try:
     import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+try:
+    import torch
     import rembg
     from tsr.system import TSR
     HAS_TRIPOSR = True
@@ -27,10 +33,15 @@ logger = logging.getLogger(__name__)
 
 class TripoSREngine:
     def __init__(self):
-        # Khởi tạo mô hình ngay khi boot server để không mất thời gian load lại (đảm bảo <= 2s)
+        self.device = "cuda:0" if (HAS_TORCH and torch.cuda.is_available()) else "cpu"
+        self.model = None
+
+    def load_model(self):
+        """Chỉ nạp model weights TripoSR (1.7GB) khi thực sự được gọi (Lazy loading)."""
+        if self.model is not None:
+            return
         if HAS_TRIPOSR:
             logger.info("Loading TripoSR Fail-safe Model...")
-            self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
             try:
                 self.model = TSR.from_pretrained(
                     "stabilityai/TripoSR",
@@ -43,8 +54,6 @@ class TripoSREngine:
             except Exception as e:
                 logger.warning(f"Chua the nap weights TripoSR: {e}")
                 self.model = None
-        else:
-            self.model = None
 
     def preprocess_image(self, image_path):
         """Tách nền và chuẩn hóa về định dạng RGB 3 kênh"""
@@ -75,6 +84,7 @@ class TripoSREngine:
             img_rgba = self.preprocess_image(image_path)
             
             # 2. Tạo 3D
+            self.load_model()
             if self.model is None or not HAS_TRIPOSR:
                 raise RuntimeError("TripoSR chưa được nạp weights hoặc thiếu thư viện. Đã gỡ bỏ hoàn toàn mock box fallback.")
 
@@ -133,6 +143,7 @@ class TripoSREngine:
                 pil_img = Image.fromarray(img_arr.astype(np.uint8))
 
             # 2. Tạo 3D
+            self.load_model()
             if self.model is None or not HAS_TRIPOSR:
                 raise RuntimeError("TripoSR chưa được nạp weights. Đã xóa bỏ hoàn toàn mock box fallback.")
 
