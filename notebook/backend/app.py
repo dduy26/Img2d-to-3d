@@ -25,10 +25,13 @@ try:
 except ImportError:
     HAS_TORCH = False
 
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
+
 # Import các module trong pipeline
 from preprocess import preprocess_multiview, preprocess_single_view
 from quality_gate import QualityGate
-from engine_triposr import TripoSREngine
 from engine_tsdf_mesh import TSDFMeshEngine, generate_camera_poses, DEFAULT_CONF_THRESHOLD
 from texture_blender import TextureBlender
 from engine_depth import DepthReconstructionEngine
@@ -69,9 +72,6 @@ logger.info(f"Sử dụng device: {device}")
 # P3: Quality Gate
 q_gate = QualityGate()
 
-# P3: TripoSR Fail-safe Engine (nạp sẵn vào RAM)
-triposr_engine = TripoSREngine()
-
 # ── Nút vặn chất lượng (đặt qua biến môi trường, không cần sửa code) ──
 # TSDF_RES: số voxel mỗi cạnh của lưới TSDF. Cao hơn = chi tiết hơn, chậm + tốn RAM hơn.
 #   128 -> ~16MB/grid (mặc định) | 192 -> ~57MB | 256 -> ~134MB
@@ -87,7 +87,7 @@ texture_blender = TextureBlender()
 # Kịch bản 1: Depth Reconstruction Engine (Depth-Anything-V2 + Poisson)
 depth_engine = DepthReconstructionEngine(device=device)
 
-logger.info("═══ TẤT CẢ ENGINE P1-P5 + Depth Engine ĐÃ SẴN SÀNG ═══")
+logger.info("═══ TẤT CẢ ENGINE P1-P5 (Depth-Anything-V2 + NVIDIA TSDF) ĐÃ SẴN SÀNG ═══")
 
 
 # ============================================================================
@@ -109,7 +109,6 @@ async def health():
         "device": device,
         "frontend": os.path.exists(FRONTEND_INDEX),
         "engines": {
-            "triposr": triposr_engine.model is not None,
             "depth": depth_engine.depth_model is not None,
             "tsdf": True,
             "texture_blender": True,
@@ -153,39 +152,14 @@ def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
 
         effective_mode = mode if mode != "auto" else "fast"
 
-        if effective_mode == "geometric":
-            logger.info("[Option 1] Chạy Depth Reconstruction Pipeline...")
-            success, model_path, exec_time = depth_engine.reconstruct(
-                image_rgb=preprocess_result["image_centered"],
-                alpha_mask=preprocess_result["alpha_mask_centered"],
-                focal_length=preprocess_result["focal_length"],
-                output_path=output_glb_path,
-            )
-            pipeline_type = "depth_geometric"
-        else:
-            from engine_triposr import HAS_TRIPOSR
-            if HAS_TRIPOSR:
-                logger.info("[Option 2] Chạy TripoSR (360° Full Mesh) từ ảnh đã preprocess...")
-                success, model_path, exec_time = triposr_engine.run_from_preprocessed(
-                    image_rgb=preprocess_result["image_centered"],
-                    alpha_mask=preprocess_result["alpha_mask_centered"],
-                    output_glb_path=output_glb_path,
-                )
-                pipeline_type = "triposr_preprocessed"
-            else:
-                success = False
-                model_path = None
-                exec_time = 0.0
-
-            if not success or model_path is None:
-                logger.info("[Option 2] Chuyển sang Depth-Anything-V2 Reconstruction Pipeline...")
-                success, model_path, exec_time = depth_engine.reconstruct(
-                    image_rgb=preprocess_result["image_centered"],
-                    alpha_mask=preprocess_result["alpha_mask_centered"],
-                    focal_length=preprocess_result["focal_length"],
-                    output_path=output_glb_path,
-                )
-                pipeline_type = "depth_geometric"
+        logger.info("[Single View] Chạy Depth-Anything-V2 Reconstruction Pipeline...")
+        success, model_path, exec_time = depth_engine.reconstruct(
+            image_rgb=preprocess_result["image_centered"],
+            alpha_mask=preprocess_result["alpha_mask_centered"],
+            focal_length=preprocess_result["focal_length"],
+            output_path=output_glb_path,
+        )
+        pipeline_type = "depth_anything_v2"
 
         return {
             "status": "success" if success else "failed",
@@ -209,7 +183,7 @@ def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
     logger.info(f"═══ CHẾ ĐỘ MULTI-VIEW ({len(saved_paths)} ảnh, mode={mode}) ═══")
 
     # ── Bước 1 (P1): Preprocessing ──
-    logger.info("[P1] Tiền xử lý ảnh đa góc nhìn...")
+    logger.info("[P1] Tiền xử lý ảnh đa góc nhìn (tách nền + nhận diện các mặt)...")
     preprocess_result = preprocess_multiview(
         image_paths=saved_paths,
         target_size=512,
@@ -228,12 +202,14 @@ def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
     )
     depth_maps = da_result["depth_maps"]
 
-    # Thiết lập camera trajectory quanh vật thể
+    # Thiết lập camera trajectory chuẩn xác dựa trên các mặt nhận diện được
+    viewpoint_assignments = preprocess_result.get("viewpoint_assignments")
     camera_poses = generate_camera_poses(
         n_views=len(saved_paths),
         radius=2.2,
         elevation_deg=15.0,
         view_names=saved_paths,
+        viewpoint_assignments=viewpoint_assignments,
     )
     focal_lengths = preprocess_result.get("focal_lengths")
     if focal_lengths is None or len(focal_lengths) != len(saved_paths):
@@ -253,6 +229,7 @@ def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
             camera_poses=camera_poses,
             focal_lengths=focal_lengths,
             view_names=saved_paths,
+            viewpoint_assignments=viewpoint_assignments,
         )
 
         logger.info(f"[P5] Trải UV & Nướng màu từ toàn bộ {len(preprocess_result['images_rgb'])} ảnh vào Mesh 360°...")

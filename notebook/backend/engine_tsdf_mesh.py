@@ -572,17 +572,47 @@ def generate_camera_poses(
     radius: float = 2.2,
     elevation_deg: float = 15.0,
     view_names: Optional[List[str]] = None,
+    viewpoint_assignments: Optional[List[Dict[str, Any]]] = None,
 ) -> List[np.ndarray]:
     """
     Sinh ma trận camera 4x4 (Camera-to-World, c2w) quanh vật thể.
     Quy ước camera: OpenCV/Pinhole (+X phải, +Y xuống, +Z hướng nhìn tới vật thể).
     Chuẩn hóa tương thích 100% với utils_3d.project_vertices và texture_blender.
 
-    Hỗ trợ 2 chế độ:
-    1. Orthogonal box (nếu có tên front, right, back, left, top, bottom).
-    2. Turntable 360° (chia đều góc xoay azimuth quanh trục Y).
+    Hỗ trợ 3 chế độ:
+    1. Chuẩn xác từ viewpoint_assignments (Nhận diện mặt bằng Deep Learning / HOG).
+    2. Nạp từ file cameras.json đi kèm dataset (nếu có).
+    3. Turntable 360° (chia đều góc xoay azimuth quanh trục Y).
     """
-    # 0. Nếu có file cameras.json đi kèm trong thư mục ảnh hoặc input/, ưu tiên nạp ma trận chuẩn
+    # 0. Nếu có kết quả nhận diện mặt (Deep Learning / HOG), ưu tiên sử dụng để gán đúng Vector Camera
+    if viewpoint_assignments and len(viewpoint_assignments) == n_views:
+        logger.info("✓ Sinh ma trận camera dựa trên kết quả nhận diện các mặt (Viewpoint Recognition).")
+        poses = []
+        for vp in viewpoint_assignments:
+            az = float(vp.get("azimuth", 0.0))
+            el = float(vp.get("elevation", elevation_deg))
+            az_rad = np.radians(az)
+            el_rad = np.radians(el)
+            cx = float(radius * np.cos(el_rad) * np.sin(az_rad))
+            cy = float(radius * np.sin(el_rad))
+            cz = float(radius * np.cos(el_rad) * np.cos(az_rad))
+            c_pos = np.array([cx, cy, cz], dtype=np.float32)
+
+            forward = -c_pos / np.maximum(np.linalg.norm(c_pos), 1e-6)
+            world_up = np.array([0.0, 1.0, 0.0], dtype=np.float32) if abs(el) < 80 else np.array([0.0, 0.0, -1.0], dtype=np.float32)
+            right = np.cross(forward, world_up)
+            right /= np.maximum(np.linalg.norm(right), 1e-6)
+            down = np.cross(forward, right)
+            down /= np.maximum(np.linalg.norm(down), 1e-6)
+
+            R_c2w = np.column_stack([right, down, forward])
+            pose = np.eye(4, dtype=np.float32)
+            pose[:3, :3] = R_c2w
+            pose[:3, 3] = c_pos
+            poses.append(pose)
+        return poses
+
+    # 1. Nếu có file cameras.json đi kèm trong thư mục ảnh hoặc input/, ưu tiên nạp ma trận chuẩn
     if view_names and len(view_names) > 0:
         candidate_dirs = [os.path.dirname(view_names[0]), "input", "data/objaverse_apple"]
         for cdir in candidate_dirs:
@@ -607,12 +637,13 @@ def generate_camera_poses(
 
     poses = []
     
-    # Kiểm tra xem có phải bộ ảnh 6 góc trực giao không
+    # Kiểm tra xem có phải bộ ảnh có tên mặt trực giao không
     has_ortho = False
-    if view_names and len(view_names) == 6:
+    if view_names and len(view_names) >= 4:
         lowered = [str(n).lower() for n in view_names]
-        if any("front" in n for n in lowered) and any("back" in n for n in lowered):
+        if any("front" in n for n in lowered) and (any("back" in n for n in lowered) or any("right" in n for n in lowered)):
             has_ortho = True
+
 
     if has_ortho and view_names:
         for name in view_names:
@@ -894,6 +925,7 @@ class TSDFMeshEngine:
         camera_poses: Optional[List[np.ndarray]] = None,
         focal_lengths: Optional[List[Tuple[float, float]]] = None,
         view_names: Optional[List[str]] = None,
+        viewpoint_assignments: Optional[List[Dict[str, Any]]] = None,
     ) -> trimesh.Trimesh:
         """
         Thuật toán cốt lõi NVIDIA + Depth-Anything-V2:
@@ -905,6 +937,7 @@ class TSDFMeshEngine:
             camera_poses: (Tùy chọn) Danh sách N ma trận camera 4x4 c2w. Nếu None, tự động sinh theo quỹ đạo.
             focal_lengths: (Tùy chọn) Danh sách N cặp tiêu cự (fx, fy). Nếu None, tự tính theo FOV ~ 50°.
             view_names: (Tùy chọn) Tên các góc nhìn để tự động nhận diện orthogonal box.
+            viewpoint_assignments: (Tùy chọn) Kết quả nhận diện mặt từ Deep Learning / HOG.
 
         Returns:
             trimesh.Trimesh: Mesh 3D đặc ruột, kín nước 100%.
@@ -924,6 +957,7 @@ class TSDFMeshEngine:
                 radius=2.2,
                 elevation_deg=15.0,
                 view_names=view_names,
+                viewpoint_assignments=viewpoint_assignments,
             )
 
         all_pts_list = []

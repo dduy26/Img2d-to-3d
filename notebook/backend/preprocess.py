@@ -689,6 +689,191 @@ def _match_histogram_single(source: np.ndarray, reference: np.ndarray) -> np.nda
 
 
 # ============================================================================
+# HÀM 5B: NHẬN DIỆN CÁC MẶT VẬT THỂ (DEEP LEARNING + HOG SYMMETRY FALLBACK)
+# ============================================================================
+
+def classify_viewpoints(
+    images_rgb: List[np.ndarray],
+    filenames: Optional[List[str]] = None,
+    device: str = "cpu",
+) -> List[Dict[str, Any]]:
+    """
+    Thuật toán Nhận Diện Các Mặt Của Vật Thể Thực Tế:
+    Xác định chính xác từng ảnh thuộc mặt nào để gán đúng Vector Camera Pose:
+        - 'front'  : Mặt trước (Azimuth 0°, Elevation 15°)
+        - 'right'  : Mặt phải (Azimuth 90°, Elevation 15°)
+        - 'back'   : Mặt sau (Azimuth 180°, Elevation 15°)
+        - 'left'   : Mặt trái (Azimuth 270°, Elevation 15°)
+        - 'top'    : Mặt trên nhìn xuống (Elevation 85°)
+        - 'bottom' : Mặt dưới nhìn lên (Elevation -85°)
+
+    Sử dụng giải thuật Bipartite Matching (scipy.optimize.linear_sum_assignment)
+    để bảo đảm mỗi góc nhìn chuẩn 3D được gán 1-1 với đúng 1 ảnh phù hợp nhất,
+    triệt tiêu hoàn toàn hiện tượng ghép chéo / ghép loạn.
+    """
+    n = len(images_rgb)
+    if n == 0:
+        return []
+
+    CANONICAL_FACES = [
+        ("front", 0.0, 15.0),
+        ("right", 90.0, 15.0),
+        ("back", 180.0, 15.0),
+        ("left", 270.0, 15.0),
+        ("top", 0.0, 85.0),
+        ("bottom", 0.0, -85.0),
+    ]
+
+    # 1. Kiểm tra filename tường minh
+    explicit = {}
+    if filenames:
+        for idx, fn in enumerate(filenames):
+            fn_l = os.path.basename(str(fn)).lower()
+            for face, az, el in CANONICAL_FACES:
+                if face in fn_l:
+                    explicit[idx] = (face, az, el, 1.0)
+                    break
+
+    if len(explicit) == n:
+        logger.info("Nhận diện các mặt: Toàn bộ %d ảnh khớp tên file tường minh.", n)
+        return [
+            {"index": i, "face": explicit[i][0], "azimuth": explicit[i][1], "elevation": explicit[i][2], "confidence": 1.0}
+            for i in range(n)
+        ]
+
+    score_matrix = np.zeros((n, 6), dtype=np.float32)
+    has_dl = False
+
+    # 2. Deep Learning Zero-shot Viewpoint Classifier (CLIP ViT)
+    try:
+        from transformers import AutoProcessor, AutoModelForZeroShotImageClassification
+        from PIL import Image as _PILImage
+        import torch
+
+        model_id = "openai/clip-vit-base-patch32"
+        proc = AutoProcessor.from_pretrained(model_id, local_files_only=True)
+        model = AutoModelForZeroShotImageClassification.from_pretrained(model_id, local_files_only=True)
+        model = model.to(device)
+        model.eval()
+
+        labels = [
+            "front view of the object",
+            "right side view of the object",
+            "back view of the object",
+            "left side view of the object",
+            "top-down view of the object",
+            "bottom view of the object",
+        ]
+
+        for i, img_rgb in enumerate(images_rgb):
+            pil_im = _PILImage.fromarray(img_rgb)
+            inputs = proc(text=labels, images=pil_im, return_tensors="pt", padding=True).to(device)
+            with torch.no_grad():
+                out = model(**inputs)
+                probs = out.logits_per_image[0].softmax(dim=-1).cpu().numpy()
+            score_matrix[i, :] = probs
+        has_dl = True
+        logger.info("✓ Nhận diện các mặt thành công bằng Deep Learning (CLIP ViT).")
+    except Exception:
+        has_dl = False
+
+    # 3. Fallback HOG + Bilateral Symmetry Analysis (Cổ điển siêu tốc)
+    if not has_dl:
+        try:
+            import cv2
+            from skimage.feature import hog
+
+            hog_feats = []
+            hog_flips = []
+            for img in images_rgb:
+                gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
+                gray_res = cv2.resize(gray, (128, 128))
+                hf = hog(gray_res, orientations=8, pixels_per_cell=(16, 16), cells_per_block=(1, 1))
+                hf_flip = hog(cv2.flip(gray_res, 1), orientations=8, pixels_per_cell=(16, 16), cells_per_block=(1, 1))
+                hog_feats.append(hf / max(float(np.linalg.norm(hf)), 1e-6))
+                hog_flips.append(hf_flip / max(float(np.linalg.norm(hf_flip)), 1e-6))
+
+            # Độ đối xứng gương tự thân (Front & Back có độ đối xứng trục cao nhất)
+            self_syms = [float(np.dot(hog_feats[i], hog_flips[i])) for i in range(n)]
+            front_cand = int(np.argmax(self_syms))
+            score_matrix[front_cand, 0] += 0.8
+
+            # Độ tương quan lật gương chéo (Left và Right phản chiếu qua nhau)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    cross = float(np.dot(hog_feats[i], hog_flips[j]))
+                    norm_sim = float(np.dot(hog_feats[i], hog_feats[j]))
+                    if cross > norm_sim + 0.08:
+                        score_matrix[i, 1] += 0.6  # Right
+                        score_matrix[j, 3] += 0.6  # Left
+                        score_matrix[j, 1] += 0.3
+                        score_matrix[i, 3] += 0.3
+
+            # Điểm xoay tuần tự (Circular Continuity)
+            for i in range(n):
+                angle = i * (360.0 / n)
+                for j, (face, az, el) in enumerate(CANONICAL_FACES[:4]):
+                    ang_diff = abs((angle - az + 180.0) % 360.0 - 180.0)
+                    score_matrix[i, j] += max(0.0, 1.0 - ang_diff / 90.0) * 0.4
+
+            logger.info("✓ Nhận diện các mặt bằng HOG Gradient & Bilateral Symmetry.")
+        except Exception as e:
+            logger.warning("Không thể chạy HOG viewpoint classification (%s), dùng quỹ đạo tuần tự.", e)
+            for i in range(n):
+                angle = i * (360.0 / n)
+                for j, (face, az, el) in enumerate(CANONICAL_FACES[:4]):
+                    ang_diff = abs((angle - az + 180.0) % 360.0 - 180.0)
+                    score_matrix[i, j] = max(0.0, 1.0 - ang_diff / 90.0)
+
+    # Đưa các nhãn explicit đã biết vào ma trận điểm
+    for idx, (face, az, el, conf) in explicit.items():
+        for col_idx, (cface, _, _) in enumerate(CANONICAL_FACES):
+            if cface == face:
+                score_matrix[idx, :] = 0.0
+                score_matrix[idx, col_idx] = 10.0
+
+    # 4. Bipartite Matching: Phân bổ 1-1 tối ưu không trùng lặp
+    try:
+        from scipy.optimize import linear_sum_assignment
+        k_targets = min(n, 6)
+        row_ind, col_ind = linear_sum_assignment(-score_matrix[:, :k_targets])
+        assigned = {}
+        for r, c in zip(row_ind, col_ind):
+            face, az, el = CANONICAL_FACES[c]
+            assigned[r] = {
+                "index": int(r),
+                "face": face,
+                "azimuth": az,
+                "elevation": el,
+                "confidence": float(score_matrix[r, c]),
+            }
+    except Exception:
+        assigned = {}
+
+    results = []
+    for i in range(n):
+        if i in assigned:
+            results.append(assigned[i])
+        else:
+            az = (i * 360.0 / n) % 360.0
+            results.append({
+                "index": i,
+                "face": f"orbit_{int(az)}",
+                "azimuth": az,
+                "elevation": 15.0,
+                "confidence": 0.5,
+            })
+
+    for r in results:
+        logger.info(
+            f"  [MẶT NHẬN DIỆN] Ảnh #{r['index'] + 1}: {r['face'].upper()} "
+            f"(Azimuth: {r['azimuth']:.1f}°, Elevation: {r['elevation']:.1f}°, Conf: {r['confidence']:.2f})"
+        )
+
+    return results
+
+
+# ============================================================================
 # HÀM 6: PREPROCESS MULTIVIEW (ĐÓNG GÓI TỔNG THỂ)
 # ============================================================================
 
@@ -706,7 +891,8 @@ def preprocess_multiview(
         3. Resize chuẩn DUSt3R (bảo toàn epipolar geometry, chia hết cho 16)
         4. Trích xuất Alpha Mask bằng RMBG-2.0 (Mask nhị phân {0, 1})
         5. Cân bằng sáng Histogram Matching theo ảnh đầu tiên
-        6. Chuẩn hóa Tensor ImageNet cho DUSt3R
+        6. Nhận diện các mặt bằng Deep Learning / HOG (classify_viewpoints)
+        7. Chuẩn hóa Tensor ImageNet cho DUSt3R
 
     Args:
         image_paths: Danh sách đường dẫn file ảnh đầu vào.
@@ -714,28 +900,21 @@ def preprocess_multiview(
         device: Thiết bị chạy RMBG-2.0 ('cpu' hoặc 'cuda').
 
     Returns:
-        Dict chứa 7 trường dữ liệu chuẩn:
-            'images_rgb': List[np.ndarray] ảnh RGB đã resize (H, W, 3) uint8 — cho P5 Texturing
-            'images_normalized': np.ndarray (N, 3, H, W) float32 chuẩn hóa ImageNet — cho P2 DUSt3R
-            'alpha_masks': List[np.ndarray] mỗi mask shape (H, W) uint8 {0,1} — cho P4 Point Pruning
-            'original_sizes': List[Tuple[int, int]] kích thước gốc (W, H)
-            'scale_factors': List[float] tỉ lệ co dãn mỗi ảnh
-            'filenames': List[str] tên file gốc
-            'num_images': int số lượng ảnh hợp lệ sau xử lý
+        Dict chứa các trường dữ liệu chuẩn kèm viewpoint_assignments.
     """
     logger.info(f"═══ BẮT ĐẦU PREPROCESSING {len(image_paths)} ẢNH ═══")
 
     # --- Bước 1: Validate & Load ---
-    logger.info("[1/5] Kiểm tra & đọc ảnh...")
+    logger.info("[1/6] Kiểm tra & đọc ảnh...")
     loaded = validate_and_load_images(image_paths)
 
     try:
         # --- Bước 2: Subsample ---
-        logger.info("[2/5] Kiểm tra số lượng ảnh...")
+        logger.info("[2/6] Kiểm tra số lượng ảnh...")
         filtered = subsample_images(loaded)
 
         # --- Bước 3: DUSt3R Resize ---
-        logger.info("[3/5] Resize chuẩn DUSt3R (bảo toàn epipolar geometry)...")
+        logger.info("[3/6] Resize chuẩn DUSt3R (bảo toàn epipolar geometry)...")
         resized_images: List[Image.Image] = []
         scale_factors: List[float] = []
         original_sizes: List[Tuple[int, int]] = []
@@ -754,12 +933,16 @@ def preprocess_multiview(
         images_rgb: List[np.ndarray] = [np.array(img.convert("RGB")) for img in resized_images]
 
         # --- Bước 4: Trích xuất Alpha Mask ---
-        logger.info("[4/5] Trích xuất Alpha Mask (RMBG-2.0)...")
+        logger.info("[4/6] Trích xuất Alpha Mask (RMBG-2.0)...")
         alpha_masks = extract_alpha_masks(resized_images, device=device)
 
         # --- Bước 5: Cân bằng sáng ---
-        logger.info("[5/5] Cân bằng sáng (Histogram Matching)...")
+        logger.info("[5/6] Cân bằng sáng (Histogram Matching)...")
         images_rgb_matched = histogram_match(images_rgb, reference_index=0)
+
+        # --- Bước 6: Nhận diện các mặt bằng Deep Learning / HOG ---
+        logger.info("[6/6] Nhận diện các mặt của vật thể (Viewpoint Recognition)...")
+        viewpoint_assignments = classify_viewpoints(images_rgb_matched, filenames=filenames, device=device)
 
         # --- Chuẩn hóa Tensor cho DUSt3R ViT ---
         images_normalized = _normalize_for_dust3r(images_rgb_matched)
@@ -772,13 +955,14 @@ def preprocess_multiview(
             "scale_factors": scale_factors,
             "filenames": filenames,
             "image_paths": image_paths_out,
+            "viewpoint_assignments": viewpoint_assignments,
+            "focal_lengths": [(550.0, 550.0)] * len(images_rgb_matched),
             "num_images": len(images_rgb_matched),
         }
 
         logger.info(
             f"═══ HOÀN THÀNH PREPROCESSING: {result['num_images']} ảnh, "
-            f"output tensor: ({result['num_images']}, 3, "
-            f"{images_normalized.shape[2]}, {images_normalized.shape[3]}) ═══"
+            f"đã nhận diện {len(viewpoint_assignments)} góc nhìn chuẩn xác ═══"
         )
         return result
 

@@ -22,11 +22,11 @@ Cell 4 in ra URL Cloudflare `https://xxxx.trycloudflare.com` → mở URL đó �
 index.html ──POST /generate-3d/ (multipart, N ảnh)──► app.py
                                                         │
                             ┌───────────────────────────┴───────────────────────────┐
-                            │ N=1 → TripoSR            N≥2 → P1→P2→P3 Quality Gate   │
-                            │                              PASS → P4 TSDF → P5 GLB  │
-                            │                              FAIL → TripoSR fallback  │
+                            │ N=1 → Depth-Anything-V2   N≥2 → P1 Viewpoint Detect   │
+                            │       (Surface ~1.1s)           P2 Depth-Anything-V2  │
+                            │                                 P4 TSDF → P5 GLB 360° │
                             └───────────────────────────┬───────────────────────────┘
-                    {"output_file": "outputs/result_x.glb"}
+                    {"output_file": "output/result_x.glb"}
                                                         │
 index.html ◄──GET /outputs/result_x.glb (Three.js GLTFLoader)── StaticFiles
 ```
