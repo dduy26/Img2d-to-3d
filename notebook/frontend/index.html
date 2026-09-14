@@ -213,14 +213,14 @@ runBtn.addEventListener('click', async () => {
     const data = cur.result;
     statusEl.textContent = data.status === 'success' ? `✅ Xong trong ${data.execution_time_seconds}s` : '❌ Thất bại';
     metaEl.textContent = [
-      `mode: ${data.mode}`,
-      data.pipeline_type ? `pipeline: ${data.pipeline_type}` : null,
-      data.quality_passed !== null && data.quality_passed !== undefined ? `quality_gate: ${data.quality_passed} — ${data.gate_reason}` : null,
-      `số ảnh: ${data.num_input_images ?? 1}`,
+      `Chế độ: ${data.mode}`,
+      `Thuật toán: ${data.pipeline || data.pipeline_type || 'NVIDIA 3D Workflow'}`,
+      data.quality_passed !== null && data.quality_passed !== undefined ? `Quality Gate: ${data.quality_passed ? '✓ ĐẠT CHUẨN' : '⚠ FALLBACK'} — ${data.quality_reason || data.gate_reason}` : null,
+      `Số ảnh: ${data.num_input_images ?? 1}`,
     ].filter(Boolean).join('\n');
-    if (data.status === 'success' && data.output_file) {
-      const filename = data.output_file.split(/[\\/]/).pop();
-      const url = '/output/' + filename;
+    if (data.status === 'success' && (data.output_url || data.output_file)) {
+      const url = data.output_url || ('/output/' + data.output_file.split(/[\\/]/).pop());
+      const filename = url.split('/').pop();
       await showGlb(url);
       const dl = document.getElementById('dl'); dl.href = url; dl.download = filename; dl.classList.remove('hidden');
       for (const id of ['wire', 'spin']) document.getElementById(id).disabled = false;

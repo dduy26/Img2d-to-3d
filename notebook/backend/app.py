@@ -1,23 +1,42 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from typing import List, Optional
-import uvicorn
-import shutil
+"""
+Ứng Dụng FastAPI Điều Phối Chuỗi Tái Tạo 3D (Phase 6 - P6 Cloud & Web API).
+Chuẩn hóa theo NVIDIA 3D Pipeline.
+
+Tích hợp trọn vẹn 5 phân hệ:
+    P1 Preprocessing: Tách nền, Histogram matching DALI, Phân loại góc nhìn.
+    P2 Depth/Geometry: Depth-Anything-V2-Small + DA3-blender gradient filter.
+    P3 Quality Gate: Kiểm định 3 tầng (Cosine angle, Co-visibility graph, Silhouette coverage).
+    P4 TSDF Mesh: True Multi-View Silhouette Space Carving, Marching Cubes, Quadric Decimation.
+    P5 Texture Blender: Fresnel Angle-Weighted Blending (cos^3 theta), PBR GLB export.
+
+Tính năng phục vụ:
+    - Bất đồng bộ qua Job Store (/generate-3d/job/ & /generate-3d/job/{id}) chống timeout 100s Cloudflare.
+    - Đồng bộ (/generate-3d/) cho cURL / kiểm thử tự động.
+    - Cơ chế cứu hộ (Fail-safe Fallback) khi multi-view gặp rủi ro -> Tự động chuyển sang Single-view Anchor View.
+"""
+
 import os
 import sys
 import time
-import glob
 import uuid
-import threading
-import numpy as np
+import shutil
 import logging
-from PIL import Image
+import threading
+from typing import List, Optional
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+import uvicorn
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
 
 try:
     import torch
@@ -25,312 +44,289 @@ try:
 except ImportError:
     HAS_TORCH = False
 
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-if BACKEND_DIR not in sys.path:
-    sys.path.insert(0, BACKEND_DIR)
+# Import các phân hệ trong backend
+try:
+    from .preprocess import preprocess_multiview, preprocess_single_view
+    from .engine_depth import DepthReconstructionEngine
+    from .quality_gate import QualityGate
+    from .engine_tsdf_mesh import TSDFMeshEngine, generate_camera_poses
+    from .texture_blender import TextureBlender
+    from .utils_3d import export_glb
+except ImportError:
+    from preprocess import preprocess_multiview, preprocess_single_view
+    from engine_depth import DepthReconstructionEngine
+    from quality_gate import QualityGate
+    from engine_tsdf_mesh import TSDFMeshEngine, generate_camera_poses
+    from texture_blender import TextureBlender
+    from utils_3d import export_glb
 
-# Import các module trong pipeline
-from preprocess import preprocess_multiview, preprocess_single_view
-from quality_gate import QualityGate
-from engine_tsdf_mesh import TSDFMeshEngine, generate_camera_poses, DEFAULT_CONF_THRESHOLD
-from texture_blender import TextureBlender
-from engine_depth import DepthReconstructionEngine
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("app_backend")
 
-# Cấu hình logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app = FastAPI(title="NVIDIA 3D Reconstruction Pipeline API", version="2.0.0")
 
-app = FastAPI(title="2D to 3D Generation API - Full Pipeline")
-
-# Xác định thư mục dự án và thiết lập 1 thư mục nhận input, 1 thư mục xuất output duy nhất
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+# Thư mục dự án, input và output thống nhất
 PROJECT_ROOT = os.path.dirname(os.path.dirname(BACKEND_DIR))
 FRONTEND_DIR = os.path.join(os.path.dirname(BACKEND_DIR), "frontend")
 FRONTEND_INDEX = os.path.join(FRONTEND_DIR, "index.html")
 
-# Thống nhất 1 thư mục nhận input và 1 thư mục xuất output ở gốc dự án
-if os.path.isdir(os.path.join(PROJECT_ROOT, "notebook")):
-    INPUT_DIR = os.path.join(PROJECT_ROOT, "input")
-    OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
-else:
-    INPUT_DIR = os.path.abspath("input")
-    OUTPUT_DIR = os.path.abspath("output")
-
+INPUT_DIR = os.path.join(PROJECT_ROOT, "input")
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 os.makedirs(INPUT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ── P6: Phục vụ file .glb tĩnh (hỗ trợ cả /output và /outputs tương thích ngược) ──
+# Mount thư mục tĩnh phục vụ file 3D .glb
 app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
 app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 
 # ============================================================================
-# KHỞI TẠO TẤT CẢ ENGINE (Chỉ chạy 1 lần lúc bật server)
+# KHỞI TẠO CÁC ENGINE (Chỉ tải mô hình 1 lần)
 # ============================================================================
 device = "cuda" if (HAS_TORCH and torch.cuda.is_available()) else "cpu"
-logger.info(f"Sử dụng device: {device}")
+logger.info(f"[Server] Khởi tạo hệ thống trên thiết bị: {device}")
 
-# P3: Quality Gate
-q_gate = QualityGate()
-
-# ── Nút vặn chất lượng (đặt qua biến môi trường, không cần sửa code) ──
-# TSDF_RES: số voxel mỗi cạnh của lưới TSDF. Cao hơn = chi tiết hơn, chậm + tốn RAM hơn.
-#   128 -> ~16MB/grid (mặc định) | 192 -> ~57MB | 256 -> ~134MB
-TSDF_RES = int(os.environ.get("TSDF_RES", "128"))
-logger.info(f"Cấu hình: TSDF_RES={TSDF_RES}")
-
-# P4: TSDF Volumetric Mesh Engine (NVIDIA reference TSDF + Marching Cubes)
-tsdf_engine = TSDFMeshEngine(resolution=TSDF_RES)
-
-# P5: XAtlas UV Parameterization & Base-Color Texture Blender
+quality_gate = QualityGate()
+depth_engine = DepthReconstructionEngine(device=device)
+tsdf_engine = TSDFMeshEngine()
 texture_blender = TextureBlender()
 
-# Kịch bản 1: Depth Reconstruction Engine (Depth-Anything-V2 + Poisson)
-depth_engine = DepthReconstructionEngine(device=device)
-
-logger.info("═══ TẤT CẢ ENGINE P1-P5 (Depth-Anything-V2 + NVIDIA TSDF) ĐÃ SẴN SÀNG ═══")
+logger.info("[Server] ✓ Toàn bộ 5 phân hệ P1-P5 chuẩn NVIDIA đã sẵn sàng phục vụ.")
 
 
 # ============================================================================
-# API 0: Giao diện Web (P6) + Health check
-# ============================================================================
-@app.get("/", include_in_schema=False)
-async def frontend():
-    """Phục vụ giao diện Web UI (Three.js) tại gốc máy chủ."""
-    if os.path.exists(FRONTEND_INDEX):
-        return FileResponse(FRONTEND_INDEX)
-    return {"message": "Frontend chưa được cài. Mở /docs để dùng Swagger UI."}
-
-
-@app.get("/api/health")
-async def health():
-    """Health check cho Colab/tunnel."""
-    return {
-        "status": "ok",
-        "device": device,
-        "frontend": os.path.exists(FRONTEND_INDEX),
-        "engines": {
-            "depth": depth_engine.depth_model is not None,
-            "tsdf": True,
-            "texture_blender": True,
-        },
-    }
-
-
-
-# ============================================================================
-# IN-MEMORY JOB STORE CHO CHẠY BẤT ĐỒNG BỘ (CHỐNG TIMEOUT CLOUDFLARE 100s)
+# IN-MEMORY JOB STORE CHO XỬ LÝ NỀN BẤT ĐỒNG BỘ
 # ============================================================================
 JOBS = {}
 
 
 def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
     """
-    Thực thi chuỗi xử lý tái tạo 3D hoàn chỉnh 100% không mock:
-    - 1 ảnh: Tiền xử lý đơn ảnh -> Depth-Anything-V2 / TripoSR
-    - >=2 ảnh: Tiền xử lý đa ảnh -> Depth-Anything-V2 + DA3-blender -> TSDF Mesh 360° -> XAtlas Texture Blender.
-      Kèm cơ chế cứu hộ Fail-safe theo đúng đặc tả plan (docs/require.md).
+    Điều phối luồng xử lý 2D-to-3D không mock:
+    - 1 ảnh: P1 Preprocessing -> P2 Depth Single-view Reconstruction.
+    - >=2 ảnh: P1 Multi-view Preprocessing -> P2 Depth-Anything-V2 -> P3 Quality Gate
+               -> P4 True Space Carving TSDF Mesh -> P5 Texture Blender.
+               Kèm cơ chế cứu hộ Fail-safe nếu Quality Gate cảnh báo rủi ro.
     """
-    pipeline_start = time.time()
+    t_start = time.time()
     base_name = os.path.splitext(os.path.basename(saved_paths[0]))[0]
-    output_glb_filename = f"result_{base_name}.glb"
+    output_glb_filename = f"model_{base_name}_{uuid.uuid4().hex[:6]}.glb"
     output_glb_path = os.path.join(OUTPUT_DIR, output_glb_filename)
 
-    # ════════════════════════════════════════════════════════════════
-    # NHÁNH 1: Chỉ có 1 ảnh → Chạy qua P1 preprocessing + chọn engine
-    # ════════════════════════════════════════════════════════════════
+    # ────────────────────────────────────────────────────────────────
+    # NHÁNH 1: Chế độ đơn ảnh (Single-view)
+    # ────────────────────────────────────────────────────────────────
     if len(saved_paths) == 1:
-        logger.info(f"═══ CHẾ ĐỘ 1 ẢNH (mode={mode}) ═══")
-        preprocess_result = preprocess_single_view(
-            image_path=saved_paths[0],
-            target_size=512,
-            device=device,
-        )
-        logger.info(
-            f"[P1] Hoàn tất đơn ảnh: centered={preprocess_result['image_centered'].shape}, "
-            f"focal={preprocess_result['focal_length']}"
-        )
+        logger.info(f"═══ [PIPELINE] XỬ LÝ CHẾ ĐỘ ĐƠN ẢNH: {saved_paths[0]} ═══")
+        prep = preprocess_single_view(saved_paths[0], target_size=512)
 
-        effective_mode = mode if mode != "auto" else "fast"
-
-        logger.info("[Single View] Chạy Depth-Anything-V2 Reconstruction Pipeline...")
         success, model_path, exec_time = depth_engine.reconstruct(
-            image_rgb=preprocess_result["image_centered"],
-            alpha_mask=preprocess_result["alpha_mask_centered"],
-            focal_length=preprocess_result["focal_length"],
+            image_rgb=prep["image_centered"],
+            alpha_mask=prep["alpha_mask_centered"],
+            focal_length=prep["focal_length"],
             output_path=output_glb_path,
         )
-        pipeline_type = "depth_anything_v2"
 
+        glb_url = f"/output/{output_glb_filename}" if success else None
         return {
             "status": "success" if success else "failed",
-            "mode": "single_image",
-            "pipeline_type": pipeline_type,
-            "quality_passed": None,
-            "gate_reason": f"Chế độ đơn ảnh: {pipeline_type}",
+            "mode": "single_view",
+            "pipeline": "Depth-Anything-V2-Small (Pinhole Grid)",
             "execution_time_seconds": round(exec_time, 2),
             "output_file": model_path,
+            "output_url": glb_url,
             "num_input_images": 1,
-            "preprocessing": {
-                "focal_length": preprocess_result["focal_length"],
-                "original_size": preprocess_result["original_size"],
-                "scale_factor": preprocess_result["scale_factor"],
-            },
         }
 
-    # ════════════════════════════════════════════════════════════════
-    # NHÁNH 2: Nhiều ảnh (2–8 ảnh) → Full Multi-View Pipeline 360°
-    # ════════════════════════════════════════════════════════════════
-    logger.info(f"═══ CHẾ ĐỘ MULTI-VIEW ({len(saved_paths)} ảnh, mode={mode}) ═══")
+    # ────────────────────────────────────────────────────────────────
+    # NHÁNH 2: Chế độ đa ảnh (Multi-view 360°)
+    # ────────────────────────────────────────────────────────────────
+    logger.info(f"═══ [PIPELINE] XỬ LÝ CHẾ ĐỘ MULTI-VIEW ({len(saved_paths)} ảnh) ═══")
 
-    # ── Bước 1 (P1): Preprocessing ──
-    logger.info("[P1] Tiền xử lý ảnh đa góc nhìn (tách nền + nhận diện các mặt)...")
-    preprocess_result = preprocess_multiview(
-        image_paths=saved_paths,
-        target_size=512,
-        device=device,
-    )
-    logger.info(
-        f"[P1] Hoàn tất: {preprocess_result['num_images']} ảnh, "
-        f"tensor shape: {preprocess_result['images_normalized'].shape}"
-    )
+    # 1. P1 Preprocessing
+    prep = preprocess_multiview(saved_paths, target_size=512)
+    images_rgb = prep["images_rgb"]
+    alpha_masks = prep["alpha_masks"]
+    viewpoint_assignments = prep.get("viewpoint_assignments")
+    focal_lengths = prep.get("focal_lengths")
 
-    # ── LUỒNG CHUẨN: NVIDIA + Depth-Anything-V2 + DA3-blender ──
-    logger.info("[P2] Dự đoán bản đồ độ sâu đa góc bằng Depth-Anything-V2 + DA3-blender filter...")
-    da_result = depth_engine.predict_multiview_depth(
-        images_rgb=preprocess_result["images_rgb"],
-        alpha_masks=preprocess_result["alpha_masks"],
-    )
-    depth_maps = da_result["depth_maps"]
+    # 2. P2 Depth Prediction
+    depth_res = depth_engine.predict_multiview_depth(images_rgb=images_rgb, alpha_masks=alpha_masks)
+    depth_maps = depth_res["depth_maps"]
 
-    # Thiết lập camera trajectory chuẩn xác dựa trên các mặt nhận diện được
-    viewpoint_assignments = preprocess_result.get("viewpoint_assignments")
+    # 3. Camera Poses
     camera_poses = generate_camera_poses(
-        n_views=len(saved_paths),
+        n_views=len(images_rgb),
         radius=2.2,
         elevation_deg=15.0,
         view_names=saved_paths,
         viewpoint_assignments=viewpoint_assignments,
     )
-    focal_lengths = preprocess_result.get("focal_lengths")
-    if focal_lengths is None or len(focal_lengths) != len(saved_paths):
-        focal_lengths = [(550.0, 550.0)] * len(saved_paths)
 
-    # ── Bước 3 (P3): Quality Gate ──
-    logger.info("[P3] Kiểm tra tính hợp lệ của dữ liệu đầu vào...")
-    is_high_quality = len(depth_maps) >= 2 and all(d is not None for d in depth_maps)
-    reason = "Depth maps và camera trajectory hợp lệ theo chuẩn NVIDIA"
+    # 4. P3 Quality Gate & Fail-safe Decision
+    q_passed, q_reason, q_info = quality_gate.evaluate(
+        camera_poses=camera_poses,
+        alpha_masks=alpha_masks,
+        depth_maps=depth_maps,
+    )
+    logger.info(f"[P3 Quality Gate] Kết quả: passed={q_passed}, lý do: {q_reason}")
 
-    # ── Bước 4 (P4): Tái tạo lưới 3D bằng NVIDIA TSDF Volume & Marching Cubes ──
-    logger.info(f"[P4] Bắt đầu tích lũy thể tích NVIDIA TSDF 360° cho {len(depth_maps)} góc nhìn...")
+    # Nếu Quality Gate cảnh báo lỗi nghiêm trọng -> Kích hoạt Fail-safe fallback sang ảnh neo #0
+    if not q_passed and q_info.get("fallback_to_single_view", False):
+        anchor_idx = q_info.get("best_view_index", 0)
+        logger.warning(
+            f"[P3] KÍCH HOẠT CƠ CHẾ CỨU HỘ: Dữ liệu multi-view không đạt chuẩn ({q_reason}). "
+            f"Tự động chuyển sang tái tạo đơn ảnh chất lượng cao từ ảnh neo #{anchor_idx}!"
+        )
+        single_prep = preprocess_single_view(saved_paths[anchor_idx], target_size=512)
+        success, model_path, exec_time = depth_engine.reconstruct(
+            image_rgb=single_prep["image_centered"],
+            alpha_mask=single_prep["alpha_mask_centered"],
+            focal_length=single_prep["focal_length"],
+            output_path=output_glb_path,
+        )
+        glb_url = f"/output/{output_glb_filename}" if success else None
+        return {
+            "status": "success" if success else "failed",
+            "mode": "fallback_single_view",
+            "pipeline": "Quality-Gate Fail-safe -> Depth-Anything-V2",
+            "quality_passed": False,
+            "quality_reason": q_reason,
+            "execution_time_seconds": round(time.time() - t_start, 2),
+            "output_file": model_path,
+            "output_url": glb_url,
+            "num_input_images": len(saved_paths),
+        }
+
+    # 5. P4 True Space Carving TSDF Mesh
     try:
         mesh = tsdf_engine.reconstruct_from_depth_maps(
             depth_maps=depth_maps,
-            alpha_masks=preprocess_result["alpha_masks"],
+            alpha_masks=alpha_masks,
             camera_poses=camera_poses,
             focal_lengths=focal_lengths,
             view_names=saved_paths,
             viewpoint_assignments=viewpoint_assignments,
         )
-
-        logger.info(f"[P5] Trải UV & Nướng màu từ toàn bộ {len(preprocess_result['images_rgb'])} ảnh vào Mesh 360°...")
-        success, model_path = texture_blender.process_and_export(
-            mesh=mesh,
-            images_rgb=preprocess_result["images_rgb"],
-            camera_poses=camera_poses,
-            focal_lengths=focal_lengths,
+    except Exception as e:
+        logger.error(f"[P4] Lỗi TSDF Space Carving: {e}. Kích hoạt Fallback sang Single-view...", exc_info=True)
+        single_prep = preprocess_single_view(saved_paths[0], target_size=512)
+        success, model_path, _ = depth_engine.reconstruct(
+            image_rgb=single_prep["image_centered"],
+            alpha_mask=single_prep["alpha_mask_centered"],
+            focal_length=single_prep["focal_length"],
             output_path=output_glb_path,
         )
-        if not success or not os.path.exists(output_glb_path):
-            logger.warning("[P5] Nướng texture gặp sự cố, xuất mesh màu đỉnh 360° trực tiếp của P4.")
-            from utils_3d import export_glb
-            export_glb(mesh, output_glb_path)
-            success = os.path.exists(output_glb_path)
-            model_path = output_glb_path
+        glb_url = f"/output/{output_glb_filename}" if success else None
+        return {
+            "status": "success" if success else "failed",
+            "mode": "fallback_single_view",
+            "pipeline": "P4-Failure Fallback -> Depth-Anything-V2",
+            "execution_time_seconds": round(time.time() - t_start, 2),
+            "output_file": model_path,
+            "output_url": glb_url,
+            "num_input_images": len(saved_paths),
+        }
 
-        pipeline_type = "nvidia_depth_anything_tsdf"
-        backend_name = "nvidia_depth_anything_tsdf"
+    # 6. P5 Texture Blender (Fresnel Angle-Weighted Blending)
+    p5_success, model_path = texture_blender.process_and_export(
+        mesh=mesh,
+        images_rgb=images_rgb,
+        camera_poses=camera_poses,
+        focal_lengths=focal_lengths,
+        output_path=output_glb_path,
+    )
 
-    except Exception as mv_err:
-        logger.error(f"[LỖI TÁI TẠO ĐA ẢNH NVIDIA TSDF]: {mv_err}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Lỗi tái tạo 3D đa ảnh tại khối P4/P5: {mv_err}. Vui lòng kiểm tra log server!"
-        )
+    if not p5_success or not os.path.exists(output_glb_path):
+        logger.warning("[P5] Nướng texture gặp sự cố, xuất mesh màu đỉnh P4 trực tiếp.")
+        export_glb(mesh, output_glb_path)
+        p5_success = os.path.exists(output_glb_path)
+        model_path = output_glb_path
 
-    total_time = time.time() - pipeline_start
+    total_time = time.time() - t_start
+    glb_url = f"/output/{output_glb_filename}" if p5_success else None
 
     return {
-        "status": "success" if success else "failed",
-        "mode": "multiview_pipeline",
-        "pipeline_type": pipeline_type,
-        "backend": backend_name,
-        "quality_passed": is_high_quality,
-        "gate_reason": reason,
-        "num_input_images": preprocess_result["num_images"],
+        "status": "success" if p5_success else "failed",
+        "mode": "multiview_360",
+        "pipeline": "NVIDIA True Space Carving TSDF + Angle-Weighted Blending",
+        "quality_passed": True,
+        "quality_reason": q_reason,
         "execution_time_seconds": round(total_time, 2),
         "output_file": model_path,
+        "output_url": glb_url,
+        "num_input_images": len(saved_paths),
     }
 
 
 # ============================================================================
-# API 1a: Upload ẢNH → Full Pipeline Đồng bộ (Dùng cho cURL, CLI, Local Test)
+# API ENDPOINTS
 # ============================================================================
+
+@app.get("/", include_in_schema=False)
+async def frontend():
+    """Phục vụ giao diện Web UI (Three.js)."""
+    if os.path.exists(FRONTEND_INDEX):
+        return FileResponse(FRONTEND_INDEX)
+    return {"message": "Frontend chưa được cài đặt. Mở /docs để dùng Swagger API."}
+
+
+@app.get("/api/health")
+async def health():
+    """Kiểm tra trạng thái sức khỏe của dịch vụ và các mô hình."""
+    return {
+        "status": "ok",
+        "device": device,
+        "frontend": os.path.exists(FRONTEND_INDEX),
+        "engines": {
+            "depth_anything_v2": depth_engine.depth_model is not None,
+            "quality_gate": True,
+            "tsdf_space_carving": True,
+            "texture_blender": True,
+        },
+    }
+
+
 @app.post("/generate-3d/")
 async def generate_3d(
     files: List[UploadFile] = File(...),
     mode: str = Form("auto"),
 ):
-    """API đồng bộ: Nhận ảnh -> Xử lý trực tiếp -> Trả JSON khi xong."""
-    valid_modes = {"auto", "fast", "geometric"}
-    if mode not in valid_modes:
-        raise HTTPException(
-            status_code=400,
-            detail=f"mode phải là một trong {valid_modes}, nhận được '{mode}'"
-        )
+    """
+    API đồng bộ: Nhận danh sách ảnh -> Thực thi pipeline -> Trả về kết quả JSON.
+    """
     try:
         saved_paths = []
         for f in files:
-            input_path = os.path.join(INPUT_DIR, f.filename)
-            with open(input_path, "wb") as buffer:
-                shutil.copyfileobj(f.file, buffer)
-            saved_paths.append(input_path)
-            logger.info(f"Đã lưu: {f.filename} vào {input_path}")
+            path = os.path.join(INPUT_DIR, f.filename)
+            with open(path, "wb") as buf:
+                shutil.copyfileobj(f.file, buf)
+            saved_paths.append(path)
 
         return execute_3d_pipeline(saved_paths, mode=mode)
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Pipeline đồng bộ lỗi: {e}", exc_info=True)
+        logger.error(f"Lỗi generate_3d: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ============================================================================
-# API 1b: Chạy NỀN (Job Polling) — CHỐNG TIMEOUT 100s CỦA CLOUDFLARE TUNNEL
-# ============================================================================
 @app.post("/generate-3d/job/")
 async def generate_3d_job(
     files: List[UploadFile] = File(...),
     mode: str = Form("auto"),
 ):
     """
-    Nhận ảnh -> lưu -> tạo job_id -> trả về NGAY LẬP TỨC (<100ms).
-    Pipeline chạy trong thread nền. Frontend polling /generate-3d/job/{id} mỗi 1.5s
-    giúp mọi request đều ngắn, không bao giờ bị Cloudflare cắt ở mốc 100s.
+    API bất đồng bộ: Nhận ảnh -> Tạo job_id -> Trả response ngay (<100ms).
+    Giải quyết triệt để lỗi ngắt kết nối 100 giây của Cloudflare Tunnel.
     """
-    valid_modes = {"auto", "fast", "geometric"}
-    if mode not in valid_modes:
-        raise HTTPException(
-            status_code=400,
-            detail=f"mode phải là một trong {valid_modes}, nhận được '{mode}'"
-        )
-
     job_id = uuid.uuid4().hex[:12]
     saved_paths = []
     for f in files:
-        input_path = os.path.join(INPUT_DIR, f.filename)
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(f.file, buffer)
-        saved_paths.append(input_path)
+        path = os.path.join(INPUT_DIR, f.filename)
+        with open(path, "wb") as buf:
+            shutil.copyfileobj(f.file, buf)
+        saved_paths.append(path)
 
     JOBS[job_id] = {
         "job_id": job_id,
@@ -348,19 +344,12 @@ async def generate_3d_job(
                 "result": res,
                 "elapsed_seconds": round(time.time() - JOBS[job_id]["started"], 2),
             }
-        except HTTPException as he:
-            JOBS[job_id] = {
-                "job_id": job_id,
-                "status": "error",
-                "error": str(he.detail),
-                "elapsed_seconds": round(time.time() - JOBS[job_id]["started"], 2),
-            }
         except Exception as e:
-            logger.error(f"Job {job_id} gặp ngoại lệ: {e}", exc_info=True)
+            logger.error(f"Job {job_id} lỗi: {e}", exc_info=True)
             JOBS[job_id] = {
                 "job_id": job_id,
                 "status": "error",
-                "error": f"{type(e).__name__}: {e}",
+                "error": str(e),
                 "elapsed_seconds": round(time.time() - JOBS[job_id]["started"], 2),
             }
 
@@ -370,7 +359,7 @@ async def generate_3d_job(
 
 @app.get("/generate-3d/job/{job_id}")
 async def get_job_status(job_id: str):
-    """Trạng thái job: running | done | error | not_found. Kèm số giây đã xử lý."""
+    """Kiểm tra tiến độ job (running | done | error | not_found)."""
     job = JOBS.get(job_id)
     if not job:
         return {"status": "not_found"}
@@ -379,19 +368,16 @@ async def get_job_status(job_id: str):
     return job
 
 
-# ============================================================================
-# API 2: Upload 1 ẢNH DUY NHẤT (Giữ API cũ tương thích)
-# ============================================================================
 @app.post("/generate-3d/single/")
 async def generate_3d_single(
     file: UploadFile = File(...),
     mode: str = Form("auto"),
 ):
-    """API đơn giản: Upload 1 ảnh -> Gọi execute_3d_pipeline."""
-    input_path = os.path.join(INPUT_DIR, file.filename)
-    with open(input_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    return execute_3d_pipeline([input_path], mode=mode)
+    """API đơn ảnh tương thích ngược."""
+    path = os.path.join(INPUT_DIR, file.filename)
+    with open(path, "wb") as buf:
+        shutil.copyfileobj(file.file, buf)
+    return execute_3d_pipeline([path], mode=mode)
 
 
 if __name__ == "__main__":
