@@ -530,6 +530,16 @@ def mesh_health(mesh: trimesh.Trimesh, decimals: int = 6) -> dict:
     else:
         boundary = 0
 
+    # ĐỘ ĐẶC: thể tích mesh / thể tích vỏ bao lồi. Khối đặc ~100%; 2 mặt bề mặt dính vào
+    # nhau (bị gấp/dán) thì bề mặt vẫn KÍN và vẫn 1 mảnh, nhưng thể tích gần 0 -> mặt cắt
+    # ngang tách thành nhiều đường bao. Đây là thứ `watertight=True` KHÔNG nói được.
+    volume = float(welded.volume)
+    try:
+        hull = float(welded.convex_hull.volume)
+    except Exception:
+        hull = 0.0
+    solidity = (100.0 * volume / hull) if hull > 1e-12 else 0.0
+
     return {
         "vertices": len(vertices),
         "faces": len(faces),
@@ -538,23 +548,38 @@ def mesh_health(mesh: trimesh.Trimesh, decimals: int = 6) -> dict:
         "winding_consistent": bool(welded.is_winding_consistent),
         "components": len(welded.split(only_watertight=False)),
         "boundary_edges": boundary,
-        "volume": float(welded.volume),
+        "volume": volume,
+        "solidity_pct": solidity,
+        "extents": [float(v) for v in welded.extents],
     }
 
 
 def log_mesh_health(mesh: trimesh.Trimesh, label: str = "mesh") -> dict:
-    """In kết quả mesh_health ra log. Hở (boundary_edges > 0) thì cảnh báo rõ."""
+    """In kết quả mesh_health ra log. Hở hoặc không phải khối đặc thì cảnh báo rõ."""
     health = mesh_health(mesh)
+    extents = np.asarray(health["extents"], dtype=float)
+    ratio = np.round(extents / extents.max(), 3).tolist() if extents.max() > 0 else []
     logger.info(
         f"[KIỂM HÌNH HỌC] {label}: {health['vertices']} đỉnh ({health['duplicated_vertices']} "
         f"đỉnh trùng do seam UV), {health['faces']} mặt | sau khi hàn: "
         f"{health['components']} mảnh, {health['boundary_edges']} cạnh biên, "
-        f"watertight={health['watertight']}, thể tích={health['volume']:.6f}"
+        f"watertight={health['watertight']}, thể tích={health['volume']:.6f}, "
+        f"độ đặc={health['solidity_pct']:.0f}% (thể tích/vỏ bao lồi), "
+        f"tỉ lệ cạnh={ratio}"
     )
     if health["boundary_edges"] > 0:
         logger.warning(
             f"[KIỂM HÌNH HỌC] {label} HỞ: {health['boundary_edges']} cạnh biên -> có vùng "
             f"không camera nào quan sát. Cần chụp thêm góc (nhất là mặt dưới)."
+        )
+    if health["watertight"] and 0.0 < health["solidity_pct"] < 30.0:
+        logger.warning(
+            f"[KIỂM HÌNH HỌC] {label} KÍN nhưng KHÔNG ĐẶC: chỉ chiếm "
+            f"{health['solidity_pct']:.0f}% vỏ bao lồi (khối đặc ~100%) -> bề mặt bị GẤP/"
+            f"DÁN vào chính nó, vật sẽ trông như bị nhân đôi. Nguyên nhân thường gặp: các "
+            f"camera gần như cùng một hướng (một vòng ngang) nên mặt trước và mặt sau bị "
+            f"TSDF trộn vào nhau. Kiểm dòng [P3→P6] Độ phủ gốc chụp — cần TẢN GÓC, không "
+            f"phải thêm ảnh cùng hướng."
         )
     return health
 

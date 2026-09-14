@@ -217,6 +217,23 @@ def main() -> int:
     else:
         print(f"✅ KỊCH BẢN A: độ phủ đa góc tốt ({cov_a['pct_band_multi']:.1f}% dải bề mặt >=2 view)")
 
+    # ĐỘ ĐẶC: thứ `watertight=True` KHÔNG nói được. Hai kịch bản phải KHÁC NHAU rõ rệt —
+    # A tản góc -> khối đặc; B một vòng ngang -> bề mặt gấp/dán vào chính nó, thể tích sụp.
+    # Đây là phép kiểm bắt lỗi "mesh kín, 1 mảnh, mà trông như bị nhân đôi".
+    sol_a, sol_b = ha["solidity_pct"], hb["solidity_pct"]
+    print(f"  độ đặc          : A {sol_a:.0f}%  |  B {sol_b:.0f}%  (khối đặc ~100%)")
+    if sol_a < 70.0:
+        print(f"❌ KỊCH BẢN A: độ đặc chỉ {sol_a:.0f}% -> mesh không phải khối đặc dù phủ đủ góc")
+        ok = False
+    else:
+        print(f"✅ KỊCH BẢN A: là khối đặc ({sol_a:.0f}% vỏ bao lồi)")
+    if sol_b >= 40.0:
+        print(f"❌ KỊCH BẢN B: độ đặc {sol_b:.0f}% — lẽ ra một vòng ngang phải làm bề mặt gấp lại")
+        ok = False
+    else:
+        print(f"✅ KỊCH BẢN B: đúng là bề mặt bị GẤP ({sol_b:.0f}% vỏ bao lồi) "
+              f"— đây là dấu hiệu 'nhân đôi', do GÓC CHỤP chứ không do số ảnh")
+
     # Kịch bản B KHÔNG phải lỗi của P4: đáy không ai thấy thì không suy ra được. Kỳ vọng
     # duy nhất là P4 KHÔNG ĐƯỢC im lặng — nó phải cảnh báo trong log. Kiểm tra bằng cách
     # dò dòng cảnh báo "[P4] Không lấp được ruột" trong log của lần chạy.
