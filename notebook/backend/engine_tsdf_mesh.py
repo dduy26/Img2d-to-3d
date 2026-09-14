@@ -66,12 +66,11 @@ def generate_camera_poses(
     Quy ước camera: OpenCV/Pinhole (+X phải, +Y xuống, +Z hướng nhìn tới vật thể).
 
     Thứ tự ưu tiên:
-        1. viewpoint_assignments từ Deep Learning (CLIP / ViT) / HOG.
-        2. cameras.json từ dataset (nếu có).
-        3. Tên ảnh trực giao (front, right, back, left, top, bottom).
-        4. Turntable 360° phân bổ đều quanh trục Y.
+        1. viewpoint_assignments từ Deep Learning (CLIP / ViT) / HOG ở P1.
+        2. Tên ảnh trực giao (front, right, back, left, top, bottom).
+        3. Turntable 360° phân bổ đều quanh trục Y.
     """
-    # 1. Ưu tiên cao nhất: Viewpoint assignments từ Deep Learning
+    # 1. Nếu có kết quả nhận diện mặt từ P1 (Deep Learning CLIP / HOG), gán đúng góc camera
     if viewpoint_assignments and len(viewpoint_assignments) == n_views:
         logger.info("[P4] Sinh camera poses từ kết quả nhận diện mặt Deep Learning / HOG.")
         poses = []
@@ -98,27 +97,6 @@ def generate_camera_poses(
             pose[:3, 3] = c_pos
             poses.append(pose)
         return poses
-
-    # 2. File cameras.json
-    if view_names and len(view_names) > 0:
-        candidate_dirs = [os.path.dirname(view_names[0]), "input"]
-        for cdir in candidate_dirs:
-            cpath = os.path.join(cdir, "cameras.json")
-            if os.path.exists(cpath):
-                try:
-                    import json
-                    with open(cpath, "r", encoding="utf-8") as f:
-                        cdata = json.load(f)
-                    poses = []
-                    for vn in view_names:
-                        bname = os.path.basename(vn)
-                        if bname in cdata:
-                            poses.append(np.array(cdata[bname]["camera_pose"], dtype=np.float32))
-                    if len(poses) == len(view_names):
-                        logger.info(f"[P4] Nạp {len(poses)} camera poses từ {cpath}")
-                        return poses
-                except Exception as e:
-                    logger.warning(f"[P4] Lỗi đọc cameras.json: {e}")
 
     # 3. Tên ảnh trực giao
     has_ortho = False
