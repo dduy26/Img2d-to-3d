@@ -663,56 +663,65 @@ class TSDFMeshEngine:
 
         logger.info(f"[P4] Tích lũy TSDF trường khoảng cách từ {len(all_valid_pts)} điểm bề mặt định hướng...")
 
-        # ── Bước 2: Khởi tạo thể tích TSDF theo Bounding Box ──
+        # ── Bước 2: Khởi tạo thể tích TSDF theo Bounding Box thực tế ──
         p_min = np.percentile(all_valid_pts, 0.5, axis=0)
         p_max = np.percentile(all_valid_pts, 99.5, axis=0)
-        center = (p_min + p_max) / 2.0
-        extent = (p_max - p_min) * 1.3
-        bounds_min = center - extent / 2.0
-        bounds_max = center + extent / 2.0
-        voxel_size = float(extent.max()) / float(self.resolution)
+        extent = p_max - p_min
+        margin = 0.15 * extent
+        bounds_min = p_min - margin
+        bounds_max = p_max + margin
 
-        xs = np.linspace(bounds_min[0], bounds_max[0], self.resolution, endpoint=False, dtype=np.float32) + voxel_size / 2.0
-        ys = np.linspace(bounds_min[1], bounds_max[1], self.resolution, endpoint=False, dtype=np.float32) + voxel_size / 2.0
-        zs = np.linspace(bounds_min[2], bounds_max[2], self.resolution, endpoint=False, dtype=np.float32) + voxel_size / 2.0
+        xs = np.linspace(bounds_min[0], bounds_max[0], self.resolution, endpoint=False, dtype=np.float32)
+        ys = np.linspace(bounds_min[1], bounds_max[1], self.resolution, endpoint=False, dtype=np.float32)
+        zs = np.linspace(bounds_min[2], bounds_max[2], self.resolution, endpoint=False, dtype=np.float32)
+        dx = float(xs[1] - xs[0])
+        dy = float(ys[1] - ys[0])
+        dz = float(zs[1] - zs[0])
+        max_voxel = max(dx, dy, dz)
+        trunc_margin = 2.5 * max_voxel
+
         gx, gy, gz = np.meshgrid(xs, ys, zs, indexing='ij')
         grid_pts = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3)
 
         # ── Bước 3: Tính toán Signed Distance Field từ các tia nhìn thực tế ──
         tree = cKDTree(all_valid_pts)
-        k_neighbors = min(5, len(all_valid_pts))
+        k_neighbors = min(3, len(all_valid_pts))
         dists, idxs = tree.query(grid_pts, k=k_neighbors)
         if k_neighbors == 1:
             diff = grid_pts - all_valid_pts[idxs]
-            dot = np.sum(diff * all_normals[idxs], axis=-1)
-            signed_dot = dot
-            dists_nearest = dists
+            dots = np.sum(diff * all_normals[idxs], axis=-1)
+            signed_dist = dots
         else:
             diff = grid_pts[:, None, :] - all_valid_pts[idxs]
-            dot = np.sum(diff * all_normals[idxs], axis=-1)
+            dots = np.sum(diff * all_normals[idxs], axis=-1)
             weights = 1.0 / np.maximum(dists, 1e-4)
             weights /= np.sum(weights, axis=-1, keepdims=True)
-            signed_dot = np.sum(dot * weights, axis=-1)
-            dists_nearest = dists[:, 0]
+            signed_dist = np.sum(dots * weights, axis=-1)
 
-        sdf = dists_nearest * np.sign(signed_dot)
-        far_outside = (dists_nearest > 3.0 * voxel_size) & (signed_dot > 0)
-        sdf[far_outside] = 1.0
+        sdf = np.clip(signed_dist, -trunc_margin, trunc_margin)
+
+        # Bất kỳ voxel nào nằm ngoài hộp [p_min, p_max] của vật thể ĐỀU LÀ KHÔNG KHÍ (+trunc_margin)
+        outside_box = (
+            (grid_pts[:, 0] < p_min[0]) | (grid_pts[:, 0] > p_max[0]) |
+            (grid_pts[:, 1] < p_min[1]) | (grid_pts[:, 1] > p_max[1]) |
+            (grid_pts[:, 2] < p_min[2]) | (grid_pts[:, 2] > p_max[2])
+        )
+        sdf[outside_box] = np.maximum(sdf[outside_box], 0.2 * trunc_margin)
 
         sdf_grid = sdf.reshape(self.resolution, self.resolution, self.resolution).astype(np.float32)
 
-        # Đệm biên 1-voxel quanh 6 mặt ngoài bằng +1.0 (không khí) để Marching Cubes luôn đóng kín nước
-        sdf_grid[0, :, :] = 1.0; sdf_grid[-1, :, :] = 1.0
-        sdf_grid[:, 0, :] = 1.0; sdf_grid[:, -1, :] = 1.0
-        sdf_grid[:, :, 0] = 1.0; sdf_grid[:, :, -1] = 1.0
+        # Đệm biên 1-voxel quanh 6 mặt ngoài bằng +trunc_margin (không khí) để Marching Cubes luôn đóng kín nước
+        sdf_grid[0, :, :] = trunc_margin; sdf_grid[-1, :, :] = trunc_margin
+        sdf_grid[:, 0, :] = trunc_margin; sdf_grid[:, -1, :] = trunc_margin
+        sdf_grid[:, :, 0] = trunc_margin; sdf_grid[:, :, -1] = trunc_margin
 
-        # ── Bước 4: Trích xuất Iso-surface Marching Cubes ──
+        # ── Bước 4: Trích xuất Iso-surface Marching Cubes với spacing thực (dx, dy, dz) ──
         logger.info("[P4] Trích xuất bề mặt Marching Cubes kín nước...")
         try:
             verts, faces, normals_mc, _ = measure.marching_cubes(
                 volume=sdf_grid,
                 level=0.0,
-                spacing=(voxel_size, voxel_size, voxel_size),
+                spacing=(dx, dy, dz),
                 allow_degenerate=False,
             )
             verts_world = verts + bounds_min
