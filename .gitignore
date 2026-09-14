@@ -60,10 +60,12 @@ outputs/
 notebook/backend/temp_uploads/
 notebook/backend/outputs/
 
-# Dữ liệu ảnh benchmark (track bộ ảnh thật)
+# Dữ liệu ảnh benchmark (track bộ ảnh thật và bộ ảnh chuẩn Objaverse)
 data/*
 !data/gso/
 !data/gso/view_*.jpg
+!data/objaverse_apple/
+!data/objaverse_apple/view_*.png
 !data/input/
 !data/input/multi_view/
 !data/input/multi_view/view_*.jpg
