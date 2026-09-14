@@ -395,25 +395,40 @@ def dust3r_resize(
 # HÀM 4: EXTRACT ALPHA MASKS (RMBG-2.0)
 # ============================================================================
 
+def refine_alpha_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Tinh chỉnh mặt nạ nhị phân cho vật thể thực tế:
+    1. Lấp đầy các lỗ rỗng cục bộ bên trong (do phản quang, nhựa trong suốt hoặc bóng chói).
+    2. Lọc bỏ các đốm nhiễu nhỏ ngoài rìa (bóng đổ mặt bàn, bụi cảm biến).
+    Áp dụng phổ quát cho MỌI vật thể thực tế (chai lọ, cốc chén, giày dép, bàn ghế, đồ chơi...).
+    """
+    if mask is None or mask.size == 0 or not np.any(mask > 0):
+        return mask
+    try:
+        from scipy import ndimage
+        filled = ndimage.binary_fill_holes(mask > 0)
+        labeled, num_features = ndimage.label(filled)
+        if num_features > 1:
+            sizes = ndimage.sum(filled, labeled, range(1, num_features + 1))
+            max_size = float(np.max(sizes))
+            # Giữ lại vùng chính và các phần phụ gắn liền có diện tích >= 3% vùng lớn nhất
+            valid_labels = [i + 1 for i, s in enumerate(sizes) if s >= 0.03 * max_size]
+            refined = np.isin(labeled, valid_labels).astype(np.uint8)
+        else:
+            refined = filled.astype(np.uint8)
+        return refined
+    except Exception:
+        return mask
+
+
 def extract_alpha_masks(
     images: List[Union[Image.Image, np.ndarray]],
     device: str = "cpu",
     threshold: float = ALPHA_THRESHOLD,
 ) -> List[np.ndarray]:
     """
-    Trích xuất Alpha Mask nhị phân cho từng ảnh bằng RMBG-2.0.
-
-    Chạy tuần tự từng ảnh để tránh tràn VRAM.
-    KHÔNG xóa nền ảnh — chỉ xuất mask để P4 (TSDF Mesh) dùng cho Point Pruning.
-    Xem lý do chi tiết: docs/lythuyet.md (Mục 2.2)
-
-    Args:
-        images: Danh sách ảnh PIL.Image.Image hoặc np.ndarray (RGB, đã resize).
-        device: Thiết bị chạy model ('cpu' hoặc 'cuda').
-        threshold: Ngưỡng nhị phân hóa alpha matte (mặc định 0.5).
-
-    Returns:
-        Danh sách np.ndarray, mỗi mask có shape (H, W), dtype uint8, giá trị {0, 1}.
+    Trích xuất Alpha Mask nhị phân cho từng ảnh bằng RMBG-2.0 hoặc rembg.
+    Được tăng cường bộ lọc refine_alpha_mask bảo toàn trọn vẹn thân vật thể thế giới thật.
     """
     masks: List[np.ndarray] = []
     if not images:
@@ -443,12 +458,14 @@ def extract_alpha_masks(
         for img in pil_images:
             if img.mode in ("RGBA", "LA"):
                 alpha = np.array(img.split()[-1])
-                masks.append((alpha > int(threshold * 255)).astype(np.uint8))
+                raw_m = (alpha > int(threshold * 255)).astype(np.uint8)
             else:
                 arr = np.array(img.convert("RGB"))
                 is_white = (arr[:, :, 0] > 240) & (arr[:, :, 1] > 240) & (arr[:, :, 2] > 240)
-                masks.append((~is_white).astype(np.uint8))
+                raw_m = (~is_white).astype(np.uint8)
+            masks.append(refine_alpha_mask(raw_m))
         return masks
+
 
     try:
         import torch
@@ -479,7 +496,7 @@ def extract_alpha_masks(
                 rgba = rembg.remove(img)
                 alpha = np.array(rgba.split()[3])
                 mask = (alpha > int(threshold * 255)).astype(np.uint8)
-                masks.append(mask)
+                masks.append(refine_alpha_mask(mask))
             logger.info(f"  ✓ Đã trích xuất {len(masks)} Alpha Masks bằng rembg!")
             return masks
         except Exception as rembg_err:
@@ -501,7 +518,7 @@ def extract_alpha_masks(
                 rgba = rembg.remove(img)
                 alpha = np.array(rgba.split()[3])
                 mask = (alpha > int(threshold * 255)).astype(np.uint8)
-                masks.append(mask)
+                masks.append(refine_alpha_mask(mask))
             logger.info(f"  ✓ Đã trích xuất {len(masks)} Alpha Masks thành công bằng rembg!")
             return masks
         except Exception as rembg_err:
@@ -511,7 +528,7 @@ def extract_alpha_masks(
                 arr = np.array(img.convert("RGB"))
                 is_white = (arr[:, :, 0] > 240) & (arr[:, :, 1] > 240) & (arr[:, :, 2] > 240)
                 if 0.05 < is_white.mean() < 0.98:
-                    masks.append((~is_white).astype(np.uint8))
+                    masks.append(refine_alpha_mask((~is_white).astype(np.uint8)))
                 else:
                     masks.append(np.ones((h, w), dtype=np.uint8))
             return masks
@@ -552,7 +569,7 @@ def extract_alpha_masks(
             )[0, 0]
 
             mask_np = (pred_resized.cpu().numpy() > threshold).astype(np.uint8)
-            masks.append(mask_np)
+            masks.append(refine_alpha_mask(mask_np))
 
             del input_tensor, output, pred, pred_resized
             if device == "cuda" and torch.cuda.is_available():

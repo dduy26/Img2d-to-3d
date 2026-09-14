@@ -163,8 +163,9 @@ def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
             )
             pipeline_type = "depth_geometric"
         else:
-            if triposr_engine.model is not None:
-                logger.info("[Option 2] Chạy TripoSR từ ảnh đã preprocess...")
+            from engine_triposr import HAS_TRIPOSR
+            if HAS_TRIPOSR:
+                logger.info("[Option 2] Chạy TripoSR (360° Full Mesh) từ ảnh đã preprocess...")
                 success, model_path, exec_time = triposr_engine.run_from_preprocessed(
                     image_rgb=preprocess_result["image_centered"],
                     alpha_mask=preprocess_result["alpha_mask_centered"],
@@ -172,7 +173,12 @@ def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
                 )
                 pipeline_type = "triposr_preprocessed"
             else:
-                logger.info("[Option 2] TripoSR chưa nạp weights, tự động chuyển sang Depth-Anything-V2...")
+                success = False
+                model_path = None
+                exec_time = 0.0
+
+            if not success or model_path is None:
+                logger.info("[Option 2] Chuyển sang Depth-Anything-V2 Reconstruction Pipeline...")
                 success, model_path, exec_time = depth_engine.reconstruct(
                     image_rgb=preprocess_result["image_centered"],
                     alpha_mask=preprocess_result["alpha_mask_centered"],

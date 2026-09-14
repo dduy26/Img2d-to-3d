@@ -957,7 +957,11 @@ class TSDFMeshEngine:
                 dist_cam = 2.2
 
             # Ước lượng bán kính 3D vật thể từ 2D mask theo hình học pinhole: R_obj = r_pixel * D / f
-            fg_radius_px = 0.5 * max(coords[:, 0].max() - coords[:, 0].min(), coords[:, 1].max() - coords[:, 1].min())
+            # Chiều sâu mặt cắt ngang của vật thể tổng quát (bất kể chai lọ, cốc, giày dép, hộp, ghế...)
+            # theo phương nhìn vuông góc với trục xoay thẳng đứng (+Y Up)
+            bbox_h = float(coords[:, 0].max() - coords[:, 0].min())
+            bbox_w = float(coords[:, 1].max() - coords[:, 1].min())
+            fg_radius_px = 0.5 * bbox_w if bbox_h >= bbox_w else 0.5 * min(bbox_w, 1.2 * bbox_h)
             r_obj = float((fg_radius_px / fx) * dist_cam)
 
             # Chuẩn hóa độ sâu trong vùng foreground: d_norm in [0, 1]
