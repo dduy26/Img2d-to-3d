@@ -80,15 +80,22 @@ class TextureBlender:
         images_rgb: Sequence[np.ndarray],
         camera_poses: Sequence[object],
         focal_lengths: Sequence[Tuple[float, float]],
+        alpha_masks: Sequence[np.ndarray] | None = None,
     ) -> np.ndarray:
-        """Blend visible samples with the angle weight max(0, n dot v)^gamma."""
+        """Blend visible samples with the angle weight max(0, n dot v)^gamma.
+
+        alpha_masks: mask nền {0,1} của từng view. Có mask thì mẫu rơi vào NỀN bị BỎ hẳn
+        (không lấy màu nền bake lên vật). None -> giữ nguyên hành vi cũ.
+        """
         validate_multiview_inputs(images_rgb, camera_poses, focal_lengths)
         vertices = np.asarray(mesh.vertices, dtype=np.float32)
         normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
         accumulated = np.zeros((len(vertices), 3), dtype=np.float64)
         accumulated_weights = np.zeros(len(vertices), dtype=np.float64)
 
-        for image, pose, focal in zip(images_rgb, camera_poses, focal_lengths):
+        for view_index, (image, pose, focal) in enumerate(
+            zip(images_rgb, camera_poses, focal_lengths)
+        ):
             pixels, depth, in_image = project_vertices(vertices, pose, focal, image.shape)
             depth_buffer = rasterize_depth_buffer(
                 vertices, mesh.faces, pose, focal, image.shape
@@ -101,10 +108,15 @@ class TextureBlender:
             selected = visible & (cosine > 0.0)
             if not np.any(selected):
                 continue
-            view_weights = np.power(cosine[selected], self.gamma)
-            samples = sample_rgb_nearest(image, pixels[selected])
-            accumulated[selected] += samples * view_weights[:, None]
-            accumulated_weights[selected] += view_weights
+            mask = None if alpha_masks is None else alpha_masks[view_index]
+            samples = sample_rgb_nearest(image, pixels[selected], mask)
+            keep = np.isfinite(samples).all(axis=1)      # False = pixel nền
+            if not np.any(keep):
+                continue
+            index = np.flatnonzero(selected)[keep]       # chỉ số đỉnh gốc để cộng dồn
+            view_weights = np.power(cosine[index], self.gamma)
+            accumulated[index] += samples[keep] * view_weights[:, None]
+            accumulated_weights[index] += view_weights
 
         colors = np.zeros((len(vertices), 4), dtype=np.uint8)
         observed = accumulated_weights > 1e-8
@@ -188,8 +200,13 @@ class TextureBlender:
         images_rgb: Sequence[np.ndarray],
         camera_poses: Sequence[object],
         focal_lengths: Sequence[Tuple[float, float]],
+        alpha_masks: Sequence[np.ndarray] | None = None,
     ) -> Image.Image:
-        """Bake colors per UV texel from visible projected mesh triangles."""
+        """Bake colors per UV texel from visible projected mesh triangles.
+
+        alpha_masks: mask nền {0,1} mỗi view — texel chiếu trúng NỀN không lấy màu nền.
+        None -> giữ nguyên hành vi cũ.
+        """
         validate_multiview_inputs(images_rgb, camera_poses, focal_lengths)
         size = self.texture_size
         texture = np.full((size, size, 3), 180, dtype=np.uint8)
@@ -263,9 +280,15 @@ class TextureBlender:
                 selected &= cosine > 0
                 if not np.any(selected):
                     continue
-                weights = np.power(cosine[selected], self.gamma)
-                blended[selected] += sample_rgb_nearest(image, pixels[selected]) * weights[:, None]
-                blend_weights[selected] += weights
+                mask = None if alpha_masks is None else alpha_masks[view_index]
+                samples = sample_rgb_nearest(image, pixels[selected], mask)
+                keep = np.isfinite(samples).all(axis=1)     # False = pixel nền -> BỎ mẫu
+                if not np.any(keep):
+                    continue
+                index = np.flatnonzero(selected)[keep]
+                weights = np.power(cosine[index], self.gamma)
+                blended[index] += samples[keep] * weights[:, None]
+                blend_weights[index] += weights
             observed = blend_weights > 1e-8
             flat_colors = np.full((len(flat_points), 3), 180, dtype=np.uint8)
             flat_colors[observed] = np.clip(
@@ -291,6 +314,7 @@ class TextureBlender:
         camera_poses: Sequence[object],
         focal_lengths: Sequence[Tuple[float, float]],
         output_path: str,
+        alpha_masks: Sequence[np.ndarray] | None = None,
     ) -> Tuple[bool, str]:
         """Run P5: unwrap, blend, bake and export one binary GLB."""
         started = time.time()
@@ -298,10 +322,10 @@ class TextureBlender:
             validate_multiview_inputs(images_rgb, camera_poses, focal_lengths)
             unwrapped_mesh, uvs = self.unwrap_uv(mesh)
             vertex_colors = self.blend_colors_for_vertices(
-                unwrapped_mesh, images_rgb, camera_poses, focal_lengths
+                unwrapped_mesh, images_rgb, camera_poses, focal_lengths, alpha_masks
             )
             texture = self.bake_texture_from_views(
-                unwrapped_mesh, uvs, images_rgb, camera_poses, focal_lengths
+                unwrapped_mesh, uvs, images_rgb, camera_poses, focal_lengths, alpha_masks
             )
             unwrapped_mesh.visual = trimesh.visual.texture.TextureVisuals(
                 uv=uvs,

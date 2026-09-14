@@ -175,11 +175,19 @@ def validate_and_load_images(image_paths: List[Union[str, Path]]) -> List[Dict[s
 
         # Chuyển đổi an toàn sang RGB:
         # Nếu là RGBA hoặc LA: hòa trộn nền trắng để tránh viền đen khi khử alpha
+        alpha_source = None
         if img.mode in ("RGBA", "LA"):
+            # Kênh alpha CÓ SẴN = mask nền do chính nguồn dữ liệu cung cấp (ảnh render
+            # 3D nền trong suốt). Giữ lại để dùng THAY RMBG-2.0: chính xác hơn (model
+            # đoán) và không cần HF_TOKEN cho repo gated. Mất alpha ở bước này thì không
+            # cách nào lấy lại được -> mask trắng bị bake lên vật.
+            try:
+                alpha_source = img.getchannel("A")
+            except Exception:
+                alpha_source = img.split()[-1]
             try:
                 bg = Image.new("RGB", img.size, (255, 255, 255))
-                alpha_channel = img.split()[-1]
-                bg.paste(img.convert("RGB"), mask=alpha_channel)
+                bg.paste(img.convert("RGB"), mask=alpha_source)
                 img.close()
                 img = bg
             except Exception:
@@ -197,6 +205,7 @@ def validate_and_load_images(image_paths: List[Union[str, Path]]) -> List[Dict[s
 
         valid_images.append({
             "image": img,
+            "alpha": alpha_source,      # None nếu ảnh gốc không có kênh alpha
             "path": resolved_str,
             "filename": path.name,
             "original_size": (w_orig, h_orig),
@@ -616,6 +625,35 @@ def _match_histogram_single(source: np.ndarray, reference: np.ndarray) -> np.nda
 # HÀM 6: PREPROCESS MULTIVIEW (ĐÓNG GÓI TỔNG THỂ)
 # ============================================================================
 
+def masks_from_alpha(
+    alphas: List[Image.Image],
+    resized_images: List[Image.Image],
+    threshold: float = ALPHA_THRESHOLD,
+) -> List[np.ndarray]:
+    """Mask nhị phân {0,1} lấy từ kênh alpha CÓ SẴN của ảnh — không cần model.
+
+    VÌ SAO: ảnh render 3D (OmniObject3D, DX.GL Objaverse-1K, GSO renders...) thường để nền
+    TRONG SUỐT, tức nguồn dữ liệu đã cho sẵn mask đúng đến từng pixel. Đem nó đi hỏi
+    RMBG-2.0 (model đoán) vừa kém chính xác hơn vừa bắt buộc phải có HF_TOKEN vì repo gated;
+    thiếu token thì P1 trả mask TOÀN 1 -> nền bị coi là vật -> texture bạc màu.
+
+    Args:
+        alphas: Danh sách ảnh alpha ("L") cùng thứ tự với resized_images.
+        resized_images: Ảnh đã resize (dùng để biết kích thước đích).
+        threshold: Ngưỡng nhị phân hoá (0..1), khớp mặc định của extract_alpha_masks.
+
+    Returns:
+        List[np.ndarray] shape (H, W), dtype uint8, giá trị {0, 1}.
+    """
+    masks: List[np.ndarray] = []
+    cutoff = int(round(threshold * 255))
+    for alpha, image in zip(alphas, resized_images):
+        # NEAREST: mask nhị phân, nội suy sẽ tạo giá trị trung gian quanh viền vật
+        resized = alpha.convert("L").resize(image.size, Image.NEAREST)
+        masks.append((np.asarray(resized, dtype=np.uint8) >= cutoff).astype(np.uint8))
+    return masks
+
+
 def preprocess_multiview(
     image_paths: List[Union[str, Path]],
     target_size: int = DEFAULT_TARGET_SIZE,
@@ -676,8 +714,16 @@ def preprocess_multiview(
         images_rgb: List[np.ndarray] = [np.array(img) for img in resized_images]
 
         # --- Bước 4: Trích xuất Alpha Mask ---
-        logger.info("[4/5] Trích xuất Alpha Mask (RMBG-2.0)...")
-        alpha_masks = extract_alpha_masks(resized_images, device=device)
+        # Ưu tiên kênh alpha CÓ SẴN trong ảnh (nguồn dữ liệu render nền trong suốt đã cho
+        # mask đúng): chính xác hơn RMBG-2.0 và KHÔNG cần HF_TOKEN. Chỉ gọi RMBG khi ảnh
+        # không có alpha (ảnh chụp thật).
+        alphas = [item.get("alpha") for item in filtered]
+        if all(a is not None for a in alphas):
+            logger.info("[4/5] Ảnh có sẵn kênh alpha -> dùng luôn làm mask (bỏ qua RMBG-2.0, không cần HF_TOKEN)")
+            alpha_masks = masks_from_alpha(alphas, resized_images)
+        else:
+            logger.info("[4/5] Trích xuất Alpha Mask (RMBG-2.0)...")
+            alpha_masks = extract_alpha_masks(resized_images, device=device)
 
         # --- Bước 5: Cân bằng sáng ---
         logger.info("[5/5] Cân bằng sáng (Histogram Matching)...")
@@ -706,10 +752,12 @@ def preprocess_multiview(
     finally:
         # Luôn giải phóng tài nguyên ảnh PIL
         for item in loaded:
-            try:
-                item["image"].close()
-            except Exception:
-                pass
+            for key in ("image", "alpha"):
+                try:
+                    if item.get(key) is not None:
+                        item[key].close()
+                except Exception:
+                    pass
 
 
 def _normalize_for_dust3r(images: List[np.ndarray]) -> np.ndarray:

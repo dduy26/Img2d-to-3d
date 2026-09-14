@@ -94,6 +94,74 @@ logger.info("═══ TẤT CẢ ENGINE P1-P5 ĐÃ SẴN SÀNG ═══")
 
 
 # ============================================================================
+# P6: ĐO ĐỘ PHỦ GỐC CHỤP (bổ khuyết cho P3)
+# ============================================================================
+# VÌ SAO CẦN: P3 chỉ kiểm "đồ thị camera có LIÊN THÔNG không" — mà 5 camera đứng gần như
+# trên CÙNG một mặt phẳng vẫn liên thông hoàn hảo. Nên bộ ảnh chỉ chụp ngang, không ai
+# thấy mặt ĐÁY, vẫn cho quality_passed=true rồi ra mesh thiếu đáy và không dòng log nào
+# nói tại sao. Hàm này đo đúng câu hỏi đó: camera có BAO QUANH vật không.
+# Đặt ở tầng keo (P6) để không sửa file quality_gate.py của thành viên khác.
+def audit_view_coverage(
+    pointmaps_3d,
+    confidence_masks,
+    camera_poses,
+    conf_threshold: float = DEFAULT_CONF_THRESHOLD,
+    min_axis_cover: float = 0.6,
+) -> dict:
+    """Camera có BAO QUANH vật không? Trả dict có 'ok' + lý do tiếng Việt.
+
+    Cách đo (không phụ thuộc hệ toạ độ riêng của DUSt3R): lấy 3 TRỤC CHÍNH của vật bằng SVD
+    trên điểm quan sát được, rồi với mỗi trục tính `|cos|` lớn nhất giữa trục đó và hướng
+    camera. Trục nào cũng phải có camera nhìn "dọc theo trục" (>= 0.6 ~ 53°). Bộ ảnh đi một
+    VÒNG NGANG thì hướng vuông góc với vòng đó có `|cos|` ~ sin(độ nâng) -> bị bắt ngay.
+    Đây mới là câu hỏi P3 bỏ sót: đồ thị camera liên thông KHÔNG có nghĩa là có bao quanh.
+    """
+    pm = pointmaps_3d.cpu().numpy() if hasattr(pointmaps_3d, "cpu") else np.asarray(pointmaps_3d)
+    cf = confidence_masks.cpu().numpy() if hasattr(confidence_masks, "cpu") else np.asarray(confidence_masks)
+    pm = np.asarray(pm, dtype=np.float64).reshape(-1, 3)
+    cf = np.asarray(cf, dtype=np.float64).reshape(-1)
+    points = pm[cf >= conf_threshold]
+    if len(points) > 20000:                      # ponytail: lấy mẫu đều, đủ để tính trục
+        points = points[np.linspace(0, len(points) - 1, 20000).astype(int)]
+    if len(points) < 50:
+        return {"ok": False, "reason": f"quá ít điểm quan sát được ({len(points)})"}
+
+    center = points.mean(axis=0)
+    axes = np.linalg.svd(points - center, full_matrices=False)[2]   # trục dài nhất -> ngắn nhất
+
+    directions = []
+    for pose in camera_poses:
+        d = np.asarray(pose, dtype=np.float64)[:3, 3] - center
+        norm = np.linalg.norm(d)
+        directions.append(d / norm if norm > 1e-9 else d)
+    directions = np.asarray(directions)
+
+    cover = np.abs(directions @ axes.T).max(axis=0)      # |cos| tốt nhất theo từng trục
+    worst = int(np.argmin(cover))
+    worst_deg = float(np.degrees(np.arccos(np.clip(cover[worst], 0.0, 1.0))))
+    ok = bool(cover[worst] >= min_axis_cover)
+    reason = (
+        f"góc nhìn tốt nhất theo 3 trục vật: "
+        f"{np.round(np.degrees(np.arccos(np.clip(cover, 0, 1)))).astype(int).tolist()}°"
+    )
+    if not ok:
+        rank = ["dài nhất", "giữa", "ngắn nhất"][worst]
+        reason += (
+            f" — trục {rank} của vật không camera nào nhìn gần dọc theo (lệch {worst_deg:.0f}°)"
+            f" -> hướng đó của vật KHÔNG AI THẤY: mặt ở hai đầu trục đó sẽ hở/thiếu."
+            f" (Với vật đặt đứng: đó là MẶT ĐÁY.) Đây là giới hạn GÓC CHỤP, không phải lỗi P4."
+        )
+    return {
+        "ok": ok,
+        "reason": reason,
+        "axis_best_angles_deg": np.degrees(np.arccos(np.clip(cover, 0, 1))).round(1).tolist(),
+        "worst_axis": int(worst),
+        "worst_axis_angle_deg": round(worst_deg, 1),
+        "num_views": int(len(camera_poses)),
+    }
+
+
+# ============================================================================
 # API 0: Giao diện Web (P6) + Health check
 # ============================================================================
 @app.get("/", include_in_schema=False)
@@ -253,6 +321,19 @@ async def generate_3d(files: List[UploadFile] = File(...)):
         )
         logger.info(f"[P3] Kết quả: {'PASS ✓' if is_high_quality else 'FAIL ✗'} — {reason}")
 
+        # ── P6: đo ĐỘ PHỦ gốc chụp (P3 chỉ kiểm liên thông, không kiểm bao quanh) ──
+        try:
+            coverage = audit_view_coverage(pointmaps_3d, confidence_masks, camera_poses)
+        except Exception as e:
+            coverage = {"ok": None, "reason": f"không đo được ({type(e).__name__}: {e})"}
+        logger.info(f"[P3→P6] Độ phủ gốc chụp: {coverage['reason']}")
+        if coverage.get("ok") is False:
+            logger.warning(
+                "[P3→P6] Bộ ảnh KHÔNG bao quanh vật đủ -> phần bị thiếu là do GÓC CHỤP, "
+                "không phải lỗi P4/P5. Cần chụp thêm góc từ dưới/các hướng còn trống."
+                " Xem docs/dataset_va_do_phu_goc_chup.md"
+            )
+
         # ── Bước 4: Phân luồng theo kết quả Quality Gate ──
         if is_high_quality:
             # ✓ PASS: Chạy luồng NVIDIA P4 TSDF Mesh & P5 Texture Blender
@@ -272,6 +353,8 @@ async def generate_3d(files: List[UploadFile] = File(...)):
                 camera_poses=camera_poses,
                 focal_lengths=focal_lengths,
                 output_path=output_glb_path,
+                # Truyền mask: không có nó thì texel chiếu trúng NỀN lấy màu nền bake lên vật
+                alpha_masks=preprocess_result["alpha_masks"],
             )
             # Fallback an toàn nếu nướng texture gặp sự cố: xuất mesh thô trực tiếp
             if not success or not os.path.exists(output_glb_path):
@@ -307,7 +390,8 @@ async def generate_3d(files: List[UploadFile] = File(...)):
             "pipeline_type": pipeline_type,
             "dust3r_backend": dust3r_result.get("backend", "mock"),
             "quality_passed": is_high_quality,
-            "gate_reason": reason,
+            "gate_reason": f"{reason} | Độ phủ gốc chụp: {coverage['reason']}",
+            "view_coverage": coverage,
             "num_input_images": preprocess_result["num_images"],
             "execution_time_seconds": round(total_time, 2),
             "output_file": model_path,

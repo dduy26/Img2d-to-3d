@@ -189,12 +189,24 @@ def visible_projected_points(
     return visible
 
 
-def sample_rgb_nearest(image: np.ndarray, pixels: np.ndarray) -> np.ndarray:
-    """Sample RGB values at projected pixels using nearest-neighbor lookup."""
+def sample_rgb_nearest(
+    image: np.ndarray,
+    pixels: np.ndarray,
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Sample RGB values at projected pixels using nearest-neighbor lookup.
+
+    `mask` (nền/vật, {0,1} hoặc {0..255}) là tuỳ chọn: pixel rơi vào NỀN trả về NaN để
+    nơi gọi BỎ mẫu đó. Vì sao cần: không có mask thì điểm mesh nào chiếu trúng nền cũng
+    lấy màu nền bake lên vật (nền trắng -> texture bạc màu).
+    """
     height, width = image.shape[:2]
     x = np.clip(np.rint(pixels[:, 0]).astype(np.int32), 0, width - 1)
     y = np.clip(np.rint(pixels[:, 1]).astype(np.int32), 0, height - 1)
-    return image[y, x].astype(np.float64)
+    colors = image[y, x].astype(np.float64)
+    if mask is not None:
+        colors[np.asarray(mask)[y, x] == 0] = np.nan
+    return colors
 
 
 def export_glb(mesh: trimesh.Trimesh, output_path: str | os.PathLike[str]) -> str:
@@ -205,3 +217,17 @@ def export_glb(mesh: trimesh.Trimesh, output_path: str | os.PathLike[str]) -> st
     if not path.is_file() or path.stat().st_size == 0:
         raise IOError(f"GLB export did not create a file: {path}")
     return str(path)
+
+
+if __name__ == "__main__":
+    # Tự kiểm (không cần model, không cần mạng): mask phải chặn ĐÚNG pixel nền.
+    image = np.full((4, 4, 3), 200, dtype=np.uint8)
+    image[1, 1] = (0, 0, 0)                       # 1 pixel nền (đen)
+    mask = np.ones((4, 4), dtype=np.uint8)
+    mask[1, 1] = 0
+    pixels = np.array([[1.0, 1.0], [2.0, 2.0]])   # [nền, vật]
+
+    assert np.isnan(sample_rgb_nearest(image, pixels, mask)[0]).all(), "pixel nền phải bị loại"
+    assert np.isfinite(sample_rgb_nearest(image, pixels, mask)[1]).all(), "pixel vật phải giữ"
+    assert np.isfinite(sample_rgb_nearest(image, pixels)[0]).all(), "không truyền mask -> giữ nguyên"
+    print("✅ utils_3d: sample_rgb_nearest lọc nền theo mask OK")
