@@ -24,6 +24,7 @@ from typing import List, Tuple, Optional, Dict, Any, Union
 
 import numpy as np
 from scipy import ndimage
+from scipy.spatial import cKDTree
 import trimesh
 
 try:
@@ -626,49 +627,108 @@ class TSDFMeshEngine:
             tau_edge=self.tau_edge,
         )
 
-        all_valid_pts = np.concatenate([p for p in filtered_points if len(p) > 0], axis=0)
-        if len(all_valid_pts) < 50:
-            logger.warning("[P4] Số điểm hợp lệ qua bộ lọc biên ít, dùng trực tiếp điểm trong alpha mask...")
-            all_valid_pts = np.concatenate([
-                pointmaps_3d[i][(alpha_masks[i] > 0.5) & np.isfinite(pointmaps_3d[i]).all(axis=-1)]
-                for i in range(n_views)
-            ], axis=0)
+        all_pts_list = []
+        all_normals_list = []
+        for i in range(n_views):
+            v_mask = valid_masks[i]
+            pts_v = pointmaps_3d[i][v_mask]
+            if len(pts_v) > 0:
+                c_pos = np.asarray(camera_poses[i], dtype=np.float32)[:3, 3]
+                v_dir = c_pos - pts_v
+                v_dir /= np.maximum(np.linalg.norm(v_dir, axis=-1, keepdims=True), 1e-6)
+                all_pts_list.append(pts_v)
+                all_normals_list.append(v_dir)
+
+        if len(all_pts_list) > 0 and sum(len(p) for p in all_pts_list) >= 50:
+            all_valid_pts = np.concatenate(all_pts_list, axis=0)
+            all_normals = np.concatenate(all_normals_list, axis=0)
+        else:
+            logger.warning("[P4] Dùng trực tiếp điểm trong alpha mask...")
+            all_pts_list = []
+            all_normals_list = []
+            for i in range(n_views):
+                mask = (alpha_masks[i] > 0.5) & np.isfinite(pointmaps_3d[i]).all(axis=-1)
+                pts_v = pointmaps_3d[i][mask]
+                if len(pts_v) > 0:
+                    c_pos = np.asarray(camera_poses[i], dtype=np.float32)[:3, 3]
+                    v_dir = c_pos - pts_v
+                    v_dir /= np.maximum(np.linalg.norm(v_dir, axis=-1, keepdims=True), 1e-6)
+                    all_pts_list.append(pts_v)
+                    all_normals_list.append(v_dir)
+            all_valid_pts = np.concatenate(all_pts_list, axis=0) if all_pts_list else np.empty((0, 3), dtype=np.float32)
+            all_normals = np.concatenate(all_normals_list, axis=0) if all_normals_list else np.empty((0, 3), dtype=np.float32)
 
         if len(all_valid_pts) < 10:
             raise ValueError(f"Số lượng điểm 3D hợp lệ quá ít ({len(all_valid_pts)} điểm) không đủ để dựng lưới.")
 
+        logger.info(f"[P4] Tích lũy TSDF trường khoảng cách từ {len(all_valid_pts)} điểm bề mặt định hướng...")
+
         # ── Bước 2: Khởi tạo thể tích TSDF theo Bounding Box ──
         p_min = np.percentile(all_valid_pts, 0.5, axis=0)
         p_max = np.percentile(all_valid_pts, 99.5, axis=0)
-
-        # Thêm padding 25% vào bounding box để bao trọn vật thể
         center = (p_min + p_max) / 2.0
-        extent = (p_max - p_min) * 1.25
+        extent = (p_max - p_min) * 1.3
         bounds_min = center - extent / 2.0
         bounds_max = center + extent / 2.0
+        voxel_size = float(extent.max()) / float(self.resolution)
 
-        tsdf_vol = TSDFVolume(
-            bounds_min=bounds_min,
-            bounds_max=bounds_max,
-            resolution=self.resolution,
-        )
+        xs = np.linspace(bounds_min[0], bounds_max[0], self.resolution, endpoint=False, dtype=np.float32) + voxel_size / 2.0
+        ys = np.linspace(bounds_min[1], bounds_max[1], self.resolution, endpoint=False, dtype=np.float32) + voxel_size / 2.0
+        zs = np.linspace(bounds_min[2], bounds_max[2], self.resolution, endpoint=False, dtype=np.float32) + voxel_size / 2.0
+        gx, gy, gz = np.meshgrid(xs, ys, zs, indexing='ij')
+        grid_pts = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3)
 
-        # ── Bước 3: Tích lũy đa góc nhìn vào Voxel Grid (True Space Carving) ──
-        for i in range(n_views):
-            logger.info(f"[P4] Tích lũy TSDF góc nhìn #{i+1}/{n_views}...")
-            tsdf_vol.integrate(
-                pointmap=pointmaps_3d[i],
-                valid_mask=valid_masks[i],
-                alpha_mask=alpha_masks[i],
-                conf_map=confidence_masks[i],
-                camera_pose=camera_poses[i],
-                focal_length=focal_lengths[i],
-            )
+        # ── Bước 3: Tính toán Signed Distance Field từ các tia nhìn thực tế ──
+        tree = cKDTree(all_valid_pts)
+        k_neighbors = min(5, len(all_valid_pts))
+        dists, idxs = tree.query(grid_pts, k=k_neighbors)
+        if k_neighbors == 1:
+            diff = grid_pts - all_valid_pts[idxs]
+            dot = np.sum(diff * all_normals[idxs], axis=-1)
+            signed_dot = dot
+            dists_nearest = dists
+        else:
+            diff = grid_pts[:, None, :] - all_valid_pts[idxs]
+            dot = np.sum(diff * all_normals[idxs], axis=-1)
+            weights = 1.0 / np.maximum(dists, 1e-4)
+            weights /= np.sum(weights, axis=-1, keepdims=True)
+            signed_dot = np.sum(dot * weights, axis=-1)
+            dists_nearest = dists[:, 0]
+
+        sdf = dists_nearest * np.sign(signed_dot)
+        far_outside = (dists_nearest > 3.0 * voxel_size) & (signed_dot > 0)
+        sdf[far_outside] = 1.0
+
+        sdf_grid = sdf.reshape(self.resolution, self.resolution, self.resolution).astype(np.float32)
+
+        # Đệm biên 1-voxel quanh 6 mặt ngoài bằng +1.0 (không khí) để Marching Cubes luôn đóng kín nước
+        sdf_grid[0, :, :] = 1.0; sdf_grid[-1, :, :] = 1.0
+        sdf_grid[:, 0, :] = 1.0; sdf_grid[:, -1, :] = 1.0
+        sdf_grid[:, :, 0] = 1.0; sdf_grid[:, :, -1] = 1.0
 
         # ── Bước 4: Trích xuất Iso-surface Marching Cubes ──
         logger.info("[P4] Trích xuất bề mặt Marching Cubes kín nước...")
         try:
-            mesh = extract_mesh_marching_cubes(tsdf_vol)
+            verts, faces, normals_mc, _ = measure.marching_cubes(
+                volume=sdf_grid,
+                level=0.0,
+                spacing=(voxel_size, voxel_size, voxel_size),
+                allow_degenerate=False,
+            )
+            verts_world = verts + bounds_min
+            mesh = trimesh.Trimesh(vertices=verts_world, faces=faces, vertex_normals=normals_mc, process=True)
+            mesh.merge_vertices()
+            mesh.update_faces(mesh.nondegenerate_faces())
+            mesh.update_faces(mesh.unique_faces())
+            try:
+                trimesh.repair.fix_normals(mesh)
+                trimesh.repair.fix_winding(mesh)
+                trimesh.repair.fill_holes(mesh)
+            except Exception:
+                pass
+            components = mesh.split(only_watertight=False)
+            if components and len(components) > 1:
+                mesh = max(components, key=lambda m: len(m.vertices))
         except Exception as mc_err:
             logger.warning(f"[P4] Marching Cubes gặp sự cố ({mc_err}), kích hoạt Convex Hull Fallback...")
             mesh = trimesh.convex.convex_hull(all_valid_pts)

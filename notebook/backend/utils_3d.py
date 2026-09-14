@@ -198,10 +198,29 @@ def sample_rgb_nearest(image: np.ndarray, pixels: np.ndarray) -> np.ndarray:
 
 
 def export_glb(mesh: trimesh.Trimesh, output_path: str | os.PathLike[str]) -> str:
-    """Export one binary GLB and verify that the file exists."""
+    """Export one binary GLB and verify that the file exists.
+    
+    Transforms vertices from OpenCV/DUSt3R convention (+X Right, +Y Down, +Z In)
+    to GLTF/Three.js standard (+X Right, +Y Up, +Z Out) via 180° rotation around X.
+    Aligns bottom of object to floor plane (Y=0) and centers horizontally.
+    """
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    mesh.export(str(path), file_type="glb")
+
+    out_mesh = mesh.copy()
+    if len(out_mesh.vertices) > 0:
+        # Xoay 180 độ quanh trục X để sửa lỗi lộn ngược (+Y Down -> +Y Up)
+        R_opencv_to_gltf = np.diag([1.0, -1.0, -1.0])
+        out_mesh.vertices = out_mesh.vertices @ R_opencv_to_gltf.T
+
+        # Đặt đáy vật thể tiếp xúc mặt sàn Y = 0
+        out_mesh.vertices[:, 1] -= out_mesh.vertices[:, 1].min()
+
+        # Căn giữa theo trục X và Z
+        out_mesh.vertices[:, 0] -= (out_mesh.vertices[:, 0].max() + out_mesh.vertices[:, 0].min()) / 2.0
+        out_mesh.vertices[:, 2] -= (out_mesh.vertices[:, 2].max() + out_mesh.vertices[:, 2].min()) / 2.0
+
+    out_mesh.export(str(path), file_type="glb")
     if not path.is_file() or path.stat().st_size == 0:
         raise IOError(f"GLB export did not create a file: {path}")
     return str(path)

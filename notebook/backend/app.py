@@ -305,7 +305,8 @@ def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
         )
         if not success or not os.path.exists(output_glb_path):
             logger.warning("[P5] Nướng texture gặp sự cố, xuất mesh màu đỉnh 360° trực tiếp của P4.")
-            mesh.export(output_glb_path, file_type="glb")
+            from utils_3d import export_glb
+            export_glb(mesh, output_glb_path)
             success = os.path.exists(output_glb_path)
             model_path = output_glb_path
 
