@@ -27,7 +27,6 @@ except ImportError:
 
 # Import các module trong pipeline
 from preprocess import preprocess_multiview, preprocess_single_view
-from engine_dust3r import DUSt3REngine, DUST3R_IMPORT_ERROR, HAS_DUST3R
 from quality_gate import QualityGate
 from engine_triposr import TripoSREngine
 from engine_tsdf_mesh import TSDFMeshEngine, generate_camera_poses, DEFAULT_CONF_THRESHOLD
@@ -76,13 +75,8 @@ triposr_engine = TripoSREngine()
 # ── Nút vặn chất lượng (đặt qua biến môi trường, không cần sửa code) ──
 # TSDF_RES: số voxel mỗi cạnh của lưới TSDF. Cao hơn = chi tiết hơn, chậm + tốn RAM hơn.
 #   128 -> ~16MB/grid (mặc định) | 192 -> ~57MB | 256 -> ~134MB
-# DUST3R_NITER: số vòng global alignment. Cao hơn = khớp camera chặt hơn, chậm hơn.
 TSDF_RES = int(os.environ.get("TSDF_RES", "128"))
-DUST3R_NITER = int(os.environ.get("DUST3R_NITER", "300"))
-logger.info(f"Cấu hình: TSDF_RES={TSDF_RES}, DUST3R_NITER={DUST3R_NITER}")
-
-# P2: DUSt3R Engine (Tùy chọn phụ trợ)
-dust3r_engine = DUSt3REngine(device=device, niter=DUST3R_NITER)
+logger.info(f"Cấu hình: TSDF_RES={TSDF_RES}")
 
 # P4: TSDF Volumetric Mesh Engine (NVIDIA reference TSDF + Marching Cubes)
 tsdf_engine = TSDFMeshEngine(resolution=TSDF_RES)
@@ -116,10 +110,9 @@ async def health():
         "frontend": os.path.exists(FRONTEND_INDEX),
         "engines": {
             "triposr": triposr_engine.model is not None,
-            "dust3r": dust3r_engine.model is not None,
-            "has_dust3r": HAS_DUST3R,
-            "dust3r_import_error": str(DUST3R_IMPORT_ERROR) if DUST3R_IMPORT_ERROR else None,
             "depth": depth_engine.depth_model is not None,
+            "tsdf": True,
+            "texture_blender": True,
         },
     }
 
@@ -134,8 +127,8 @@ JOBS = {}
 def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
     """
     Thực thi chuỗi xử lý tái tạo 3D hoàn chỉnh 100% không mock:
-    - 1 ảnh: Tiền xử lý đơn ảnh F1.2A -> TripoSR (fast) hoặc Depth-Anything-V2 (geometric)
-    - >=2 ảnh: Tiền xử lý đa ảnh -> DUSt3R thật -> Quality Gate -> TSDF Mesh 360° -> XAtlas Texture Blender.
+    - 1 ảnh: Tiền xử lý đơn ảnh -> Depth-Anything-V2 / TripoSR
+    - >=2 ảnh: Tiền xử lý đa ảnh -> Depth-Anything-V2 + DA3-blender -> TSDF Mesh 360° -> XAtlas Texture Blender.
       Kèm cơ chế cứu hộ Fail-safe theo đúng đặc tả plan (docs/require.md).
     """
     pipeline_start = time.time()
@@ -221,33 +214,42 @@ def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
         f"tensor shape: {preprocess_result['images_normalized'].shape}"
     )
 
-    # Nếu người dùng chỉ định rõ mode == "dust3r", chạy qua DUSt3R
-    if mode == "dust3r":
-        logger.info("[P2] Chạy chế độ DUSt3R pairwise matching + global alignment...")
-        if dust3r_engine.model is None:
-            dust3r_engine.load_model()
-        if HAS_TORCH:
-            images_tensor = torch.from_numpy(preprocess_result["images_normalized"]).to(device)
-        else:
-            images_tensor = preprocess_result["images_normalized"]
+    # ── LUỒNG CHUẨN: NVIDIA + Depth-Anything-V2 + DA3-blender ──
+    logger.info("[P2] Dự đoán bản đồ độ sâu đa góc bằng Depth-Anything-V2 + DA3-blender filter...")
+    da_result = depth_engine.predict_multiview_depth(
+        images_rgb=preprocess_result["images_rgb"],
+        alpha_masks=preprocess_result["alpha_masks"],
+    )
+    depth_maps = da_result["depth_maps"]
 
-        dust3r_result = dust3r_engine.process({
-            "images_dust3r": images_tensor,
-            "image_paths": preprocess_result.get("image_paths", saved_paths),
-        })
+    # Thiết lập camera trajectory quanh vật thể
+    camera_poses = generate_camera_poses(
+        n_views=len(saved_paths),
+        radius=2.2,
+        elevation_deg=15.0,
+        view_names=saved_paths,
+    )
+    focal_lengths = preprocess_result.get("focal_lengths")
+    if focal_lengths is None or len(focal_lengths) != len(saved_paths):
+        focal_lengths = [(550.0, 550.0)] * len(saved_paths)
 
-        pointmaps_3d = dust3r_result["pointmaps_3d"]
-        confidence_masks = dust3r_result["confidence_masks"]
-        camera_poses = dust3r_result["camera_poses"]
-        focal_lengths = dust3r_result["focal_lengths"]
+    # ── Bước 3 (P3): Quality Gate ──
+    logger.info("[P3] Kiểm tra tính hợp lệ của dữ liệu đầu vào...")
+    is_high_quality = len(depth_maps) >= 2 and all(d is not None for d in depth_maps)
+    reason = "Depth maps và camera trajectory hợp lệ theo chuẩn NVIDIA"
 
-        mesh = tsdf_engine.reconstruct(
-            pointmaps_3d=pointmaps_3d,
+    # ── Bước 4 (P4): Tái tạo lưới 3D bằng NVIDIA TSDF Volume & Marching Cubes ──
+    logger.info(f"[P4] Bắt đầu tích lũy thể tích NVIDIA TSDF 360° cho {len(depth_maps)} góc nhìn...")
+    try:
+        mesh = tsdf_engine.reconstruct_from_depth_maps(
+            depth_maps=depth_maps,
             alpha_masks=preprocess_result["alpha_masks"],
-            confidence_masks=confidence_masks,
             camera_poses=camera_poses,
             focal_lengths=focal_lengths,
+            view_names=saved_paths,
         )
+
+        logger.info(f"[P5] Trải UV & Nướng màu từ toàn bộ {len(preprocess_result['images_rgb'])} ảnh vào Mesh 360°...")
         success, model_path = texture_blender.process_and_export(
             mesh=mesh,
             images_rgb=preprocess_result["images_rgb"],
@@ -255,71 +257,22 @@ def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
             focal_lengths=focal_lengths,
             output_path=output_glb_path,
         )
-        pipeline_type = "dust3r_pairwise_multiview"
-        backend_name = "dust3r-real"
-        is_high_quality = True
-        reason = "DUSt3R pairwise matching hoàn tất"
+        if not success or not os.path.exists(output_glb_path):
+            logger.warning("[P5] Nướng texture gặp sự cố, xuất mesh màu đỉnh 360° trực tiếp của P4.")
+            from utils_3d import export_glb
+            export_glb(mesh, output_glb_path)
+            success = os.path.exists(output_glb_path)
+            model_path = output_glb_path
 
-    else:
-        # ── LUỒNG CHUẨN: NVIDIA + Depth-Anything-V2 + DA3-blender ──
-        logger.info("[P2] Dự đoán bản đồ độ sâu đa góc bằng Depth-Anything-V2 + DA3-blender filter...")
-        da_result = depth_engine.predict_multiview_depth(
-            images_rgb=preprocess_result["images_rgb"],
-            alpha_masks=preprocess_result["alpha_masks"],
+        pipeline_type = "nvidia_depth_anything_tsdf"
+        backend_name = "nvidia_depth_anything_tsdf"
+
+    except Exception as mv_err:
+        logger.error(f"[LỖI TÁI TẠO ĐA ẢNH NVIDIA TSDF]: {mv_err}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Lỗi tái tạo 3D đa ảnh tại khối P4/P5: {mv_err}. Vui lòng kiểm tra log server!"
         )
-        depth_maps = da_result["depth_maps"]
-
-        # Thiết lập camera trajectory quanh vật thể
-        camera_poses = generate_camera_poses(
-            n_views=len(saved_paths),
-            radius=2.2,
-            elevation_deg=15.0,
-            view_names=saved_paths,
-        )
-        focal_lengths = preprocess_result.get("focal_lengths")
-        if focal_lengths is None or len(focal_lengths) != len(saved_paths):
-            focal_lengths = [(550.0, 550.0)] * len(saved_paths)
-
-        # ── Bước 3 (P3): Quality Gate ──
-        logger.info("[P3] Kiểm tra tính hợp lệ của dữ liệu đầu vào...")
-        is_high_quality = len(depth_maps) >= 2 and all(d is not None for d in depth_maps)
-        reason = "Depth maps và camera trajectory hợp lệ theo chuẩn NVIDIA"
-
-        # ── Bước 4 (P4): Tái tạo lưới 3D bằng NVIDIA TSDF Volume & Marching Cubes ──
-        logger.info(f"[P4] Bắt đầu tích lũy thể tích NVIDIA TSDF 360° cho {len(depth_maps)} góc nhìn...")
-        try:
-            mesh = tsdf_engine.reconstruct_from_depth_maps(
-                depth_maps=depth_maps,
-                alpha_masks=preprocess_result["alpha_masks"],
-                camera_poses=camera_poses,
-                focal_lengths=focal_lengths,
-                view_names=saved_paths,
-            )
-
-            logger.info(f"[P5] Trải UV & Nướng màu từ toàn bộ {len(preprocess_result['images_rgb'])} ảnh vào Mesh 360°...")
-            success, model_path = texture_blender.process_and_export(
-                mesh=mesh,
-                images_rgb=preprocess_result["images_rgb"],
-                camera_poses=camera_poses,
-                focal_lengths=focal_lengths,
-                output_path=output_glb_path,
-            )
-            if not success or not os.path.exists(output_glb_path):
-                logger.warning("[P5] Nướng texture gặp sự cố, xuất mesh màu đỉnh 360° trực tiếp của P4.")
-                from utils_3d import export_glb
-                export_glb(mesh, output_glb_path)
-                success = os.path.exists(output_glb_path)
-                model_path = output_glb_path
-
-            pipeline_type = "nvidia_depth_anything_tsdf"
-            backend_name = "nvidia_depth_anything_tsdf"
-
-        except Exception as mv_err:
-            logger.error(f"[LỖI TÁI TẠO ĐA ẢNH NVIDIA TSDF]: {mv_err}", exc_info=True)
-            raise HTTPException(
-                status_code=500,
-                detail=f"Lỗi tái tạo 3D đa ảnh tại khối P4/P5: {mv_err}. Vui lòng kiểm tra log server!"
-            )
 
     total_time = time.time() - pipeline_start
 

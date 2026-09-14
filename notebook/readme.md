@@ -18,7 +18,6 @@ Img2d-to-3d/
         ├── tsr/          # Thư mục mã nguồn lõi của TripoSR
         ├── app.py        # Máy chủ FastAPI (API Điều phối)
         ├── quality_gate.py
-        ├── engine_dust3r.py
         ├── engine_tsdf_mesh.py
         ├── texture_blender.py
         └── engine_depth.py
