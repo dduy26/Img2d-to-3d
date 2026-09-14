@@ -572,14 +572,16 @@ def log_mesh_health(mesh: trimesh.Trimesh, label: str = "mesh") -> dict:
             f"[KIỂM HÌNH HỌC] {label} HỞ: {health['boundary_edges']} cạnh biên -> có vùng "
             f"không camera nào quan sát. Cần chụp thêm góc (nhất là mặt dưới)."
         )
+    # ĐỘ ĐẶC KHÔNG PHẢI BẰNG CHỨNG. Vật thưa/mỏng (drone, khung, cây) đặc ~13% là BÌNH THƯỜNG,
+    # còn bề mặt bị gấp/dán (lỗi thật) cũng đo được ~11% — hai ca TRÙNG NHAU, không tách được
+    # bằng con số này. Nên chỉ nêu số, không kết luận; muốn kết luận thì so bề rộng mesh với
+    # bề rộng điểm đưa vào (engine in ở dòng "[P4] Kích thước: ... -> mesh ... | hao ...").
     if health["watertight"] and 0.0 < health["solidity_pct"] < 30.0:
-        logger.warning(
-            f"[KIỂM HÌNH HỌC] {label} KÍN nhưng KHÔNG ĐẶC: chỉ chiếm "
-            f"{health['solidity_pct']:.0f}% vỏ bao lồi (khối đặc ~100%) -> bề mặt bị GẤP/"
-            f"DÁN vào chính nó, vật sẽ trông như bị nhân đôi. Nguyên nhân thường gặp: các "
-            f"camera gần như cùng một hướng (một vòng ngang) nên mặt trước và mặt sau bị "
-            f"TSDF trộn vào nhau. Kiểm dòng [P3→P6] Độ phủ gốc chụp — cần TẢN GÓC, không "
-            f"phải thêm ảnh cùng hướng."
+        logger.info(
+            f"[KIỂM HÌNH HỌC] {label} KÍN nhưng độ đặc chỉ {health['solidity_pct']:.0f}% vỏ bao "
+            f"lồi. Có thể là BÌNH THƯỜNG (vật thưa/mỏng, nhiều khoảng không) hoặc là bề mặt bị "
+            f"GẤP/DÁN vào chính nó. Số này một mình không phân biệt được — xem dòng \"[P4] "
+            f"Kích thước: ... hao ...\" và dòng \"[P3→P6] Độ phủ gốc chụp\" để biết."
         )
     return health
 
@@ -746,6 +748,29 @@ class TSDFMeshEngine:
         # ── Bước 4: Trích xuất Iso-surface Marching Cubes ──
         logger.info("[P4] Trích xuất bề mặt Marching Cubes...")
         mesh = extract_mesh_marching_cubes(tsdf_vol)
+
+        # ĐO NGAY TẠI ĐÂY: mesh có giữ được kích thước của CHÍNH điểm đưa vào không?
+        # Đây mới là phép kiểm quyết định. `watertight=True` và "độ đặc" đều KHÔNG nói được
+        # điều này: đo trên 1 drone thật (196 góc, depth+pose ground truth), TSDF 128^3 cho
+        # tỉ lệ trục [1.0, 0.58, 0.50] trong khi điểm đưa vào là [1.0, 0.89, 0.73] -> hao 28%
+        # một chiều; nâng lên 192^3 -> [1.0, 0.865, 0.82]. Làm mượt Taubin KHÔNG gây ra
+        # (số đỉnh y hệt ở mọi mức làm mượt). Vật càng MỎNG/THƯA (drone, cánh, chân ghế) càng
+        # cần res cao, vì chi tiết phải dày hơn vài lần voxel mới tồn tại được.
+        point_extent = p_max - p_min
+        mesh_extent = np.asarray(mesh.extents, dtype=np.float64)
+        loss_pct = 100.0 * (point_extent - mesh_extent) / np.maximum(point_extent, 1e-12)
+        logger.info(
+            f"[P4] Kích thước: điểm vào {np.round(point_extent, 4).tolist()} -> mesh "
+            f"{np.round(mesh_extent, 4).tolist()} | hao {np.round(loss_pct, 1).tolist()} %"
+            f" | voxel={tsdf_vol.voxel_size:.4f} m"
+        )
+        if float(loss_pct.max()) > 20.0:
+            logger.warning(
+                f"[P4] MESH HAO {loss_pct.max():.0f}% theo một chiều so với điểm đưa vào "
+                f"(voxel={tsdf_vol.voxel_size:.4f} m): chi tiết mỏng hơn vài lần voxel bị ăn "
+                f"mất. Tăng TSDF_RES (128 -> 192/256) hoặc giảm TSDF_TRUNC_FRAC. Đây KHÔNG "
+                f"phải lỗi của P2."
+            )
 
         # ── Bước 5: Làm mượt Taubin (giảm sần do nhiễu DUSt3R, KHÔNG co khối) ──
         if self.smooth_iterations > 0:

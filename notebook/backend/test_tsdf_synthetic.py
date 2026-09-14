@@ -205,6 +205,22 @@ def main() -> int:
     else:
         print(f"✅ KỊCH BẢN A: kích thước đúng (lệch tối đa {ext_a.max():.1f}%)")
 
+    # HẠO KÍCH THƯỚC so với CHÍNH điểm đưa vào — chỉ số engine in ở dòng "[P4] Kích thước:".
+    # PHẢI dùng đúng cách đo của P4: lọc nền TRƯỚC, rồi percentile 1-99. Lấy min/max thô của
+    # điểm chưa lọc thì một điểm ngoại lai làm bề rộng phình ra -> phép kiểm báo sai (đã dính).
+    _, filt_a = prune_background_points(
+        pointmaps_3d=pm, alpha_masks=al, confidence_masks=cf, tau_conf=0.35, tau_edge=0.07,
+    )
+    pts_a = np.concatenate([p for p in filt_a if len(p) > 0], axis=0)
+    span_a = np.percentile(pts_a, 99.0, axis=0) - np.percentile(pts_a, 1.0, axis=0)
+    loss_a = 100.0 * (span_a - mesh_a.extents) / span_a
+    if loss_a.max() > 35.0:
+        print(f"❌ KỊCH BẢN A: mesh hao {loss_a.max():.0f}% một chiều so với điểm đưa vào "
+              f"(khối đặc phủ đủ góc thì không được hao quá 35%)")
+        ok = False
+    else:
+        print(f"✅ KỊCH BẢN A: mesh giữ kích thước điểm vào (hao tối đa {loss_a.max():.0f}%)")
+
     if ha["boundary_edges"] != 0 or not ha["watertight"]:
         print("❌ KỊCH BẢN A: mesh phải KÍN khi đã phủ đủ mọi hướng")
         ok = False

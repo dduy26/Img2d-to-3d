@@ -49,8 +49,12 @@ VIT_PATCH_SIZE: int = 16
 # Giới hạn số lượng ảnh đa góc nhìn
 MIN_MULTIVIEW_IMAGES: int = 2
 OPTIMAL_MIN_IMAGES: int = 4
-MAX_MULTIVIEW_IMAGES: int = 8
-TARGET_SUBSAMPLE_COUNT: int = 6
+# MAX/TARGET vặn được từ ngoài vì trần 8 là để TIẾT KIỆM, không phải vì dữ liệu:
+#   DUSt3R chạy N(N-1)/2 cặp ảnh (8 -> 28 cặp, 16 -> 120, 24 -> 276).
+# Và nạp > MAX thì bị CẮT XUỐNG TARGET (12 ảnh -> còn 6) — tức nạp nhiều hơn lại ra KÉM hơn.
+# Muốn cho K ảnh đã chọn kỹ đi qua nguyên vẹn thì đặt PREPROC_MAX_IMAGES = K.
+MAX_MULTIVIEW_IMAGES: int = int(os.environ.get("PREPROC_MAX_IMAGES", "8"))
+TARGET_SUBSAMPLE_COUNT: int = int(os.environ.get("PREPROC_TARGET_COUNT", "6"))
 
 # Ngưỡng nhị phân hóa Alpha Mask
 ALPHA_THRESHOLD: float = 0.5

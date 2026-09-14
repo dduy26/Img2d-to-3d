@@ -54,4 +54,16 @@ notebook/backend/tsr/
 temp_uploads/
 outputs/
 notebook/backend/temp_uploads/
-notebook/backend/outputs/
+notebook/backend/outputs/
+
+# ============================================================================
+# Dữ liệu tải về của riêng từng máy — KHÔNG push (nặng, và mỗi người tải bản khác)
+#   data/01/     : 1 bộ DX.GL Objaverse-1K vừa giải nén (196 ảnh 1024x1024 + mask
+#                  + depth + poses) = ~121 MB
+#   data/images/ : bản sao rời 196 ảnh đó = ~28 MB
+#   data/objaverse/ : ảnh do notebook Cell 2 sinh ra (cũng tự tải lại được)
+# Muốn đưa vào repo thì nén lại rồi upload lên HF/Drive, đừng commit thẳng.
+# ============================================================================
+data/01/
+data/images/
+data/objaverse/
