@@ -32,10 +32,9 @@ Thumbs.db
 # Node
 node_modules/
 
-# Thư mục Input & Output duy nhất (track sample images và .gitkeep)
+# Thư mục Input & Output duy nhất (chỉ track .gitkeep)
 input/*
 !input/.gitkeep
-!input/view_*.jpg
 output/*
 !output/.gitkeep
 
