@@ -35,6 +35,7 @@ except ImportError:
 
 import numpy as np
 import logging
+import os
 
 # Weights DUSt3R gốc trên HuggingFace (~2.3GB, tải ở lần chạy đầu)
 DEFAULT_WEIGHTS = "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt"
@@ -77,7 +78,7 @@ def _conf_to_unit(raw):
 
 class DUSt3REngine:
     def __init__(self, model_name="dust3r", device=None, weights=DEFAULT_WEIGHTS,
-                 image_size=512, niter=300, batch_size=1):
+                 image_size=512, niter=300, batch_size=None):
         self.model_name = model_name
         if device is None:
             self.device = "cuda" if (HAS_TORCH and torch.cuda.is_available()) else "cpu"
@@ -86,7 +87,10 @@ class DUSt3REngine:
         self.weights = weights
         self.image_size = int(image_size)
         self.niter = int(niter)
-        self.batch_size = int(batch_size)
+        # batch_size=1 nghĩa là mỗi cặp một lượt forward. Với graph thưa (196 ảnh -> 1.176 cặp)
+        # thì đó là 1.176 lượt tuần tự, rất chậm; T4 15GB chứa được batch 4–8 ở 512x512.
+        # Đặt qua env DUST3R_BATCH, tham số truyền tay vẫn thắng.
+        self.batch_size = int(batch_size or os.environ.get("DUST3R_BATCH", "1"))
         self.model = None
         self.logger = logging.getLogger(__name__)
 
@@ -123,7 +127,18 @@ class DUSt3REngine:
         views = load_images(list(image_paths), size=self.image_size, square_ok=True, verbose=False)
         self.logger.info(f"[P2] Đã nạp {len(views)} view: {views[0]['true_shape'].tolist()}")
 
-        pairs = make_pairs(views, scene_graph="complete", prefilter=None, symmetrize=True)
+        # scene_graph quyết định SỐ CẶP ẢNH, mà đó là chi phí thật của P2:
+        #   "complete"     -> N(N-1) cặp sau symmetrize. N=8 -> 56 cặp (ổn); N=196 -> 38.220 cặp
+        #                     ~250 GB RAM -> OOM chứ không phải chậm. Trần an toàn cỡ N<=16.
+        #   "swin-k"       -> ~2*k*N cặp (O(N)), CHỈ ghép các ảnh LIỀN KỀ trong danh sách.
+        #                     Muốn dùng thì ảnh phải được xếp theo thứ tự láng giềng theo GÓC
+        #                     (Cell 2 của notebook làm việc đó). Bộ DX.GL xếp theo Fibonacci
+        #                     spiral nên 2 khung liền kề cách nhau tới 83° -> swin vô nghĩa
+        #                     nếu không sắp lại.
+        #   "logwin-k"/"oneref-i" -> các kiểu thưa khác của DUSt3R.
+        scene_graph = os.environ.get("DUST3R_SCENE_GRAPH", "complete")
+        pairs = make_pairs(views, scene_graph=scene_graph, prefilter=None, symmetrize=True)
+        self.logger.info(f"[P2] scene_graph={scene_graph} -> {len(pairs)} cặp ảnh")
         self.logger.info(f"[P2] Pairwise inference trên {len(pairs)} cặp ảnh...")
         with torch.no_grad():
             output = inference(pairs, self.model, self.device, batch_size=self.batch_size)
