@@ -175,13 +175,18 @@ def validate_and_load_images(image_paths: List[Union[str, Path]]) -> List[Dict[s
 
         # Chuyển đổi an toàn sang RGB:
         # Nếu là RGBA hoặc LA: hòa trộn nền trắng để tránh viền đen khi khử alpha
+        # Chuyển đổi an toàn:
+        # Nếu là RGBA hoặc LA: kiểm tra xem có alpha thực sự không.
+        # Nếu có alpha, giữ nguyên RGBA để extract_alpha_masks đọc trực tiếp!
         if img.mode in ("RGBA", "LA"):
             try:
-                bg = Image.new("RGB", img.size, (255, 255, 255))
                 alpha_channel = img.split()[-1]
-                bg.paste(img.convert("RGB"), mask=alpha_channel)
-                img.close()
-                img = bg
+                alpha_arr = np.array(alpha_channel)
+                if (alpha_arr < 250).any():
+                    # Ảnh có kênh trong suốt thực sự (PNG)
+                    pass
+                else:
+                    img = img.convert("RGB")
             except Exception:
                 img = img.convert("RGB")
         elif img.mode != "RGB":
@@ -424,6 +429,27 @@ def extract_alpha_masks(
         else:
             raise TypeError(f"Ảnh không đúng định dạng: {type(item)}")
 
+    # 0. Kiểm tra nếu ảnh đầu vào đã có sẵn kênh Alpha (PNG)
+    has_native_alpha = False
+    for img in pil_images:
+        if img.mode in ("RGBA", "LA"):
+            alpha = np.array(img.split()[-1])
+            if (alpha < 250).any():
+                has_native_alpha = True
+                break
+
+    if has_native_alpha:
+        logger.info("Ảnh đầu vào đã có sẵn kênh Alpha (PNG). Trích xuất trực tiếp...")
+        for img in pil_images:
+            if img.mode in ("RGBA", "LA"):
+                alpha = np.array(img.split()[-1])
+                masks.append((alpha > int(threshold * 255)).astype(np.uint8))
+            else:
+                arr = np.array(img.convert("RGB"))
+                is_white = (arr[:, :, 0] > 240) & (arr[:, :, 1] > 240) & (arr[:, :, 2] > 240)
+                masks.append((~is_white).astype(np.uint8))
+        return masks
+
     try:
         import torch
         from torchvision import transforms
@@ -479,10 +505,15 @@ def extract_alpha_masks(
             logger.info(f"  ✓ Đã trích xuất {len(masks)} Alpha Masks thành công bằng rembg!")
             return masks
         except Exception as rembg_err:
-            logger.warning(f"rembg fallback cũng thất bại: {rembg_err}. Tạo mask toàn 1.")
+            logger.warning(f"rembg fallback cũng thất bại: {rembg_err}. Thử bóc tách nền đơn sắc...")
             for img in pil_images:
                 w, h = img.size
-                masks.append(np.ones((h, w), dtype=np.uint8))
+                arr = np.array(img.convert("RGB"))
+                is_white = (arr[:, :, 0] > 240) & (arr[:, :, 1] > 240) & (arr[:, :, 2] > 240)
+                if 0.05 < is_white.mean() < 0.98:
+                    masks.append((~is_white).astype(np.uint8))
+                else:
+                    masks.append(np.ones((h, w), dtype=np.uint8))
             return masks
 
     transform = transforms.Compose([
@@ -702,8 +733,8 @@ def preprocess_multiview(
 
         image_paths_out: List[str] = [item["path"] for item in filtered]
 
-        # Chuyển sang numpy array RGB
-        images_rgb: List[np.ndarray] = [np.array(img) for img in resized_images]
+        # Chuyển sang numpy array RGB (luôn đảm bảo 3 kênh)
+        images_rgb: List[np.ndarray] = [np.array(img.convert("RGB")) for img in resized_images]
 
         # --- Bước 4: Trích xuất Alpha Mask ---
         logger.info("[4/5] Trích xuất Alpha Mask (RMBG-2.0)...")

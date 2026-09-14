@@ -22,7 +22,7 @@ Thư viện chính:
 
 import logging
 import time
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List
 
 import numpy as np
 import trimesh
@@ -179,6 +179,66 @@ class DepthReconstructionEngine:
             raise RuntimeError(
                 "Model Depth-Anything-V2 chưa được nạp. Đã gỡ bỏ hoàn toàn mock depth map giả lập."
             )
+
+    def predict_depth_batch(self, images: List[np.ndarray]) -> List[np.ndarray]:
+        """
+        Dự đoán Depth Maps cho danh sách N ảnh (multi-view batching).
+
+        Args:
+            images: Danh sách N ảnh RGB uint8 (H, W, 3).
+
+        Returns:
+            Danh sách N ma trận depth map float32 (H, W) trong khoảng [0, 1].
+        """
+        if not images:
+            return []
+        depth_maps = []
+        for i, img in enumerate(images):
+            d = self.predict_depth(img)
+            depth_maps.append(d)
+        return depth_maps
+
+    def predict_multiview_depth(
+        self,
+        images_rgb: List[np.ndarray],
+        alpha_masks: Optional[List[np.ndarray]] = None,
+        tau_edge: float = 0.07,
+    ) -> Dict[str, Any]:
+        """
+        Ước lượng độ sâu đa góc nhìn kết hợp lọc viền gradient DA3-blender.
+
+        Args:
+            images_rgb: Danh sách N ảnh RGB (H, W, 3).
+            alpha_masks: Danh sách N alpha mask {0, 1}.
+            tau_edge: Ngưỡng lọc viền gradient DA3-blender.
+
+        Returns:
+            dict chứa:
+                - 'depth_maps': List N depth maps [0, 1]
+                - 'valid_masks': List N boolean masks sau khi gộp alpha và lọc viền
+        """
+        depth_maps = self.predict_depth_batch(images_rgb)
+        valid_masks = []
+        for i, d in enumerate(depth_maps):
+            # DA3-blender Edge Discontinuity Filtering
+            h, w = d.shape
+            gx = np.zeros_like(d)
+            gy = np.zeros_like(d)
+            gx[:, 1:-1] = np.abs(d[:, 2:] - d[:, :-2])
+            gy[1:-1, :] = np.abs(d[2:, :] - d[:-2, :])
+            edge_mask = np.maximum(gx, gy) <= (tau_edge * d + 1e-4)
+
+            if alpha_masks is not None and i < len(alpha_masks):
+                a_mask = alpha_masks[i] > 0
+                comb_mask = a_mask & edge_mask
+            else:
+                comb_mask = edge_mask
+            valid_masks.append(comb_mask)
+
+        return {
+            "depth_maps": depth_maps,
+            "valid_masks": valid_masks,
+        }
 
     # ========================================================================
     # BƯỚC 2A.2: BACK-PROJECTION (DEPTH MAP → POINT CLOUD)
@@ -554,10 +614,11 @@ class DepthReconstructionEngine:
                 focal_length=focal_length,
             )
 
-            # Bước 3: Export .glb
+            # Bước 3: Export .glb chuẩn hóa tọa độ Three.js (+Y Up, Y_min = 0)
             import os
+            from utils_3d import export_glb
             os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
-            mesh.export(output_path, file_type="glb")
+            export_glb(mesh, output_path)
 
             execution_time = time.time() - start_time
             logger.info(
