@@ -960,82 +960,124 @@ class TSDFMeshEngine:
                 viewpoint_assignments=viewpoint_assignments,
             )
 
-        all_pts_list = []
-        all_normals_list = []
-
+        # ── Bước 1: Ước lượng bán kính vật thể 3D thực tế từ các Silhouette Masks ──
+        max_r_obj = 0.55
         for i in range(n_views):
+            pose = camera_poses[i]
+            fx, fy = focal_lengths[i]
+            a_mask = alpha_masks[i] if i < len(alpha_masks) else np.ones((h, w), dtype=np.uint8)
+            coords = np.argwhere(a_mask > 0.5)
+            if len(coords) > 10:
+                bbox_h = float(coords[:, 0].max() - coords[:, 0].min())
+                bbox_w = float(coords[:, 1].max() - coords[:, 1].min())
+                dist_cam = float(np.linalg.norm(pose[:3, 3]))
+                if dist_cam < 0.5:
+                    dist_cam = 2.2
+                fg_r_px = 0.5 * bbox_w if bbox_h >= bbox_w else 0.5 * min(bbox_w, 1.2 * bbox_h)
+                r_est = float((fg_r_px / fx) * dist_cam)
+                max_r_obj = max(max_r_obj, r_est)
+
+        r_box = float(min(1.2, max(0.5, max_r_obj * 1.35)))
+        res = self.resolution
+        xs = np.linspace(-r_box, r_box, res, dtype=np.float32)
+        ys = np.linspace(-r_box, r_box, res, dtype=np.float32)
+        zs = np.linspace(-r_box, r_box, res, dtype=np.float32)
+        dx = float(xs[1] - xs[0])
+        gx, gy, gz = np.meshgrid(xs, ys, zs, indexing='ij')
+        voxels = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3)
+
+        trunc_margin = float(2.5 * dx)
+        # Khởi tạo thể tích TSDF: bắt đầu từ -trunc_margin (ruột đặc)
+        # Mỗi góc nhìn camera sẽ gọt (carve) triệt để các khoảng không gian tự do ra ngoài
+        tsdf = np.full(len(voxels), -trunc_margin, dtype=np.float32)
+
+        # ── Bước 2: True Multi-View Space Carving & Visual Hull ──
+        for i in range(n_views):
+            pose = camera_poses[i]
             d_map = depth_maps[i]
             a_mask = alpha_masks[i] if i < len(alpha_masks) else np.ones((h, w), dtype=np.uint8)
-            pose = camera_poses[i]
             fx, fy = focal_lengths[i]
             cx, cy = w / 2.0, h / 2.0
 
-            # Lọc viền gradient DA3-blender
-            edge_mask = filter_depth_discontinuity(d_map, tau=self.tau_edge)
-            valid_mask = (a_mask > 0.5) & edge_mask
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[:3, :4] = pose[:3, :4]
+            R_w2c = c2w[:3, :3].T
+            t_w2c = -R_w2c @ c2w[:3, 3]
 
-            if np.count_nonzero(valid_mask) < 20:
-                valid_mask = (a_mask > 0.5)
+            p_cam = voxels @ R_w2c.T + t_w2c
+            x_c, y_c, z_c = p_cam[:, 0], p_cam[:, 1], p_cam[:, 2]
 
-            coords = np.argwhere(valid_mask)
-            if len(coords) < 10:
-                continue
+            valid_z = z_c > 0.1
+            u = np.round(fx * (x_c / np.maximum(z_c, 1e-4)) + cx).astype(np.int32)
+            v = np.round(fy * (y_c / np.maximum(z_c, 1e-4)) + cy).astype(np.int32)
 
-            v_idx = coords[:, 0]
-            u_idx = coords[:, 1]
+            in_img = valid_z & (u >= 0) & (u < w) & (v >= 0) & (v < h)
 
-            # Tính khoảng cách từ camera tới tâm vật thể (0,0,0)
-            t_c2w = pose[:3, 3]
-            dist_cam = float(np.linalg.norm(t_c2w))
-            if dist_cam < 0.5:
-                dist_cam = 2.2
+            # (A) Silhouette Carving: Voxel chiếu ra ngoài vùng vật thể ĐỀU BỊ GỌT SẠCH (+trunc_margin)
+            is_fg = np.zeros(len(voxels), dtype=bool)
+            is_fg[in_img] = (a_mask[v[in_img], u[in_img]] > 0.5)
+            tsdf[~is_fg] = np.maximum(tsdf[~is_fg], trunc_margin)
 
-            # Ước lượng bán kính 3D vật thể từ 2D mask theo hình học pinhole: R_obj = r_pixel * D / f
-            # Chiều sâu mặt cắt ngang của vật thể tổng quát (bất kể chai lọ, cốc, giày dép, hộp, ghế...)
-            # theo phương nhìn vuông góc với trục xoay thẳng đứng (+Y Up)
-            bbox_h = float(coords[:, 0].max() - coords[:, 0].min())
-            bbox_w = float(coords[:, 1].max() - coords[:, 1].min())
-            fg_radius_px = 0.5 * bbox_w if bbox_h >= bbox_w else 0.5 * min(bbox_w, 1.2 * bbox_h)
-            r_obj = float((fg_radius_px / fx) * dist_cam)
+            # (B) Depth Carving: Voxel nằm trước bề mặt quan sát cũng bị gọt thành không khí
+            fg_indices = np.where(is_fg)[0]
+            if len(fg_indices) > 0:
+                fg_u = u[fg_indices]
+                fg_v = v[fg_indices]
+                fg_zc = z_c[fg_indices]
 
-            # Chuẩn hóa độ sâu trong vùng foreground: d_norm in [0, 1]
-            fg_vals = d_map[v_idx, u_idx]
-            v_min, v_max = float(fg_vals.min()), float(fg_vals.max())
-            if v_max - v_min > 1e-6:
-                d_norm = (fg_vals - v_min) / (v_max - v_min)
-            else:
-                d_norm = np.ones_like(fg_vals) * 0.5
+                dist_cam = float(np.linalg.norm(c2w[:3, 3]))
+                if dist_cam < 0.5:
+                    dist_cam = 2.2
+                d_norm = d_map[fg_v, fg_u]
+                d_min, d_max = float(d_norm.min()), float(d_norm.max())
+                if d_max - d_min > 1e-6:
+                    d_norm = (d_norm - d_min) / (d_max - d_min)
+                else:
+                    d_norm = np.ones_like(d_norm) * 0.5
 
-            # Bề mặt trước nhìn thấy lồi từ viền (dist_cam) về phía camera tối đa r_obj:
-            z_cam = dist_cam - d_norm * r_obj
+                d_surf = dist_cam - d_norm * max_r_obj
+                s_dist = d_surf - fg_zc
+                view_sdf = np.clip(s_dist, -trunc_margin, trunc_margin)
+                tsdf[fg_indices] = np.maximum(tsdf[fg_indices], view_sdf)
 
-            # Back-projection theo Pinhole Camera Model (OpenCV convention)
-            x_cam = (u_idx - cx) * z_cam / fx
-            y_cam = (v_idx - cy) * z_cam / fy
-            z_cam_dir = z_cam
+        tsdf_grid = tsdf.reshape(res, res, res).astype(np.float32)
+        # Đệm biên ngoài bằng không khí để mesh Marching Cubes đóng kín tuyệt đối
+        tsdf_grid[0, :, :] = trunc_margin; tsdf_grid[-1, :, :] = trunc_margin
+        tsdf_grid[:, 0, :] = trunc_margin; tsdf_grid[:, -1, :] = trunc_margin
+        tsdf_grid[:, :, 0] = trunc_margin; tsdf_grid[:, :, -1] = trunc_margin
 
-            pts_cam = np.column_stack([x_cam, y_cam, z_cam_dir])
+        # ── Bước 3: Trích xuất Iso-surface Marching Cubes ──
+        logger.info("[P4] Trích xuất Iso-surface Marching Cubes từ trường thể tích Space Carved...")
+        verts, faces, normals_mc, _ = measure.marching_cubes(
+            volume=tsdf_grid,
+            level=0.0,
+            spacing=(dx, dx, dx),
+            allow_degenerate=False,
+        )
+        verts_world = verts + np.array([-r_box, -r_box, -r_box], dtype=np.float32)
+        mesh = trimesh.Trimesh(vertices=verts_world, faces=faces, vertex_normals=normals_mc, process=True)
+        mesh.merge_vertices()
+        mesh.update_faces(mesh.nondegenerate_faces())
+        mesh.update_faces(mesh.unique_faces())
+        try:
+            trimesh.repair.fix_normals(mesh)
+            trimesh.repair.fix_winding(mesh)
+            trimesh.repair.fill_holes(mesh)
+        except Exception:
+            pass
 
-            # Chuyển đổi sang hệ tọa độ thế giới (world coordinates)
-            R_c2w = pose[:3, :3]
-            t_c2w = pose[:3, 3]
-            pts_world = (R_c2w @ pts_cam.T).T + t_c2w
+        components = mesh.split(only_watertight=False)
+        if components and len(components) > 1:
+            mesh = max(components, key=lambda m: len(m.vertices))
 
-            # Vector pháp tuyến hướng về camera
-            normals = t_c2w - pts_world
-            normals /= np.maximum(np.linalg.norm(normals, axis=-1, keepdims=True), 1e-6)
+        if self.smooth_iterations > 0 and len(mesh.vertices) > 0:
+            try:
+                from trimesh.smoothing import filter_taubin
+                filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=self.smooth_iterations)
+            except Exception:
+                pass
 
-            all_pts_list.append(pts_world)
-            all_normals_list.append(normals)
-
-        if not all_pts_list:
-            raise ValueError("Không có điểm 3D hợp lệ nào từ các depth maps.")
-
-        all_pts = np.concatenate(all_pts_list, axis=0).astype(np.float32)
-        all_norms = np.concatenate(all_normals_list, axis=0).astype(np.float32)
-
-        logger.info(f"[P4] Đã back-project {len(all_pts)} điểm bề mặt định hướng từ {n_views} góc chụp.")
-        mesh = self._extract_watertight_mesh_from_points_and_normals(all_pts, all_norms)
+        log_mesh_health(mesh, "P4 Watertight Space Carved Mesh")
         elapsed = time.time() - t0
         logger.info(f"═══ [P4] HOÀN THÀNH NVIDIA TSDF FUSION TRONG {elapsed:.2f} GIÂY ═══")
         return mesh
