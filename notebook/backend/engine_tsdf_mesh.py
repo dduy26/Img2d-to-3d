@@ -582,6 +582,29 @@ def generate_camera_poses(
     1. Orthogonal box (nếu có tên front, right, back, left, top, bottom).
     2. Turntable 360° (chia đều góc xoay azimuth quanh trục Y).
     """
+    # 0. Nếu có file cameras.json đi kèm trong thư mục ảnh hoặc input/, ưu tiên nạp ma trận chuẩn
+    if view_names and len(view_names) > 0:
+        candidate_dirs = [os.path.dirname(view_names[0]), "input", "data/objaverse_apple"]
+        for cdir in candidate_dirs:
+            if not cdir:
+                continue
+            cpath = os.path.join(cdir, "cameras.json")
+            if os.path.exists(cpath):
+                try:
+                    import json
+                    with open(cpath, "r", encoding="utf-8") as f:
+                        cdata = json.load(f)
+                    poses = []
+                    for vn in view_names:
+                        bname = os.path.basename(vn)
+                        if bname in cdata:
+                            poses.append(np.array(cdata[bname]["camera_pose"], dtype=np.float32))
+                    if len(poses) == len(view_names):
+                        logger.info("✓ Đã nạp thành công %d ma trận camera chuẩn xác từ %s", len(poses), cpath)
+                        return poses
+                except Exception as e:
+                    logger.warning("Lỗi đọc cameras.json: %s", e)
+
     poses = []
     
     # Kiểm tra xem có phải bộ ảnh 6 góc trực giao không
@@ -927,10 +950,26 @@ class TSDFMeshEngine:
             v_idx = coords[:, 0]
             u_idx = coords[:, 1]
 
-            # Depth-Anything-V2: d_norm trong [0, 1] (1 là gần camera, 0 là xa)
-            # Vật thể tại tâm (0,0,0), camera ở bán kính r=2.2 -> Z ở camera space ~ [1.5, 2.9]
-            d_norm = d_map[v_idx, u_idx]
-            z_cam = 1.5 + (1.0 - d_norm) * 1.4
+            # Tính khoảng cách từ camera tới tâm vật thể (0,0,0)
+            t_c2w = pose[:3, 3]
+            dist_cam = float(np.linalg.norm(t_c2w))
+            if dist_cam < 0.5:
+                dist_cam = 2.2
+
+            # Ước lượng bán kính 3D vật thể từ 2D mask theo hình học pinhole: R_obj = r_pixel * D / f
+            fg_radius_px = 0.5 * max(coords[:, 0].max() - coords[:, 0].min(), coords[:, 1].max() - coords[:, 1].min())
+            r_obj = float((fg_radius_px / fx) * dist_cam)
+
+            # Chuẩn hóa độ sâu trong vùng foreground: d_norm in [0, 1]
+            fg_vals = d_map[v_idx, u_idx]
+            v_min, v_max = float(fg_vals.min()), float(fg_vals.max())
+            if v_max - v_min > 1e-6:
+                d_norm = (fg_vals - v_min) / (v_max - v_min)
+            else:
+                d_norm = np.ones_like(fg_vals) * 0.5
+
+            # Bề mặt trước nhìn thấy lồi từ viền (dist_cam) về phía camera tối đa r_obj:
+            z_cam = dist_cam - d_norm * r_obj
 
             # Back-projection theo Pinhole Camera Model (OpenCV convention)
             x_cam = (u_idx - cx) * z_cam / fx

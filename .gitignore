@@ -65,6 +65,7 @@ data/*
 !data/gso/view_*.jpg
 !data/objaverse_apple/
 !data/objaverse_apple/view_*.png
+!data/objaverse_apple/cameras.json
 !data/input/
 !data/input/multi_view/
 !data/input/multi_view/view_*.jpg

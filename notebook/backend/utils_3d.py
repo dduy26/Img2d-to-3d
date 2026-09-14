@@ -98,7 +98,9 @@ def visible_vertex_mask(
 ) -> np.ndarray:
     """Approximate visibility with a projected-vertex depth buffer."""
     height, width = image_shape[:2]
-    integer_pixels = np.rint(pixels).astype(np.int32)
+    px = np.clip(np.rint(pixels[:, 0]).astype(np.int32), 0, width - 1)
+    py = np.clip(np.rint(pixels[:, 1]).astype(np.int32), 0, height - 1)
+    integer_pixels = np.column_stack([px, py])
     visible = np.zeros(len(pixels), dtype=bool)
     valid_indices = np.flatnonzero(in_image)
     if len(valid_indices) == 0:
