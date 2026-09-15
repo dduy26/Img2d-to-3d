@@ -254,6 +254,8 @@ class TSDFMeshEngine:
         focal_lengths: Optional[List[Tuple[float, float]]] = None,
         view_names: Optional[List[str]] = None,
         viewpoint_assignments: Optional[List[Dict[str, Any]]] = None,
+        rgb_images: Optional[List[np.ndarray]] = None,
+        **kwargs: Any,
     ) -> trimesh.Trimesh:
         """
         Tái tạo lưới 3D đặc ruột, kín nước 100% từ chuỗi ảnh và Depth Maps:
@@ -277,10 +279,12 @@ class TSDFMeshEngine:
         if not HAS_SKIMAGE:
             raise RuntimeError("Cần cài đặt scikit-image: pip install scikit-image")
 
-        h, w = depth_maps[0].shape[:2]
         if focal_lengths is None or len(focal_lengths) != n_views:
-            f_est = float((w / 2.0) / np.tan(np.radians(25.0)))
-            focal_lengths = [(f_est, f_est)] * n_views
+            focal_lengths = []
+            for d in depth_maps:
+                h_i, w_i = d.shape[:2]
+                f_est = float((w_i / 2.0) / np.tan(np.radians(25.0)))
+                focal_lengths.append((f_est, f_est))
 
         if camera_poses is None or len(camera_poses) != n_views:
             camera_poses = generate_camera_poses(
@@ -296,7 +300,7 @@ class TSDFMeshEngine:
         for i in range(n_views):
             pose = camera_poses[i]
             fx, _ = focal_lengths[i]
-            a_mask = alpha_masks[i] if i < len(alpha_masks) else np.ones((h, w), dtype=np.uint8)
+            a_mask = alpha_masks[i] if i < len(alpha_masks) else np.ones(depth_maps[i].shape[:2], dtype=np.uint8)
             coords = np.argwhere(a_mask > 127)
             if len(coords) > 10:
                 bbox_h = float(coords[:, 0].max() - coords[:, 0].min())
@@ -304,11 +308,12 @@ class TSDFMeshEngine:
                 dist_cam = float(np.linalg.norm(pose[:3, 3]))
                 if dist_cam < 0.5:
                     dist_cam = 2.2
-                fg_r_px = 0.5 * bbox_w if bbox_h >= bbox_w else 0.5 * min(bbox_w, 1.2 * bbox_h)
+                # Bán kính bao phủ đường bao tối đa của mọi góc nhìn (chiều dài, rộng, cao)
+                fg_r_px = 0.5 * max(bbox_w, bbox_h)
                 r_est = float((fg_r_px / fx) * dist_cam)
                 max_r_obj = max(max_r_obj, r_est)
 
-        r_box = float(min(1.2, max(0.5, max_r_obj * 1.35)))
+        r_box = float(max(0.65, max_r_obj * 1.35))
         res = self.resolution
         xs = np.linspace(-r_box, r_box, res, dtype=np.float32)
         ys = np.linspace(-r_box, r_box, res, dtype=np.float32)
@@ -327,9 +332,10 @@ class TSDFMeshEngine:
         for i in range(n_views):
             pose = camera_poses[i]
             d_map = depth_maps[i]
-            a_mask = alpha_masks[i] if i < len(alpha_masks) else np.ones((h, w), dtype=np.uint8)
+            a_mask = alpha_masks[i] if i < len(alpha_masks) else np.ones(d_map.shape[:2], dtype=np.uint8)
+            h_i, w_i = d_map.shape[:2]
             fx, fy = focal_lengths[i]
-            cx, cy = w / 2.0, h / 2.0
+            cx, cy = w_i / 2.0, h_i / 2.0
 
             c2w = np.eye(4, dtype=np.float32)
             c2w[:3, :4] = pose[:3, :4]
@@ -344,7 +350,7 @@ class TSDFMeshEngine:
             u = np.round(fx * (x_c / np.maximum(z_c, 1e-4)) + cx).astype(np.int32)
             v = np.round(fy * (y_c / np.maximum(z_c, 1e-4)) + cy).astype(np.int32)
 
-            in_img = valid_z & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+            in_img = valid_z & (u >= 0) & (u < w_i) & (v >= 0) & (v < h_i)
 
             # (A) Silhouette Space Carving: Bất kỳ voxel nào chiếu ra ngoài Alpha Mask
             # ĐỀU BỊ GỌT SẠCH THÀNH KHÔNG KHÍ (+trunc_margin)

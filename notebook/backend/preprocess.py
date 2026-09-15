@@ -1,25 +1,30 @@
 """
-Module Tiền Xử Lý Dữ Liệu 2D (P1 - Data & Preprocessing)
-Chuẩn hóa theo kiến trúc NVIDIA 3D Workflow & NVIDIA DALI:
-1. Đồng bộ quang học (Multi-view Color & Histogram Matching theo Anchor View #0).
-2. Tách nền & Vá lỗ phản quang trên vật thể trong suốt (PET / Kim loại bóng).
-3. Resize chuẩn Vision Transformer (ViT) bảo toàn tỷ lệ khung hình & Epipolar Geometry (chia hết cho 16).
-4. Nhận diện góc nhìn tự động (Viewpoint Recognition: Tên file -> CLIP ViT -> HOG Symmetry)
-   kết hợp giải thuật Hungarian Bipartite Assignment gán góc 1-1 tối ưu toàn cục.
+Module Tiền Xử Lý Dữ Liệu 2D Chuẩn NVIDIA Pipeline (Phase 1 - P1).
+Phiên bản 2.1: Hỗ trợ tách nền đa chế độ (Native Alpha, Solid Studio Background, Rembg AI)
+và chuẩn hóa kích thước đa góc nhìn trên khung hình thống nhất (Unified Canonical Frame),
+bảo toàn tuyệt đối tỉ lệ hình học giữa các góc nhìn (Front, Right, Back, Left, Top, Bottom).
+
+Trách nhiệm chính:
+    1. Validate & Đọc ảnh (hỗ trợ Unicode, giữ nguyên Native Alpha channel nếu có từ Objaverse/RGBA).
+    2. Cân bằng quang học (Histogram Matching DALI-style) theo Anchor View #0.
+    3. Tách nền đa tầng: Native Alpha -> Solid Backdrop (White/Black Studio) -> Rembg U2Net.
+    4. Vá kín lỗ thủng phản xạ (refine_alpha_mask) cho vật liệu trong suốt/kim loại bóng.
+    5. Unified Canonical Frame: Scale thống nhất toàn bộ chuỗi ảnh đa góc vào canvas vuông (512x512)
+       để bảo đảm tỷ lệ kích thước vật thể ở mọi góc nhìn là 1:1, không bị crop méo giữa các mặt.
+    6. Nhận diện các mặt (Viewpoint Recognition): Filename keywords -> CLIP ViT -> HOG Symmetry + Hungarian.
 """
 
 import os
 import sys
-import glob
 import logging
-from typing import List, Tuple, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Tuple, Optional, Union
 
 import cv2
 import numpy as np
 from PIL import Image
-from skimage.exposure import match_histograms
-import scipy.ndimage as ndimage
+from scipy import ndimage
 from scipy.optimize import linear_sum_assignment
+from skimage.exposure import match_histograms
 
 try:
     import torch
@@ -27,7 +32,7 @@ try:
 except ImportError:
     HAS_TORCH = False
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("preprocess")
 if not logger.handlers:
     handler = logging.StreamHandler()
     formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(name)s: %(message)s")
@@ -35,14 +40,8 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# ============================================================================
-# CẤU HÌNH HỆ THỐNG
-# ============================================================================
-DEFAULT_TARGET_SIZE = 512
-MAX_RECOMMENDED_VIEWS = 8
-MIN_RECOMMENDED_VIEWS = 2
+DEFAULT_TARGET_SIZE: int = 512
 
-# Các góc chụp chuẩn định chuẩn (Canonical Faces) theo tọa độ thế giới (OpenCV Camera)
 CANONICAL_FACES = [
     ("front", 0.0, 15.0),
     ("right", 90.0, 15.0),
@@ -54,35 +53,60 @@ CANONICAL_FACES = [
 
 
 # ============================================================================
-# 1. VALIDATION & LOADING (ĐỌC & CHUẨN HÓA ĐẦU VÀO)
+# 1. VALIDATION & LOADING (ĐỌC & BẢO TOÀN ALPHA GỐC NẾU CÓ)
 # ============================================================================
-def validate_and_load_images(image_paths: List[str]) -> List[np.ndarray]:
+def validate_and_load_images(image_paths: List[str]) -> Tuple[List[np.ndarray], List[Optional[np.ndarray]]]:
     """
     Kiểm tra và đọc ảnh từ danh sách đường dẫn.
-    Hỗ trợ Unicode path trên Windows và tự động chuyển về định dạng RGB uint8.
+    Hỗ trợ Unicode path trên Windows.
+    Đặc biệt: Nếu ảnh đầu vào là định dạng có sẵn kênh Alpha (như dataset Objaverse PNG RGBA),
+    sẽ giữ nguyên kênh Alpha gốc để đạt độ chính xác 100%, không bị phụ thuộc vào AI đoán lại.
+    Đồng thời lót phông nền trắng sạch cho phần RGB để tránh viền đen khi chuyển đổi.
+
+    Returns:
+        (images_rgb, native_masks):
+            - images_rgb: List[np.ndarray (H, W, 3) uint8]
+            - native_masks: List[Optional[np.ndarray (H, W) uint8]]
     """
     if not image_paths:
         raise ValueError("Danh sách đường dẫn ảnh rỗng.")
 
     loaded_images = []
+    native_masks = []
+
     for path in image_paths:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Không tìm thấy file ảnh: {path}")
 
-        # Đọc an toàn hỗ trợ unicode path
         try:
             pil_img = Image.open(path)
             pil_img.load()
-            if pil_img.mode != "RGB":
-                pil_img = pil_img.convert("RGB")
-            img_rgb = np.array(pil_img, dtype=np.uint8)
+
+            native_alpha = None
+            if pil_img.mode in ("RGBA", "LA") or (pil_img.mode == "P" and "transparency" in pil_img.info):
+                rgba = pil_img.convert("RGBA")
+                alpha_ch = np.array(rgba.split()[-1], dtype=np.uint8)
+                # Kiểm tra xem có pixel trong suốt thực sự không
+                if np.any(alpha_ch < 250) and np.any(alpha_ch > 10):
+                    native_alpha = alpha_ch
+                    # Lót nền trắng sạch để RGB không bị viền đen
+                    bg = Image.new("RGBA", pil_img.size, (255, 255, 255, 255))
+                    bg.alpha_composite(rgba)
+                    img_rgb = np.array(bg.convert("RGB"), dtype=np.uint8)
+                else:
+                    img_rgb = np.array(pil_img.convert("RGB"), dtype=np.uint8)
+            else:
+                img_rgb = np.array(pil_img.convert("RGB"), dtype=np.uint8)
+
             loaded_images.append(img_rgb)
+            native_masks.append(native_alpha)
+
         except Exception as e:
             logger.error(f"Lỗi khi đọc ảnh {path}: {e}")
             raise ValueError(f"Không thể đọc file ảnh {path}: {e}")
 
-    logger.info(f"[P1] Đã đọc thành công {len(loaded_images)} ảnh hợp lệ.")
-    return loaded_images
+    logger.info(f"[P1] Đã đọc thành công {len(loaded_images)} ảnh hợp lệ (Native Alpha: {sum(1 for m in native_masks if m is not None)}/{len(loaded_images)}).")
+    return loaded_images, native_masks
 
 
 # ============================================================================
@@ -90,8 +114,8 @@ def validate_and_load_images(image_paths: List[str]) -> List[np.ndarray]:
 # ============================================================================
 def histogram_match_sequence(images_rgb: List[np.ndarray], anchor_idx: int = 0) -> List[np.ndarray]:
     """
-    Toán tử NVIDIA DALI-style: Ép biểu đồ màu của N-1 ảnh theo ảnh Anchor View (#0)
-    để đồng bộ quang học, loại bỏ hoàn toàn lỗi phơi sáng (Auto-Exposure) và ám màu (Auto-WB).
+    Toán tử NVIDIA DALI-style: Cân bằng biểu đồ màu theo Anchor View (#0)
+    để đồng bộ dải sáng giữa các góc chụp.
     """
     if len(images_rgb) <= 1:
         return images_rgb
@@ -116,22 +140,21 @@ def histogram_match_sequence(images_rgb: List[np.ndarray], anchor_idx: int = 0) 
 
 
 # ============================================================================
-# 3. TÁCH NỀN & VÁ LỖ PHẢN QUANG (PET / SPECULAR HOLE REFINEMENT)
+# 3. TÁCH NỀN ĐA TẦNG & VÁ KÍN LỖ KHÚC XẠ (ALPHA MASK EXTRACTION)
 # ============================================================================
-def refine_alpha_mask(raw_mask: np.ndarray) -> np.ndarray:
+def refine_alpha_mask(mask: np.ndarray) -> np.ndarray:
     """
-    Thuật toán vá lỗ vật thể trong suốt / phản quang:
-    Chai nhựa PET, ly thủy tinh, kim loại bóng thường bị khoét lủng lỗ trắng do phản xạ.
-    Sử dụng binary_fill_holes và lọc thành phần liên thông lớn nhất để lấp kín 100% ruột vật thể.
+    Vá kín lỗ thủng phản xạ (PET/Specular Highlights) và khử nhiễu phông nền:
+    1. Binary Fill Holes để vá các lỗ thủng bên trong thân vật thể.
+    2. Giữ lại thành phần liên thông lớn nhất (loại bỏ bụi nhiễu).
+    3. Morphological Closing làm mượt biên dạng.
     """
-    binary = (raw_mask > 127).astype(bool)
-    if not np.any(binary):
-        return np.ones_like(raw_mask, dtype=np.uint8)
+    binary = (mask > 127)
 
-    # 1. Bịt kín toàn bộ lỗ thủng bên trong thân vật thể
+    # 1. Vá kín lỗ thủng
     filled = ndimage.binary_fill_holes(binary)
 
-    # 2. Lọc bỏ các đốm bụi nhiễu nhỏ ngoài phông nền
+    # 2. Lọc bỏ các đốm bụi nhiễu ngoài phông nền
     labeled, num_features = ndimage.label(filled)
     if num_features > 1:
         sizes = ndimage.sum(filled, labeled, range(1, num_features + 1))
@@ -144,27 +167,78 @@ def refine_alpha_mask(raw_mask: np.ndarray) -> np.ndarray:
     return (refined.astype(np.uint8) * 255)
 
 
-def extract_alpha_masks(images_rgb: List[np.ndarray]) -> List[np.ndarray]:
+def _detect_solid_background_mask(img_rgb: np.ndarray, tolerance: float = 18.0) -> Optional[np.ndarray]:
     """
-    Trích xuất mặt nạ vật thể (Alpha Mask) từ danh sách ảnh RGB.
-    Tự động ưu tiên rembg offline hoặc fallback ngưỡng Otsu.
+    Tách nền siêu tốc cho ảnh studio / render 3D (nền trắng tinh #ffffff hoặc đen #000000 hoặc đồng màu).
+    Kiểm tra 4 góc ảnh: nếu 4 góc đồng màu, tính khoảng cách màu Euclidean để tách vật thể chuẩn xác 100%,
+    không bị Rembg lẹm vào phần trắng/đen của vật thể.
+    """
+    h, w = img_rgb.shape[:2]
+    # Lấy mẫu các góc
+    patch_size = min(16, h // 8, w // 8)
+    corners = np.concatenate([
+        img_rgb[:patch_size, :patch_size].reshape(-1, 3),
+        img_rgb[:patch_size, -patch_size:].reshape(-1, 3),
+        img_rgb[-patch_size:, :patch_size].reshape(-1, 3),
+        img_rgb[-patch_size:, -patch_size:].reshape(-1, 3),
+    ], axis=0)
+
+    corner_std = np.std(corners, axis=0)
+    # Nếu độ lệch màu 4 góc rất nhỏ (nền đồng nhất)
+    if np.all(corner_std < 8.0):
+        bg_color = np.median(corners, axis=0)
+        diff = np.linalg.norm(img_rgb.astype(np.float32) - bg_color.astype(np.float32), axis=-1)
+        if diff.max() > 25.0:
+            raw_mask = (diff > tolerance).astype(np.uint8) * 255
+            refined = refine_alpha_mask(raw_mask)
+            ratio = np.count_nonzero(refined > 127) / refined.size
+            if 0.02 < ratio < 0.95:
+                return refined
+    return None
+
+
+def extract_alpha_masks(
+    images_rgb: List[np.ndarray],
+    native_masks: Optional[List[Optional[np.ndarray]]] = None,
+) -> List[np.ndarray]:
+    """
+    Trích xuất mặt nạ vật thể (Alpha Mask) theo quy trình 3 tầng thông minh:
+    - Tầng 1: Sử dụng Native Alpha channel gốc nếu ảnh là PNG RGBA (dataset Objaverse, v.v.).
+    - Tầng 2: Tách nền màu đồng nhất (Solid White/Black Studio Backdrop).
+    - Tầng 3: AI Rembg U2Net + vá kín lỗ thủng (ảnh chụp ngoài đời thực tế).
     """
     alpha_masks = []
+    rembg_session = None
     has_rembg = False
-    session = None
-
-    try:
-        from rembg import remove, new_session
-        session = new_session("u2net")
-        has_rembg = True
-    except Exception:
-        has_rembg = False
 
     for i, img in enumerate(images_rgb):
-        if has_rembg and session is not None:
+        # Tầng 1: Đã có sẵn Native Alpha từ file ảnh gốc
+        if native_masks is not None and i < len(native_masks) and native_masks[i] is not None:
+            logger.info(f"[P1] Ảnh #{i}: Dùng trực tiếp Native Alpha Mask từ ảnh gốc.")
+            alpha_masks.append(refine_alpha_mask(native_masks[i]))
+            continue
+
+        # Tầng 2: Phát hiện nền đồng nhất (Studio / White Backdrop)
+        solid_mask = _detect_solid_background_mask(img)
+        if solid_mask is not None:
+            logger.info(f"[P1] Ảnh #{i}: Tách nền thành công qua Solid Backdrop Detection.")
+            alpha_masks.append(solid_mask)
+            continue
+
+        # Tầng 3: AI Rembg U2Net
+        if not has_rembg and rembg_session is None:
             try:
+                from rembg import new_session
+                rembg_session = new_session("u2net")
+                has_rembg = True
+            except Exception:
+                has_rembg = False
+
+        if has_rembg and rembg_session is not None:
+            try:
+                from rembg import remove
                 pil_img = Image.fromarray(img)
-                out_rgba = remove(pil_img, session=session)
+                out_rgba = remove(pil_img, session=rembg_session)
                 raw_mask = np.array(out_rgba.split()[-1], dtype=np.uint8)
                 refined = refine_alpha_mask(raw_mask)
                 alpha_masks.append(refined)
@@ -172,39 +246,123 @@ def extract_alpha_masks(images_rgb: List[np.ndarray]) -> List[np.ndarray]:
             except Exception as e:
                 logger.warning(f"[P1] rembg ảnh #{i} lỗi ({e}), chuyển sang fallback Otsu.")
 
-        # Fallback phân đoạn màu nền
+        # Fallback phân đoạn ngưỡng Otsu
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        corners_val = np.mean([gray[0, 0], gray[0, -1], gray[-1, 0], gray[-1, -1]])
+        if corners_val > 127:
+            # Nền sáng -> vật thể tối
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        else:
+            # Nền tối -> vật thể sáng
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         alpha_masks.append(refine_alpha_mask(thresh))
 
-    logger.info(f"[P1] Đã trích xuất & vá kín {len(alpha_masks)} Alpha Masks chuẩn xác.")
+    logger.info(f"[P1] Đã trích xuất & hoàn thiện {len(alpha_masks)} Alpha Masks chuẩn xác.")
     return alpha_masks
 
 
 # ============================================================================
-# 4. RESIZE CHUẨN VISION TRANSFORMER (DIVISIBLE BY 16 & EPIPOLAR PRESERVATION)
+# 4. KHUNG HÌNH THỐNG NHẤT (UNIFIED MULTI-VIEW CANONICAL FRAME)
 # ============================================================================
-def vit_geometric_resize(
-    image: np.ndarray, 
-    mask: np.ndarray, 
-    target_size: int = DEFAULT_TARGET_SIZE
-) -> Tuple[np.ndarray, np.ndarray, float]:
+def normalize_multiview_scales_and_canvas(
+    images_rgb: List[np.ndarray],
+    alpha_masks: List[np.ndarray],
+    target_size: int = DEFAULT_TARGET_SIZE,
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[float]]:
     """
-    Resize bảo toàn tỷ lệ khung hình (Aspect Ratio), cạnh dài nhất = target_size,
-    đồng thời ép cả 2 cạnh chia hết cho 16 chuẩn cấu hình mạng ViT Backbone.
-    Tuyệt đối không crop để bảo toàn Epipolar Geometry và tâm quang học.
-    """
-    h, w = image.shape[:2]
-    scale = target_size / max(h, w)
-    nh, nw = int(round(h * scale)), int(round(w * scale))
+    Toán tử cốt lõi giải quyết triệt để lỗi 'không khớp tỷ lệ giữa các mặt' (Front vs Left/Right):
 
-    # Ép chia hết cho 16
+    Vấn đề cũ:
+        Nếu mỗi ảnh tự resize theo max(H_i, W_i) riêng của nó, mặt trước (dọc, hẹp) sẽ bị kéo to,
+        còn mặt bên (ngang, dài) sẽ bị thu nhỏ lại. Khi gọt khối (Space Carving), mặt trước sẽ cắt
+        cụt chiều dài của mặt bên!
+
+    Giải pháp chuẩn NVIDIA:
+        1. Tìm kích thước tối đa bao phủ toàn bộ chuỗi ảnh: global_max_dim = max_i(max(H_i, W_i)).
+        2. Áp dụng DUY NHẤT một tỉ lệ thu phóng (Global Uniform Scale) cho toàn bộ N ảnh:
+           global_scale = target_size / global_max_dim.
+        3. Đặt từng ảnh đã co dãn vào chính giữa một khung vuông chuẩn (target_size, target_size),
+           đệm viền đối xứng (Symmetric Letterbox).
+
+    Kết quả:
+        - Mọi ảnh đều có chung độ phân giải (target_size, target_size).
+        - Mọi camera đều có tâm quang học chính giữa (c_x, c_y) = (target_size/2, target_size/2).
+        - Mọi camera đều có cùng tiêu cự f_x = f_y = f_est.
+        - Tỉ lệ chiều dài, chiều rộng, chiều cao của vật thể giữa tất cả các góc nhìn là 1:1 tuyệt đối,
+          không bao giờ bị crop ngang hay mất cân bằng hình học!
+    """
+    n = len(images_rgb)
+    # 1. Tìm kích thước tối đa trong toàn bộ ảnh đầu vào
+    max_dim = max(max(img.shape[0], img.shape[1]) for img in images_rgb)
+    global_scale = float(target_size) / float(max_dim)
+
+    canonical_rgb_list = []
+    canonical_mask_list = []
+    scale_factors = []
+
+    for i in range(n):
+        img = images_rgb[i]
+        msk = alpha_masks[i]
+        h, w = img.shape[:2]
+
+        nh = int(round(h * global_scale))
+        nw = int(round(w * global_scale))
+
+        # Ép chia hết cho 16
+        nh = min(target_size, max(16, (nh // 16) * 16))
+        nw = min(target_size, max(16, (nw // 16) * 16))
+
+        r_img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        r_msk = cv2.resize(msk, (nw, nh), interpolation=cv2.INTER_NEAREST)
+
+        # Đặt vào tâm khung vuông target_size x target_size
+        canvas_rgb = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+        # Nền canvas mặc định dùng màu trung tính hoặc màu góc ảnh
+        bg_col = np.median([img[0, 0], img[0, -1], img[-1, 0], img[-1, -1]], axis=0).astype(np.uint8)
+        canvas_rgb[:] = bg_col
+
+        canvas_mask = np.zeros((target_size, target_size), dtype=np.uint8)
+
+        oy = (target_size - nh) // 2
+        ox = (target_size - nw) // 2
+
+        canvas_rgb[oy:oy+nh, ox:ox+nw] = r_img
+        canvas_mask[oy:oy+nh, ox:ox+nw] = r_msk
+
+        canonical_rgb_list.append(canvas_rgb)
+        canonical_mask_list.append(canvas_mask)
+        scale_factors.append(global_scale)
+
+    logger.info(
+        f"[P1] Đã đồng bộ tỉ lệ đa góc nhìn trên khung vuông chuẩn ({target_size}x{target_size}), "
+        f"Global Scale: {global_scale:.4f}"
+    )
+    return canonical_rgb_list, canonical_mask_list, scale_factors
+
+
+def vit_geometric_resize(
+    image_rgb: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+    target_size: int = DEFAULT_TARGET_SIZE,
+) -> Tuple[np.ndarray, Optional[np.ndarray], float]:
+    """
+    Chuẩn hóa kích thước hình học cho ViT / DUSt3R / Depth-Anything:
+    Giữ nguyên tỉ lệ (Aspect Ratio), cạnh lớn nhất thành target_size,
+    và cả 2 chiều đều chia hết cho 16.
+    """
+    h, w = image_rgb.shape[:2]
+    scale = float(target_size) / float(max(h, w))
+    nh = int(round(h * scale))
+    nw = int(round(w * scale))
     nh = max(16, (nh // 16) * 16)
     nw = max(16, (nw // 16) * 16)
 
-    resized_img = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    resized_mask = cv2.resize(mask, (nw, nh), interpolation=cv2.INTER_NEAREST)
-    return resized_img, resized_mask, scale
+    r_img = cv2.resize(image_rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    r_msk = None
+    if mask is not None:
+        r_msk = cv2.resize(mask, (nw, nh), interpolation=cv2.INTER_NEAREST)
+    return r_img, r_msk, scale
+
 
 
 # ============================================================================
@@ -218,13 +376,13 @@ def _calc_bilateral_symmetry(gray_img: np.ndarray) -> float:
 
 
 def classify_viewpoints(
-    images_rgb: List[np.ndarray], 
+    images_rgb: List[np.ndarray],
     filenames: Optional[List[str]] = None,
     device: str = "cpu"
 ) -> List[Dict[str, Any]]:
     """
     Nhận diện các mặt của vật thể theo kiến trúc 3 tầng:
-    1. Tầng 1: Tên file nếu chứa từ khóa (front, right, back, left, top).
+    1. Tầng 1: Tên file nếu chứa từ khóa (front, right, back, left, top, bottom).
     2. Tầng 2: Zero-shot CLIP ViT đo độ tương đồng ngữ nghĩa ảnh và text prompt.
     3. Tầng 3: HOG Gradient & Bilateral Symmetry Fallback (phân biệt trước/sau đối xứng).
     Sau đó áp dụng giải thuật Hungarian Bipartite Assignment gán cặp 1-1 góc chuẩn.
@@ -233,30 +391,38 @@ def classify_viewpoints(
     num_faces = len(CANONICAL_FACES)
     cost_matrix = np.ones((n, num_faces), dtype=np.float32)
 
-    # 1. Kiểm tra từ khóa tên file
+    # 1. Kiểm tra từ khóa tên file (front, right, back, left, top, bottom)
     keyword_map = {
-        "front": 0, "f": 0, "truoc": 0,
-        "right": 1, "r": 1, "phai": 1,
-        "back": 2, "b": 2, "sau": 2,
-        "left": 3, "l": 3, "trai": 3,
-        "top": 4, "t": 4, "tren": 4,
-        "bottom": 5, "duoi": 5,
+        "front": 0, "f": 0, "truoc": 0, "01_front": 0,
+        "right": 1, "r": 1, "phai": 1, "02_right": 1,
+        "back": 2, "b": 2, "sau": 2, "03_back": 2,
+        "left": 3, "l": 3, "trai": 3, "04_left": 3,
+        "top": 4, "t": 4, "tren": 4, "05_top": 4,
+        "bottom": 5, "duoi": 5, "06_bottom": 5,
     }
 
     if filenames and len(filenames) == n:
         for i, fname in enumerate(filenames):
             base = os.path.splitext(os.path.basename(fname).lower())[0]
+            parts = base.replace("-", "_").split("_")
+            matched = False
             for kw, face_col in keyword_map.items():
-                if kw in base.split("_") or kw in base.split("-") or kw == base:
+                if kw in parts or kw == base:
                     cost_matrix[i, :] += 5.0
                     cost_matrix[i, face_col] = 0.0
+                    matched = True
                     break
+            if not matched:
+                for kw, face_col in keyword_map.items():
+                    if kw in base:
+                        cost_matrix[i, :] += 5.0
+                        cost_matrix[i, face_col] = 0.0
+                        break
 
     # 2. HOG Symmetry Fallback để bổ trợ
     for i, img in enumerate(images_rgb):
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         sym = _calc_bilateral_symmetry(gray)
-        # Mặt trước và mặt sau đối xứng cao hơn mặt bên
         if sym > 0.70:
             cost_matrix[i, 0] -= 0.5  # Ưu tiên Front
             cost_matrix[i, 2] -= 0.4  # Ưu tiên Back
@@ -278,7 +444,6 @@ def classify_viewpoints(
             "confidence": float(max(0.0, 1.0 - cost_matrix[r, c] / 5.0)),
         }
 
-    # Bổ sung góc phân bổ đều nếu số lượng ảnh > số mặt canonical
     for i in range(n):
         if assignments[i] is None:
             az = float((i * 360.0 / n) % 360.0)
@@ -295,7 +460,7 @@ def classify_viewpoints(
 
 
 # ============================================================================
-# 6. ĐÓNG GÓI HỢP ĐỒNG GIAO DIỆN (PREPROCESS MULTIVIEW & SINGLE VIEW)
+# 6. ĐÓNG GÓI HỢP ĐỒNG TIỀN XỬ LÝ (PREPROCESS MULTIVIEW & SINGLE VIEW)
 # ============================================================================
 def preprocess_multiview(
     image_paths: List[str],
@@ -303,49 +468,52 @@ def preprocess_multiview(
     device: str = "cpu"
 ) -> Dict[str, Any]:
     """
-    Toàn bộ chuỗi tiền xử lý đa ảnh chuẩn NVIDIA:
-    Load -> Histogram Match -> Alpha Mask -> ViT Resize -> Viewpoint Hungarian.
+    Toàn bộ chuỗi tiền xử lý đa ảnh chuẩn NVIDIA không mất cân bằng tỷ lệ:
+    1. Load ảnh (giữ Native Alpha nếu có từ Objaverse PNG RGBA).
+    2. Cân bằng quang học (Histogram Matching).
+    3. Tách nền đa tầng (Native Alpha -> Solid Studio Backdrop -> Rembg).
+    4. Vá kín lỗ khúc xạ PET / Highlights.
+    5. Đồng bộ tỷ lệ trên khung vuông chuẩn (Unified Canonical Frame) -> Loại bỏ lỗi Front/Side lệch tỷ lệ.
+    6. Nhận diện các mặt (Hungarian Viewpoint Assignment).
     """
-    raw_images = validate_and_load_images(image_paths)
+    raw_images, native_masks = validate_and_load_images(image_paths)
     filenames = [os.path.basename(p) for p in image_paths]
 
-    # 1. Đồng bộ quang học (NVIDIA DALI Style)
+    # 1. Đồng bộ quang học theo Anchor View #0
     matched_images = histogram_match_sequence(raw_images, anchor_idx=0)
 
-    # 2. Tách nền và vá lỗ phản quang
-    raw_masks = extract_alpha_masks(matched_images)
+    # 2. Tách nền đa tầng
+    raw_masks = extract_alpha_masks(matched_images, native_masks=native_masks)
 
-    # 3. ViT Geometric Resize (bảo toàn epipolar geometry, chia hết cho 16)
-    clean_rgb_list = []
-    clean_mask_list = []
+    # 3. Đồng bộ tỷ lệ toàn cục và căn tâm trên khung vuông chuẩn
+    clean_rgb_list, clean_mask_list, scale_factors = normalize_multiview_scales_and_canvas(
+        images_rgb=matched_images,
+        alpha_masks=raw_masks,
+        target_size=target_size,
+    )
+
+    # Chuẩn hóa tensor ImageNet cho ViT nếu có PyTorch
     tensor_list = []
-    scale_factors = []
-
-    for img, msk in zip(matched_images, raw_masks):
-        r_img, r_msk, s = vit_geometric_resize(img, msk, target_size=target_size)
-        clean_rgb_list.append(r_img)
-        clean_mask_list.append(r_msk)
-        scale_factors.append(s)
-
-        if HAS_TORCH:
-            # Chuẩn hóa ImageNet cho ViT
+    if HAS_TORCH:
+        mean = torch.tensor([0.485, 0.456, 0.406])
+        std = torch.tensor([0.229, 0.224, 0.225])
+        for r_img in clean_rgb_list:
             t = torch.from_numpy(r_img).float() / 255.0
-            mean = torch.tensor([0.485, 0.456, 0.406])
-            std = torch.tensor([0.229, 0.224, 0.225])
             t = (t - mean) / std
             tensor_list.append(t.permute(2, 0, 1))
 
-    # 4. Nhận diện góc nhìn tự động
+    # 4. Nhận diện góc nhìn
     viewpoint_assignments = classify_viewpoints(clean_rgb_list, filenames=filenames, device=device)
 
-    # Tiêu cự ước tính theo FOV 50°
-    h, w = clean_rgb_list[0].shape[:2]
-    f_est = float((w / 2.0) / np.tan(np.radians(25.0)))
+    # Tiêu cự chuẩn hóa cho khung vuông target_size x target_size theo FOV 50°
+    f_est = float((target_size / 2.0) / np.tan(np.radians(25.0)))
     focal_lengths = [(f_est, f_est)] * len(clean_rgb_list)
 
     result = {
         "images_rgb": clean_rgb_list,
+        "clean_rgb_list": clean_rgb_list,
         "alpha_masks": clean_mask_list,
+        "clean_mask_list": clean_mask_list,
         "images_normalized": torch.stack(tensor_list) if HAS_TORCH and tensor_list else None,
         "viewpoint_assignments": viewpoint_assignments,
         "focal_lengths": focal_lengths,
@@ -364,12 +532,11 @@ def preprocess_single_view(
     target_size: int = DEFAULT_TARGET_SIZE
 ) -> Dict[str, Any]:
     """Tiền xử lý chế độ đơn ảnh (Single-view) cho Depth-Anything-V2."""
-    raw_images = validate_and_load_images([image_path])
+    raw_images, native_masks = validate_and_load_images([image_path])
     img = raw_images[0]
-    masks = extract_alpha_masks([img])
+    masks = extract_alpha_masks([img], native_masks=native_masks)
     mask = masks[0]
 
-    # Canh giữa tâm và padding vào khung vuông
     coords = np.argwhere(mask > 127)
     if len(coords) > 10:
         y_min, x_min = coords.min(axis=0)

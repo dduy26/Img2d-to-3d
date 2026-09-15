@@ -10,6 +10,7 @@ try:
         extract_alpha_masks,
         refine_alpha_mask,
         vit_geometric_resize,
+        normalize_multiview_scales_and_canvas,
         classify_viewpoints,
     )
 except ImportError:
@@ -21,6 +22,7 @@ except ImportError:
         extract_alpha_masks,
         refine_alpha_mask,
         vit_geometric_resize,
+        normalize_multiview_scales_and_canvas,
         classify_viewpoints,
     )
 
@@ -37,6 +39,7 @@ __all__ = [
     "extract_alpha_masks",
     "refine_alpha_mask",
     "vit_geometric_resize",
+    "normalize_multiview_scales_and_canvas",
     "dust3r_resize",
     "classify_viewpoints",
 ]
