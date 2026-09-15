@@ -341,3 +341,8 @@ class DepthReconstructionEngine:
             elapsed = time.time() - t0
             logger.error(f"[P2] Lỗi tái tạo đơn ảnh: {e}", exc_info=True)
             return False, None, elapsed
+
+
+# Backward-compatibility alias
+SurfaceMeshEngine = DepthReconstructionEngine
+
