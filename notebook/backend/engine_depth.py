@@ -345,4 +345,3 @@ class DepthReconstructionEngine:
 
 # Backward-compatibility alias
 SurfaceMeshEngine = DepthReconstructionEngine
-

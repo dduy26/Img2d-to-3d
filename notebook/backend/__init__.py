@@ -10,7 +10,6 @@ Cung cấp toàn bộ các phân hệ P1 - P6 cho người dùng:
 - P6: FastAPI Application & execute_3d_pipeline
 """
 
-# Đảm bảo thư mục hiện tại có trong sys.path để hỗ trợ cả import tuyệt đối và tương đối
 import os, sys
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 if _BACKEND_DIR not in sys.path:
