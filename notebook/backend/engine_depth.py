@@ -120,8 +120,13 @@ class DepthReconstructionEngine:
             from transformers import AutoImageProcessor, AutoModelForDepthEstimation
             logger.info(f"[P2] Đang nạp model {DEPTH_MODEL_ID} trên thiết bị '{self.device}'...")
 
-            self.depth_processor = AutoImageProcessor.from_pretrained(DEPTH_MODEL_ID)
-            self.depth_model = AutoModelForDepthEstimation.from_pretrained(DEPTH_MODEL_ID)
+            try:
+                self.depth_processor = AutoImageProcessor.from_pretrained(DEPTH_MODEL_ID, local_files_only=True)
+                self.depth_model = AutoModelForDepthEstimation.from_pretrained(DEPTH_MODEL_ID, local_files_only=True)
+            except Exception:
+                self.depth_processor = AutoImageProcessor.from_pretrained(DEPTH_MODEL_ID)
+                self.depth_model = AutoModelForDepthEstimation.from_pretrained(DEPTH_MODEL_ID)
+
             self.depth_model.to(self.device)
             self.depth_model.eval()
             logger.info(f"[P2] ✓ Depth-Anything-V2-Small nạp thành công trên {self.device}.")

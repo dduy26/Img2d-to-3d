@@ -67,4 +67,7 @@ data/*
 !data/objaverse_apple/cameras.json
 !data/input/
 !data/input/multi_view/
-!data/input/multi_view/view_*.jpg
+!data/input/multi_view/view_*.jpg
+
+# Scratch files
+scratch/
