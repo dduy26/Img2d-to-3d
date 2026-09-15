@@ -308,26 +308,33 @@ def normalize_multiview_scales_and_canvas(
         nh = int(round(h * global_scale))
         nw = int(round(w * global_scale))
 
-        # Ép chia hết cho 16
-        nh = min(target_size, max(16, (nh // 16) * 16))
-        nw = min(target_size, max(16, (nw // 16) * 16))
+        # Ép kích thước chia hết cho 16 nhưng tuyệt đối không vượt quá target_size
+        nh = int(min(target_size, max(16, (nh // 16) * 16)))
+        nw = int(min(target_size, max(16, (nw // 16) * 16)))
 
         r_img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
         r_msk = cv2.resize(msk, (nw, nh), interpolation=cv2.INTER_NEAREST)
 
-        # Đặt vào tâm khung vuông target_size x target_size
-        canvas_rgb = np.zeros((target_size, target_size, 3), dtype=np.uint8)
-        # Nền canvas mặc định dùng màu trung tính hoặc màu góc ảnh
-        bg_col = np.median([img[0, 0], img[0, -1], img[-1, 0], img[-1, -1]], axis=0).astype(np.uint8)
-        canvas_rgb[:] = bg_col
+        # 1. Khắc phục Lỗi 1: Xác định màu nền chuẩn (Trắng tinh hoặc Đen cố định)
+        # Nếu góc ảnh có độ sáng trung bình > 128 (phông sáng/trắng từ studio/Objaverse) -> dùng trắng tinh [255, 255, 255]
+        corner_brightness = float(np.mean([img[0, 0], img[0, -1], img[-1, 0], img[-1, -1]]))
+        bg_col = np.array([255, 255, 255], dtype=np.uint8) if corner_brightness > 128 else np.array([0, 0, 0], dtype=np.uint8)
 
+        # Khử triệt để đường viền hộp (letterbox artifact): ép toàn bộ vùng ngoài mask về màu nền chuẩn
+        r_img[r_msk == 0] = bg_col
+
+        canvas_rgb = np.full((target_size, target_size, 3), bg_col, dtype=np.uint8)
         canvas_mask = np.zeros((target_size, target_size), dtype=np.uint8)
 
-        oy = (target_size - nh) // 2
-        ox = (target_size - nw) // 2
+        # 2. Khắc phục Lỗi 2: Tính toán vị trí cắt lát an toàn tuyệt đối, chống lỗi Broadcast Shape Mismatch
+        act_h, act_w = r_img.shape[:2]
+        oy = max(0, (target_size - act_h) // 2)
+        ox = max(0, (target_size - act_w) // 2)
+        ey = min(target_size, oy + act_h)
+        ex = min(target_size, ox + act_w)
 
-        canvas_rgb[oy:oy+nh, ox:ox+nw] = r_img
-        canvas_mask[oy:oy+nh, ox:ox+nw] = r_msk
+        canvas_rgb[oy:ey, ox:ex] = r_img[:ey - oy, :ex - ox]
+        canvas_mask[oy:ey, ox:ex] = r_msk[:ey - oy, :ex - ox]
 
         canonical_rgb_list.append(canvas_rgb)
         canonical_mask_list.append(canvas_mask)
