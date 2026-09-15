@@ -114,28 +114,37 @@ def validate_and_load_images(image_paths: List[str]) -> Tuple[List[np.ndarray], 
 # ============================================================================
 def histogram_match_sequence(images_rgb: List[np.ndarray], anchor_idx: int = 0) -> List[np.ndarray]:
     """
-    Toán tử NVIDIA DALI-style: Cân bằng biểu đồ màu theo Anchor View (#0)
-    để đồng bộ dải sáng giữa các góc chụp.
+    Toán tử quang học chuẩn CIE Lab (NVIDIA DALI Style):
+    Chuyển đổi sang không gian màu CIE Lab và CHỈ cân bằng độ sáng trên kênh L,
+    bảo toàn 100% hai kênh sắc độ a, b nguyên bản của vật thể theo Anchor View (#0),
+    triệt tiêu hoàn toàn lỗi lệch phơi sáng (Auto-Exposure) và ám màu.
     """
     if len(images_rgb) <= 1:
         return images_rgb
 
     anchor_view = images_rgb[anchor_idx]
+    ref_lab = cv2.cvtColor(anchor_view, cv2.COLOR_RGB2LAB)
+    ref_L = ref_lab[:, :, 0]
     matched_sequence = []
 
     for i, src_img in enumerate(images_rgb):
         if i == anchor_idx:
-            matched_sequence.append(anchor_view)
+            matched_sequence.append(anchor_view.copy())
             continue
         try:
-            matched = match_histograms(src_img, anchor_view, channel_axis=-1)
-            matched = np.clip(matched, 0, 255).astype(np.uint8)
-            matched_sequence.append(matched)
+            src_lab = cv2.cvtColor(src_img, cv2.COLOR_RGB2LAB)
+            src_L, src_a, src_b = cv2.split(src_lab)
+            # Chỉ match trên kênh Luminance L
+            matched_L = match_histograms(src_L, ref_L)
+            matched_L = np.clip(matched_L, 0, 255).astype(np.uint8)
+            matched_lab = cv2.merge([matched_L, src_a, src_b])
+            matched_rgb = cv2.cvtColor(matched_lab, cv2.COLOR_LAB2RGB)
+            matched_sequence.append(matched_rgb)
         except Exception as e:
-            logger.warning(f"[P1] Cân bằng màu ảnh #{i} thất bại ({e}), giữ nguyên ảnh gốc.")
-            matched_sequence.append(src_img)
+            logger.warning(f"[P1] Cân bằng màu Lab ảnh #{i} thất bại ({e}), giữ nguyên ảnh gốc.")
+            matched_sequence.append(src_img.copy())
 
-    logger.info(f"[P1] Đã cân bằng quang học (Histogram Matching) {len(images_rgb)} ảnh theo Anchor View #{anchor_idx}.")
+    logger.info(f"[P1] Đã cân bằng quang học CIE Lab (Luminance Matching) {len(images_rgb)} ảnh theo Anchor View #{anchor_idx}.")
     return matched_sequence
 
 
@@ -169,31 +178,57 @@ def refine_alpha_mask(mask: np.ndarray) -> np.ndarray:
 
 def _detect_solid_background_mask(img_rgb: np.ndarray, tolerance: float = 18.0) -> Optional[np.ndarray]:
     """
-    Tách nền siêu tốc cho ảnh studio / render 3D (nền trắng tinh #ffffff hoặc đen #000000 hoặc đồng màu).
-    Kiểm tra 4 góc ảnh: nếu 4 góc đồng màu hoặc trắng/đen, tính khoảng cách màu Euclidean để tách vật thể chuẩn xác 100%,
-    không bị Rembg lẹm vào phần trắng/đen của vật thể.
+    Tách nền studio chuẩn xác qua không gian CIE Lab + Phân ngưỡng tự động Otsu + Lọc hình thái học:
+    1. Chuyển sang không gian màu Lab để tách độc lập kênh độ sáng L khỏi 2 kênh sắc độ a, b (loại bỏ bóng đổ).
+    2. Lấy mẫu màu 4 góc ảnh để nhận diện phông nền studio (trắng tinh, đen tuyền hoặc đồng màu).
+    3. Tính khoảng cách sắc độ và chuẩn hóa phân ngưỡng tự động Otsu (Otsu's Thresholding).
+    4. Áp dụng toán tử Closing (lấp đầy lỗ thủng phản quang) và Opening (xóa nhiễu hạt bụi ngoài nền).
     """
     h, w = img_rgb.shape[:2]
     patch_size = max(8, min(16, h // 10, w // 10))
-    corners = np.concatenate([
+    corners_rgb = np.concatenate([
         img_rgb[:patch_size, :patch_size].reshape(-1, 3),
         img_rgb[:patch_size, -patch_size:].reshape(-1, 3),
         img_rgb[-patch_size:, :patch_size].reshape(-1, 3),
         img_rgb[-patch_size:, -patch_size:].reshape(-1, 3),
     ], axis=0)
 
-    bg_color = np.median(corners, axis=0)
-    is_white_bg = np.all(bg_color > 235)
-    is_black_bg = np.all(bg_color < 20)
-    is_uniform_bg = np.all(np.std(corners, axis=0) < 14.0)
+    bg_rgb = np.median(corners_rgb, axis=0)
+    corner_std = np.std(corners_rgb, axis=0)
+    is_white_bg = np.all(bg_rgb > 235)
+    is_black_bg = np.all(bg_rgb < 20)
+    is_uniform_bg = np.all(corner_std < 14.0)
 
-    if is_white_bg or is_black_bg or is_uniform_bg:
-        diff = np.linalg.norm(img_rgb.astype(np.float32) - bg_color.astype(np.float32), axis=-1)
-        raw_mask = (diff > tolerance).astype(np.uint8) * 255
-        refined = refine_alpha_mask(raw_mask)
-        ratio = np.count_nonzero(refined > 127) / refined.size
-        if 0.01 < ratio < 0.98:
-            return refined
+    if not (is_white_bg or is_black_bg or is_uniform_bg):
+        return None
+
+    # Chuyển sang không gian Lab
+    img_lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+    corner_lab = cv2.cvtColor(bg_rgb.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2LAB).reshape(3).astype(np.float32)
+
+    # Đo khoảng cách màu tổng hợp trong Lab (sắc độ a,b chiếm trọng số cao để khử ảnh hưởng bóng đổ)
+    diff_L = np.abs(img_lab[:, :, 0].astype(np.float32) - corner_lab[0])
+    diff_ab = np.linalg.norm(img_lab[:, :, 1:].astype(np.float32) - corner_lab[1:], axis=-1)
+
+    if is_white_bg or is_black_bg:
+        diff_total = diff_L * 0.7 + diff_ab * 1.3
+    else:
+        diff_total = diff_L * 0.3 + diff_ab * 1.7
+
+    # Phân ngưỡng tự động Otsu
+    diff_norm = cv2.normalize(diff_total, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, otsu_mask = cv2.threshold(diff_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Toán tử hình thái học: Closing (lấp lỗ thủng phản quang) + Opening (khử nhiễu nền)
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask_closed = cv2.morphologyEx(otsu_mask, cv2.MORPH_CLOSE, kernel_close)
+    mask_cleaned = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, kernel_open)
+
+    refined = refine_alpha_mask(mask_cleaned)
+    ratio = np.count_nonzero(refined > 127) / refined.size
+    if 0.01 < ratio < 0.98:
+        return refined
     return None
 
 
@@ -269,24 +304,29 @@ def normalize_multiview_scales_and_canvas(
     alpha_masks: List[np.ndarray],
     target_size: int = DEFAULT_TARGET_SIZE,
     padding_factor: float = 0.85,
-) -> Tuple[List[np.ndarray], List[np.ndarray], List[float]]:
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[float], List[np.ndarray]]:
     """
     Toán tử cốt lõi giải quyết triệt để lỗi 'không khớp tỷ lệ giữa các mặt' và 'lệch tâm' (Off-center):
 
     1. Tìm Bounding Box thực tế của vật thể qua Alpha Mask trên từng góc nhìn.
-    2. Tìm kích thước tối đa của vật thể trên toàn bộ các góc nhìn:
+    2. Tìm kích thước tối đa của vật thể trên toàn bộ chuỗi ảnh:
        max_obj_dim = max(h_box, w_box) trên toàn bộ N ảnh.
     3. Áp dụng DUY NHẤT một tỉ lệ thu phóng toàn cục (Global Uniform Scale):
        global_scale = (target_size * padding_factor) / max_obj_dim.
-    4. Căn tâm vật thể chính xác vào trung tâm khung vuông chuẩn (target_size/2, target_size/2):
-       - Ép toàn bộ vùng ngoài mask về màu nền chuẩn (trắng tinh [255, 255, 255] hoặc đen [0, 0, 0])
-         để triệt tiêu hoàn toàn đường viền hộp (letterbox artifact).
-       - Cắt lát an toàn tuyệt đối chống lỗi Shape Mismatch.
+    4. Căn tâm vật thể chính xác vào trung tâm khung vuông chuẩn (target_size/2, target_size/2).
+    5. ĐẶC BIỆT (Bảo toàn hình học Epipolar):
+       Bù trừ độ dời tâm (ox - x_min * scale) và (oy - y_min * scale) vào Ma trận Camera Intrinsics K_i':
+       K_i' = [[f_x',  0,   c_x'],
+               [ 0,   f_y', c_y'],
+               [ 0,    0,    1  ]]
+       Giúp tia chiếu phối cảnh 3D đâm chính xác 100% vào trọng tâm vật thể, triệt tiêu lỗi gọt cụt
+       mũi/gót của vật thể bất đối xứng (chiếc giày, ô tô, v.v.).
+    6. Ép toàn bộ pixel ngoài mask về màu nền chuẩn để khử triệt để đường viền hộp (letterbox artifact).
     """
     n = len(images_rgb)
     bounding_boxes = []
 
-    # 1. Xác định Bounding Box thực của vật thể để căn tâm và xác định kích thước thực
+    # 1. Xác định Bounding Box thực của vật thể
     for msk in alpha_masks:
         coords = np.argwhere(msk > 127)
         if len(coords) > 10:
@@ -297,7 +337,7 @@ def normalize_multiview_scales_and_canvas(
             y_max, x_max = msk.shape
         bounding_boxes.append((y_min, y_max, x_min, x_max))
 
-    # 2. Tìm kích thước chiều dài/rộng lớn nhất của vật thể trên tất cả các góc
+    # 2. Tìm kích thước lớn nhất của vật thể trên tất cả các góc
     max_obj_dim = 1
     for (y_min, y_max, x_min, x_max) in bounding_boxes:
         h_box = y_max - y_min
@@ -309,10 +349,12 @@ def normalize_multiview_scales_and_canvas(
     canonical_rgb_list = []
     canonical_mask_list = []
     scale_factors = []
+    camera_intrinsics_list = []
 
     for i in range(n):
         img = images_rgb[i]
         msk = alpha_masks[i]
+        H_orig, W_orig = img.shape[:2]
         y_min, y_max, x_min, x_max = bounding_boxes[i]
 
         crop_rgb = img[y_min:y_max, x_min:x_max]
@@ -326,10 +368,13 @@ def normalize_multiview_scales_and_canvas(
         nh = min(target_size, max(16, (nh // 16) * 16))
         nw = min(target_size, max(16, (nw // 16) * 16))
 
+        scale_x = float(nw) / float(max(1, cw))
+        scale_y = float(nh) / float(max(1, ch))
+
         r_img = cv2.resize(crop_rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
         r_msk = cv2.resize(crop_msk, (nw, nh), interpolation=cv2.INTER_NEAREST)
 
-        # Xác định màu nền canvas chuẩn
+        # Xác định màu nền canvas chuẩn (trắng hoặc đen)
         corner_brightness = float(np.mean([img[0, 0], img[0, -1], img[-1, 0], img[-1, -1]]))
         bg_col = np.array([255, 255, 255], dtype=np.uint8) if corner_brightness > 128 else np.array([0, 0, 0], dtype=np.uint8)
 
@@ -349,15 +394,34 @@ def normalize_multiview_scales_and_canvas(
         canvas_rgb[oy:ey, ox:ex] = r_img[:ey - oy, :ex - ox]
         canvas_mask[oy:ey, ox:ex] = r_msk[:ey - oy, :ex - ox]
 
+        # ── TÍNH TOÁN BÙ TRỪ MA TRẬN CAMERA INTRINSICS K_i' ──
+        # Tâm quang học gốc và tiêu cự gốc (FOV 50°)
+        c_x0 = W_orig / 2.0
+        c_y0 = H_orig / 2.0
+        f_0 = float((W_orig / 2.0) / np.tan(np.radians(25.0)))
+
+        # Bù trừ chính xác phép dời tâm và co dãn
+        f_x_comp = float(f_0 * scale_x)
+        f_y_comp = float(f_0 * scale_y)
+        c_x_comp = float(c_x0 * scale_x + (ox - x_min * scale_x))
+        c_y_comp = float(c_y0 * scale_y + (oy - y_min * scale_y))
+
+        K_prime = np.array([
+            [f_x_comp, 0.0,      c_x_comp],
+            [0.0,      f_y_comp, c_y_comp],
+            [0.0,      0.0,      1.0     ],
+        ], dtype=np.float32)
+
         canonical_rgb_list.append(canvas_rgb)
         canonical_mask_list.append(canvas_mask)
         scale_factors.append(global_scale)
+        camera_intrinsics_list.append(K_prime)
 
     logger.info(
-        f"[P1] Đã căn tâm và đồng bộ tỉ lệ đa góc nhìn qua Foreground Bounding Box "
-        f"({target_size}x{target_size}, Scale: {global_scale:.4f}, Padding: {padding_factor})"
+        f"[P1] Đã căn tâm Bounding Box và bù trừ ma trận Camera Intrinsics K' ({target_size}x{target_size}, "
+        f"Global Scale: {global_scale:.4f}, Padding: {padding_factor})"
     )
-    return canonical_rgb_list, canonical_mask_list, scale_factors
+    return canonical_rgb_list, canonical_mask_list, scale_factors, camera_intrinsics_list
 
 
 def vit_geometric_resize(
@@ -506,7 +570,7 @@ def preprocess_multiview(
     raw_masks = extract_alpha_masks(matched_images, native_masks=native_masks)
 
     # 3. Đồng bộ tỷ lệ toàn cục và căn tâm trên khung vuông chuẩn
-    clean_rgb_list, clean_mask_list, scale_factors = normalize_multiview_scales_and_canvas(
+    clean_rgb_list, clean_mask_list, scale_factors, camera_intrinsics_list = normalize_multiview_scales_and_canvas(
         images_rgb=matched_images,
         alpha_masks=raw_masks,
         target_size=target_size,
@@ -525,9 +589,8 @@ def preprocess_multiview(
     # 4. Nhận diện góc nhìn
     viewpoint_assignments = classify_viewpoints(clean_rgb_list, filenames=filenames, device=device)
 
-    # Tiêu cự chuẩn hóa cho khung vuông target_size x target_size theo FOV 50°
-    f_est = float((target_size / 2.0) / np.tan(np.radians(25.0)))
-    focal_lengths = [(f_est, f_est)] * len(clean_rgb_list)
+    # Tiêu cự chuẩn hóa trích xuất từ camera_intrinsics_list đã bù trừ
+    focal_lengths = [(float(K[0, 0]), float(K[1, 1])) for K in camera_intrinsics_list]
 
     result = {
         "images_rgb": clean_rgb_list,
@@ -536,6 +599,8 @@ def preprocess_multiview(
         "clean_mask_list": clean_mask_list,
         "images_normalized": torch.stack(tensor_list) if HAS_TORCH and tensor_list else None,
         "viewpoint_assignments": viewpoint_assignments,
+        "camera_intrinsics": camera_intrinsics_list,
+        "camera_intrinsics_list": camera_intrinsics_list,
         "focal_lengths": focal_lengths,
         "scale_factors": scale_factors,
         "original_sizes": [img.shape[:2] for img in raw_images],

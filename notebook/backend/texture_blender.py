@@ -116,6 +116,7 @@ class TextureBlender:
         images_rgb: Sequence[np.ndarray],
         camera_poses: Sequence[object],
         focal_lengths: Sequence[Tuple[float, float]],
+        camera_intrinsics: Optional[Sequence[Optional[np.ndarray]]] = None,
     ) -> np.ndarray:
         """
         Gán màu cho đỉnh mesh theo công thức NVIDIA Angle-Weighted:
@@ -127,8 +128,14 @@ class TextureBlender:
         accumulated = np.zeros((len(vertices), 3), dtype=np.float64)
         accumulated_weights = np.zeros(len(vertices), dtype=np.float64)
 
-        for image, pose, focal in zip(images_rgb, camera_poses, focal_lengths):
-            pixels, depth, in_image = project_vertices(vertices, pose, focal, image.shape)
+        for idx, (image, pose, focal) in enumerate(zip(images_rgb, camera_poses, focal_lengths)):
+            principal_point = None
+            if camera_intrinsics is not None and idx < len(camera_intrinsics) and camera_intrinsics[idx] is not None:
+                K_i = camera_intrinsics[idx]
+                focal = (float(K_i[0, 0]), float(K_i[1, 1]))
+                principal_point = (float(K_i[0, 2]), float(K_i[1, 2]))
+
+            pixels, depth, in_image = project_vertices(vertices, pose, focal, image.shape, principal_point=principal_point)
             visible = visible_vertex_mask(pixels, depth, in_image, image.shape, tolerance=0.03)
             camera_center = np.asarray(pose, dtype=np.float32)[:3, 3]
             to_camera = camera_center - vertices
@@ -164,6 +171,7 @@ class TextureBlender:
         camera_poses: Sequence[object],
         focal_lengths: Sequence[Tuple[float, float]],
         output_path: str,
+        camera_intrinsics: Optional[Sequence[Optional[np.ndarray]]] = None,
     ) -> Tuple[bool, str]:
         """
         Quy trình trọn gói P5: Tính toán màu sắc đa hướng và xuất file .glb chuẩn hóa.
@@ -174,7 +182,7 @@ class TextureBlender:
 
             export_mesh = mesh.copy()
             vertex_colors = self.blend_colors_for_vertices(
-                export_mesh, images_rgb, camera_poses, focal_lengths
+                export_mesh, images_rgb, camera_poses, focal_lengths, camera_intrinsics=camera_intrinsics
             )
             export_mesh.visual = trimesh.visual.ColorVisuals(
                 mesh=export_mesh,

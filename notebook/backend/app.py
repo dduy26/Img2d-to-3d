@@ -151,6 +151,7 @@ def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
     alpha_masks = prep["alpha_masks"]
     viewpoint_assignments = prep.get("viewpoint_assignments")
     focal_lengths = prep.get("focal_lengths")
+    camera_intrinsics = prep.get("camera_intrinsics")
 
     # 2. P2 Depth Prediction
     depth_res = depth_engine.predict_multiview_depth(images_rgb=images_rgb, alpha_masks=alpha_masks)
@@ -207,6 +208,7 @@ def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
             alpha_masks=alpha_masks,
             camera_poses=camera_poses,
             focal_lengths=focal_lengths,
+            camera_intrinsics=camera_intrinsics,
             view_names=saved_paths,
             viewpoint_assignments=viewpoint_assignments,
         )
@@ -236,6 +238,7 @@ def execute_3d_pipeline(saved_paths: List[str], mode: str = "auto") -> dict:
         images_rgb=images_rgb,
         camera_poses=camera_poses,
         focal_lengths=focal_lengths,
+        camera_intrinsics=camera_intrinsics,
         output_path=output_glb_path,
     )
 

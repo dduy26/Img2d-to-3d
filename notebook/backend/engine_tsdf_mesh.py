@@ -252,6 +252,7 @@ class TSDFMeshEngine:
         alpha_masks: List[np.ndarray],
         camera_poses: Optional[List[np.ndarray]] = None,
         focal_lengths: Optional[List[Tuple[float, float]]] = None,
+        camera_intrinsics: Optional[List[np.ndarray]] = None,
         view_names: Optional[List[str]] = None,
         viewpoint_assignments: Optional[List[Dict[str, Any]]] = None,
         rgb_images: Optional[List[np.ndarray]] = None,
@@ -266,6 +267,7 @@ class TSDFMeshEngine:
             alpha_masks: Danh sách N alpha masks uint8 {0, 255}.
             camera_poses: Danh sách N ma trận c2w 4x4.
             focal_lengths: Danh sách N cặp (fx, fy).
+            camera_intrinsics: Danh sách N ma trận 3x3 K_i' đã bù trừ dời tâm Bounding Box.
             view_names: Danh sách tên file để hỗ trợ cameras.json.
             viewpoint_assignments: Kết quả phân loại mặt từ P1.
 
@@ -281,10 +283,13 @@ class TSDFMeshEngine:
 
         if focal_lengths is None or len(focal_lengths) != n_views:
             focal_lengths = []
-            for d in depth_maps:
-                h_i, w_i = d.shape[:2]
-                f_est = float((w_i / 2.0) / np.tan(np.radians(25.0)))
-                focal_lengths.append((f_est, f_est))
+            for i, d in enumerate(depth_maps):
+                if camera_intrinsics is not None and i < len(camera_intrinsics) and camera_intrinsics[i] is not None:
+                    focal_lengths.append((float(camera_intrinsics[i][0, 0]), float(camera_intrinsics[i][1, 1])))
+                else:
+                    h_i, w_i = d.shape[:2]
+                    f_est = float((w_i / 2.0) / np.tan(np.radians(25.0)))
+                    focal_lengths.append((f_est, f_est))
 
         if camera_poses is None or len(camera_poses) != n_views:
             camera_poses = generate_camera_poses(
@@ -299,7 +304,10 @@ class TSDFMeshEngine:
         max_r_obj = 0.55
         for i in range(n_views):
             pose = camera_poses[i]
-            fx, _ = focal_lengths[i]
+            if camera_intrinsics is not None and i < len(camera_intrinsics) and camera_intrinsics[i] is not None:
+                fx = float(camera_intrinsics[i][0, 0])
+            else:
+                fx, _ = focal_lengths[i]
             a_mask = alpha_masks[i] if i < len(alpha_masks) else np.ones(depth_maps[i].shape[:2], dtype=np.uint8)
             coords = np.argwhere(a_mask > 127)
             if len(coords) > 10:
@@ -334,8 +342,13 @@ class TSDFMeshEngine:
             d_map = depth_maps[i]
             a_mask = alpha_masks[i] if i < len(alpha_masks) else np.ones(d_map.shape[:2], dtype=np.uint8)
             h_i, w_i = d_map.shape[:2]
-            fx, fy = focal_lengths[i]
-            cx, cy = w_i / 2.0, h_i / 2.0
+            if camera_intrinsics is not None and i < len(camera_intrinsics) and camera_intrinsics[i] is not None:
+                K_i = camera_intrinsics[i]
+                fx, fy = float(K_i[0, 0]), float(K_i[1, 1])
+                cx, cy = float(K_i[0, 2]), float(K_i[1, 2])
+            else:
+                fx, fy = focal_lengths[i]
+                cx, cy = w_i / 2.0, h_i / 2.0
 
             c2w = np.eye(4, dtype=np.float32)
             c2w[:3, :4] = pose[:3, :4]

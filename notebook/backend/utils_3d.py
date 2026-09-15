@@ -61,6 +61,7 @@ def project_vertices(
     camera_pose: object,
     focal_length: Tuple[float, float],
     image_shape: Tuple[int, int, int],
+    principal_point: Optional[Tuple[float, float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Project world-space vertices using the P2 camera-to-world convention."""
     pose = as_camera_pose(camera_pose)
@@ -71,7 +72,10 @@ def project_vertices(
 
     height, width = image_shape[:2]
     fx, fy = focal_length
-    cx, cy = width / 2.0, height / 2.0
+    if principal_point is not None:
+        cx, cy = float(principal_point[0]), float(principal_point[1])
+    else:
+        cx, cy = width / 2.0, height / 2.0
     safe_depth = np.maximum(depth, 1e-6)
     pixels = np.column_stack(
         (
