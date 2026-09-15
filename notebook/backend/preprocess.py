@@ -170,12 +170,11 @@ def refine_alpha_mask(mask: np.ndarray) -> np.ndarray:
 def _detect_solid_background_mask(img_rgb: np.ndarray, tolerance: float = 18.0) -> Optional[np.ndarray]:
     """
     Tách nền siêu tốc cho ảnh studio / render 3D (nền trắng tinh #ffffff hoặc đen #000000 hoặc đồng màu).
-    Kiểm tra 4 góc ảnh: nếu 4 góc đồng màu, tính khoảng cách màu Euclidean để tách vật thể chuẩn xác 100%,
+    Kiểm tra 4 góc ảnh: nếu 4 góc đồng màu hoặc trắng/đen, tính khoảng cách màu Euclidean để tách vật thể chuẩn xác 100%,
     không bị Rembg lẹm vào phần trắng/đen của vật thể.
     """
     h, w = img_rgb.shape[:2]
-    # Lấy mẫu các góc
-    patch_size = min(16, h // 8, w // 8)
+    patch_size = max(8, min(16, h // 10, w // 10))
     corners = np.concatenate([
         img_rgb[:patch_size, :patch_size].reshape(-1, 3),
         img_rgb[:patch_size, -patch_size:].reshape(-1, 3),
@@ -183,17 +182,18 @@ def _detect_solid_background_mask(img_rgb: np.ndarray, tolerance: float = 18.0) 
         img_rgb[-patch_size:, -patch_size:].reshape(-1, 3),
     ], axis=0)
 
-    corner_std = np.std(corners, axis=0)
-    # Nếu độ lệch màu 4 góc rất nhỏ (nền đồng nhất)
-    if np.all(corner_std < 8.0):
-        bg_color = np.median(corners, axis=0)
+    bg_color = np.median(corners, axis=0)
+    is_white_bg = np.all(bg_color > 235)
+    is_black_bg = np.all(bg_color < 20)
+    is_uniform_bg = np.all(np.std(corners, axis=0) < 14.0)
+
+    if is_white_bg or is_black_bg or is_uniform_bg:
         diff = np.linalg.norm(img_rgb.astype(np.float32) - bg_color.astype(np.float32), axis=-1)
-        if diff.max() > 25.0:
-            raw_mask = (diff > tolerance).astype(np.uint8) * 255
-            refined = refine_alpha_mask(raw_mask)
-            ratio = np.count_nonzero(refined > 127) / refined.size
-            if 0.02 < ratio < 0.95:
-                return refined
+        raw_mask = (diff > tolerance).astype(np.uint8) * 255
+        refined = refine_alpha_mask(raw_mask)
+        ratio = np.count_nonzero(refined > 127) / refined.size
+        if 0.01 < ratio < 0.98:
+            return refined
     return None
 
 
@@ -268,33 +268,43 @@ def normalize_multiview_scales_and_canvas(
     images_rgb: List[np.ndarray],
     alpha_masks: List[np.ndarray],
     target_size: int = DEFAULT_TARGET_SIZE,
+    padding_factor: float = 0.85,
 ) -> Tuple[List[np.ndarray], List[np.ndarray], List[float]]:
     """
-    Toán tử cốt lõi giải quyết triệt để lỗi 'không khớp tỷ lệ giữa các mặt' (Front vs Left/Right):
+    Toán tử cốt lõi giải quyết triệt để lỗi 'không khớp tỷ lệ giữa các mặt' và 'lệch tâm' (Off-center):
 
-    Vấn đề cũ:
-        Nếu mỗi ảnh tự resize theo max(H_i, W_i) riêng của nó, mặt trước (dọc, hẹp) sẽ bị kéo to,
-        còn mặt bên (ngang, dài) sẽ bị thu nhỏ lại. Khi gọt khối (Space Carving), mặt trước sẽ cắt
-        cụt chiều dài của mặt bên!
-
-    Giải pháp chuẩn NVIDIA:
-        1. Tìm kích thước tối đa bao phủ toàn bộ chuỗi ảnh: global_max_dim = max_i(max(H_i, W_i)).
-        2. Áp dụng DUY NHẤT một tỉ lệ thu phóng (Global Uniform Scale) cho toàn bộ N ảnh:
-           global_scale = target_size / global_max_dim.
-        3. Đặt từng ảnh đã co dãn vào chính giữa một khung vuông chuẩn (target_size, target_size),
-           đệm viền đối xứng (Symmetric Letterbox).
-
-    Kết quả:
-        - Mọi ảnh đều có chung độ phân giải (target_size, target_size).
-        - Mọi camera đều có tâm quang học chính giữa (c_x, c_y) = (target_size/2, target_size/2).
-        - Mọi camera đều có cùng tiêu cự f_x = f_y = f_est.
-        - Tỉ lệ chiều dài, chiều rộng, chiều cao của vật thể giữa tất cả các góc nhìn là 1:1 tuyệt đối,
-          không bao giờ bị crop ngang hay mất cân bằng hình học!
+    1. Tìm Bounding Box thực tế của vật thể qua Alpha Mask trên từng góc nhìn.
+    2. Tìm kích thước tối đa của vật thể trên toàn bộ các góc nhìn:
+       max_obj_dim = max(h_box, w_box) trên toàn bộ N ảnh.
+    3. Áp dụng DUY NHẤT một tỉ lệ thu phóng toàn cục (Global Uniform Scale):
+       global_scale = (target_size * padding_factor) / max_obj_dim.
+    4. Căn tâm vật thể chính xác vào trung tâm khung vuông chuẩn (target_size/2, target_size/2):
+       - Ép toàn bộ vùng ngoài mask về màu nền chuẩn (trắng tinh [255, 255, 255] hoặc đen [0, 0, 0])
+         để triệt tiêu hoàn toàn đường viền hộp (letterbox artifact).
+       - Cắt lát an toàn tuyệt đối chống lỗi Shape Mismatch.
     """
     n = len(images_rgb)
-    # 1. Tìm kích thước tối đa trong toàn bộ ảnh đầu vào
-    max_dim = max(max(img.shape[0], img.shape[1]) for img in images_rgb)
-    global_scale = float(target_size) / float(max_dim)
+    bounding_boxes = []
+
+    # 1. Xác định Bounding Box thực của vật thể để căn tâm và xác định kích thước thực
+    for msk in alpha_masks:
+        coords = np.argwhere(msk > 127)
+        if len(coords) > 10:
+            y_min, x_min = coords.min(axis=0)
+            y_max, x_max = coords.max(axis=0) + 1
+        else:
+            y_min, x_min = 0, 0
+            y_max, x_max = msk.shape
+        bounding_boxes.append((y_min, y_max, x_min, x_max))
+
+    # 2. Tìm kích thước chiều dài/rộng lớn nhất của vật thể trên tất cả các góc
+    max_obj_dim = 1
+    for (y_min, y_max, x_min, x_max) in bounding_boxes:
+        h_box = y_max - y_min
+        w_box = x_max - x_min
+        max_obj_dim = max(max_obj_dim, h_box, w_box)
+
+    global_scale = (float(target_size) * padding_factor) / float(max(1, max_obj_dim))
 
     canonical_rgb_list = []
     canonical_mask_list = []
@@ -303,30 +313,33 @@ def normalize_multiview_scales_and_canvas(
     for i in range(n):
         img = images_rgb[i]
         msk = alpha_masks[i]
-        h, w = img.shape[:2]
+        y_min, y_max, x_min, x_max = bounding_boxes[i]
 
-        nh = int(round(h * global_scale))
-        nw = int(round(w * global_scale))
+        crop_rgb = img[y_min:y_max, x_min:x_max]
+        crop_msk = msk[y_min:y_max, x_min:x_max]
 
-        # Ép kích thước chia hết cho 16 nhưng tuyệt đối không vượt quá target_size
-        nh = int(min(target_size, max(16, (nh // 16) * 16)))
-        nw = int(min(target_size, max(16, (nw // 16) * 16)))
+        ch, cw = crop_rgb.shape[:2]
+        nh = int(round(ch * global_scale))
+        nw = int(round(cw * global_scale))
 
-        r_img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        r_msk = cv2.resize(msk, (nw, nh), interpolation=cv2.INTER_NEAREST)
+        # Ràng buộc chặt chẽ không vượt quá target_size và chia hết cho 16
+        nh = min(target_size, max(16, (nh // 16) * 16))
+        nw = min(target_size, max(16, (nw // 16) * 16))
 
-        # 1. Khắc phục Lỗi 1: Xác định màu nền chuẩn (Trắng tinh hoặc Đen cố định)
-        # Nếu góc ảnh có độ sáng trung bình > 128 (phông sáng/trắng từ studio/Objaverse) -> dùng trắng tinh [255, 255, 255]
+        r_img = cv2.resize(crop_rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        r_msk = cv2.resize(crop_msk, (nw, nh), interpolation=cv2.INTER_NEAREST)
+
+        # Xác định màu nền canvas chuẩn
         corner_brightness = float(np.mean([img[0, 0], img[0, -1], img[-1, 0], img[-1, -1]]))
         bg_col = np.array([255, 255, 255], dtype=np.uint8) if corner_brightness > 128 else np.array([0, 0, 0], dtype=np.uint8)
 
-        # Khử triệt để đường viền hộp (letterbox artifact): ép toàn bộ vùng ngoài mask về màu nền chuẩn
+        # Ép triệt để vùng ngoài mask về màu nền chuẩn để khử đường viền hộp letterbox
         r_img[r_msk == 0] = bg_col
 
         canvas_rgb = np.full((target_size, target_size, 3), bg_col, dtype=np.uint8)
         canvas_mask = np.zeros((target_size, target_size), dtype=np.uint8)
 
-        # 2. Khắc phục Lỗi 2: Tính toán vị trí cắt lát an toàn tuyệt đối, chống lỗi Broadcast Shape Mismatch
+        # Căn chính xác vào trung tâm khung vuông với cắt lát an toàn tuyệt đối
         act_h, act_w = r_img.shape[:2]
         oy = max(0, (target_size - act_h) // 2)
         ox = max(0, (target_size - act_w) // 2)
@@ -341,8 +354,8 @@ def normalize_multiview_scales_and_canvas(
         scale_factors.append(global_scale)
 
     logger.info(
-        f"[P1] Đã đồng bộ tỉ lệ đa góc nhìn trên khung vuông chuẩn ({target_size}x{target_size}), "
-        f"Global Scale: {global_scale:.4f}"
+        f"[P1] Đã căn tâm và đồng bộ tỉ lệ đa góc nhìn qua Foreground Bounding Box "
+        f"({target_size}x{target_size}, Scale: {global_scale:.4f}, Padding: {padding_factor})"
     )
     return canonical_rgb_list, canonical_mask_list, scale_factors
 
