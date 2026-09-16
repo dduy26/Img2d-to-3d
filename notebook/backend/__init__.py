@@ -1,122 +1,38 @@
-# notebook/backend/__init__.py
 """
-Backend package cho ImgToModel Pipeline chuẩn NVIDIA.
-Cung cấp toàn bộ các phân hệ P1 - P6 cho người dùng:
-- P1: Preprocessing & Viewpoint Assignment
-- P2: Depth & Surface Mesh Engine (Depth-Anything-V2)
-- P3: Quality Gate
-- P4: Volumetric TSDF Mesh Engine (True Space Carving)
-- P5: Texture Blender & PBR Exporter
-- P6: FastAPI Application & execute_3d_pipeline
+__init__.py — Package Interface voi Lazy Loading
+================================================
+Su dung __getattr__ de chi import module khi can thiet,
+tranh import cascade (cascade import lam tang thoi gian khoi dong).
+
+Module nay hoat dong nhu cong vao chung cua package 'backend'.
 """
 
-import os, sys
-_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-if _BACKEND_DIR not in sys.path:
-    sys.path.insert(0, _BACKEND_DIR)
+from __future__ import annotations
 
-try:
-    from .preprocess import (
-        preprocess_multiview,
-        preprocess_single_view,
-        validate_and_load_images,
-        histogram_match_sequence,
-        extract_alpha_masks,
-        refine_alpha_mask,
-        vit_geometric_resize,
-        normalize_multiview_scales_and_canvas,
-        classify_viewpoints,
-    )
-    from .engine_depth import (
-        DepthReconstructionEngine,
-        SurfaceMeshEngine,
-    )
-    from .quality_gate import (
-        QualityGate,
-    )
-    from .engine_tsdf_mesh import (
-        TSDFMeshEngine,
-        mesh_health,
-        log_mesh_health,
-        generate_camera_poses,
-    )
-    from .texture_blender import (
-        TextureBlender,
-    )
-    from .utils_3d import (
-        export_glb,
-    )
-    from .app import (
-        execute_3d_pipeline,
-        app,
-    )
-except ImportError:
-    from preprocess import (
-        preprocess_multiview,
-        preprocess_single_view,
-        validate_and_load_images,
-        histogram_match_sequence,
-        extract_alpha_masks,
-        refine_alpha_mask,
-        vit_geometric_resize,
-        normalize_multiview_scales_and_canvas,
-        classify_viewpoints,
-    )
-    from engine_depth import (
-        DepthReconstructionEngine,
-        SurfaceMeshEngine,
-    )
-    from quality_gate import (
-        QualityGate,
-    )
-    from engine_tsdf_mesh import (
-        TSDFMeshEngine,
-        mesh_health,
-        log_mesh_health,
-        generate_camera_poses,
-    )
-    from texture_blender import (
-        TextureBlender,
-    )
-    from utils_3d import (
-        export_glb,
-    )
-    from app import (
-        execute_3d_pipeline,
-        app,
-    )
+# Version cua pipeline
+__version__ = "2.0.0"
+__author__  = "ImgToModel Team"
 
-# Backward-compatibility aliases
-dust3r_resize = vit_geometric_resize
-histogram_match = histogram_match_sequence
+# Cac module chinh
+_MODULES = {
+    "utils_3d":         "notebook.backend.utils_3d",
+    "preprocess":       "notebook.backend.preprocess",
+    "engine_depth":     "notebook.backend.engine_depth",
+    "quality_gate":     "notebook.backend.quality_gate",
+    "engine_tsdf_mesh": "notebook.backend.engine_tsdf_mesh",
+    "texture_blender":  "notebook.backend.texture_blender",
+    "app":              "notebook.backend.app",
+}
 
-__all__ = [
-    # P1
-    "preprocess_multiview",
-    "preprocess_single_view",
-    "validate_and_load_images",
-    "histogram_match_sequence",
-    "histogram_match",
-    "extract_alpha_masks",
-    "refine_alpha_mask",
-    "vit_geometric_resize",
-    "normalize_multiview_scales_and_canvas",
-    "dust3r_resize",
-    "classify_viewpoints",
-    # P2
-    "DepthReconstructionEngine",
-    "SurfaceMeshEngine",
-    # P3
-    "QualityGate",
-    # P4
-    "TSDFMeshEngine",
-    "mesh_health",
-    "log_mesh_health",
-    "generate_camera_poses",
-    # P5
-    "TextureBlender",
-    "export_glb",
-    # P6
-    "execute_3d_pipeline",
-    "app",
-]
+def __getattr__(name: str):
+    """Lazy load module khi duoc truy cap lan dau."""
+    import importlib
+    if name in _MODULES:
+        mod = importlib.import_module(_MODULES[name])
+        globals()[name] = mod
+        return mod
+    raise AttributeError(f"module 'notebook.backend' khong co thuoc tinh '{name}'")
+
+
+def __dir__():
+    return list(_MODULES.keys()) + ["__version__", "__author__"]

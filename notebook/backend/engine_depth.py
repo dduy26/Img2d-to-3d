@@ -1,352 +1,337 @@
 """
-Module Ước Lượng Độ Sâu & Tái Tạo Hình Học Đơn Ảnh (Phase 2 - P2).
-Chuẩn hóa theo NVIDIA 3D Pipeline & Depth-Anything-V2-Small.
+engine_depth.py — P2: Uoc Luong Do Sau & Loc Vien
+==================================================
+Chuc nang:
+  1. Tai mo hinh Depth-Anything-V2-Small tu cache cuc bo (local_files_only=True).
+  2. Du doan ban do do sau (Depth Map) cho moi anh canvas 512x512.
+  3. Loc vien "flying pixels" bang bo loc gradient do sau (DA3 gradient edge filter).
+  4. Tra ve ban do do sau chuan hoa [0, 1] de dung cho TSDF fusion.
 
-Trách nhiệm chính:
-    1. Ước lượng độ sâu (Monocular Depth Estimation) bằng Depth-Anything-V2-Small (~95MB).
-    2. Lọc viền độ sâu (DA3-blender Edge Discontinuity Filtering) để loại bỏ hiện tượng mép rách/flying pixels.
-    3. Dự đoán độ sâu đa góc nhìn đồng bộ (Multi-view Depth Prediction).
-    4. Tái tạo hình học đơn ảnh (Single-view Surface Mesh) qua Pinhole Back-projection.
+Rang buoc phan cung:
+  - Mo hinh Depth-Anything-V2-Small: ~95MB VRAM, chay duoc tren RTX 3050 6GB.
+  - Doi voi CPU: toc do ~1.5 giay/anh tren i5-12450HX.
+
+Ly thuyet:
+  - DA3 gradient edge filter: loc vien dot gay (|gradient D| > nguong) de
+    loai bo flying pixels xuat hien o ranh gioi foreground/background.
 """
 
-import os
-import sys
-import time
-import logging
-from typing import Dict, Any, Tuple, Optional, List, Union
+from __future__ import annotations
+
+import warnings
+from pathlib import Path
+from typing import Optional, Union
 
 import cv2
 import numpy as np
-import trimesh
-from PIL import Image
 
-try:
-    import torch
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-try:
-    from .utils_3d import export_glb
-except ImportError:
-    try:
-        from utils_3d import export_glb
-    except ImportError:
-        def export_glb(mesh, path):
-            mesh.export(path, file_type="glb")
-            return str(path)
+MODEL_NAME        = "depth-anything/Depth-Anything-V2-Small-hf"
+GRADIENT_THR_REL  = 0.10   # Nguong gradient tuong doi (10% dai dong)
+CANVAS_SIZE       = 512
 
-logger = logging.getLogger("engine_depth")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(name)s: %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+# ---------------------------------------------------------------------------
+# 1. MODEL LOADING — Lazy singleton, local_files_only
+# ---------------------------------------------------------------------------
 
-DEPTH_MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
+_depth_model   = None
+_depth_pipe    = None
+_device_str    = None
 
 
-def filter_edge_discontinuity(
-    depth_map: np.ndarray,
-    tau: float = 0.05,
-) -> np.ndarray:
-    """
-    Toán tử DA3-blender: Lọc viền độ sâu (Edge Discontinuity Filtering).
+def _load_depth_pipeline(device: Optional[str] = None) -> object:
+    """Nap pipeline Depth-Anything-V2-Small lan dau, luu singleton.
 
-    Loại bỏ các pixel ranh giới có độ biến thiên gradient quá lớn
-    (nguyên nhân gây flying pixels và rách mép hình học).
-
-    Công thức:
-        Gx(u, v) = |D(u+1, v) - D(u-1, v)|
-        Gy(u, v) = |D(u, v+1) - D(u, v-1)|
-        valid_mask(u, v) = (max(Gx, Gy) <= tau * D(u, v) + 1e-4)
+    Uu tien:
+      1. local_files_only=True (chay hoan toan offline neu da cache).
+      2. Neu cache khong co -> download tu HuggingFace (log canh bao).
 
     Args:
-        depth_map: Ma trận độ sâu chuẩn hóa [0, 1] shape (H, W).
-        tau: Ngưỡng tỷ lệ biến thiên độ sâu (mặc định 0.05).
+        device: "cuda", "cpu", hoac None (tu dong phat hien).
 
     Returns:
-        valid_mask: np.ndarray bool shape (H, W), True nếu là pixel mặt phẳng hợp lệ.
+        transformers.Pipeline object.
     """
-    h, w = depth_map.shape[:2]
-    if h < 3 or w < 3:
-        return np.ones((h, w), dtype=bool)
+    global _depth_pipe, _device_str
 
-    gx = np.zeros_like(depth_map, dtype=np.float32)
-    gy = np.zeros_like(depth_map, dtype=np.float32)
+    if _depth_pipe is not None:
+        return _depth_pipe
 
-    # Trung tâm sai phân đạo hàm bậc nhất
-    gx[:, 1:-1] = 0.5 * np.abs(depth_map[:, 2:] - depth_map[:, :-2])
-    gy[1:-1, :] = 0.5 * np.abs(depth_map[2:, :] - depth_map[:-2, :])
+    try:
+        import torch
+        from transformers import pipeline as hf_pipeline
 
-    # Viền ngoài
-    gx[:, 0] = np.abs(depth_map[:, 1] - depth_map[:, 0])
-    gx[:, -1] = np.abs(depth_map[:, -1] - depth_map[:, -2])
-    gy[0, :] = np.abs(depth_map[1, :] - depth_map[0, :])
-    gy[-1, :] = np.abs(depth_map[-1, :] - depth_map[-2, :])
-
-    gradient_mag = np.maximum(gx, gy)
-    adaptive_thresh = tau * depth_map + 1e-4
-    valid_mask = gradient_mag <= adaptive_thresh
-    return valid_mask
-
-
-class DepthReconstructionEngine:
-    """
-    Động cơ ước lượng độ sâu và tái tạo hình học bề mặt chuẩn NVIDIA.
-    """
-
-    def __init__(self, device: Optional[str] = None):
-        """
-        Khởi tạo engine và nạp mô hình Depth-Anything-V2-Small.
-        """
         if device is None:
-            self.device = "cuda" if (HAS_TORCH and torch.cuda.is_available()) else "cpu"
-        else:
-            self.device = device
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        _device_str = device
 
-        self.depth_model = None
-        self.depth_processor = None
-        self._load_depth_model()
-
-    def _load_depth_model(self):
-        """Nạp model Depth-Anything-V2-Small từ HuggingFace Cache hoặc Hub."""
-        if not HAS_TORCH:
-            logger.warning("[P2] PyTorch không khả dụng. Cần PyTorch để chạy Depth-Anything-V2.")
-            return
-
+        # Thu tai tu cache cuc bo truoc
         try:
-            from transformers import AutoImageProcessor, AutoModelForDepthEstimation
-            logger.info(f"[P2] Đang nạp model {DEPTH_MODEL_ID} trên thiết bị '{self.device}'...")
-
-            try:
-                self.depth_processor = AutoImageProcessor.from_pretrained(DEPTH_MODEL_ID, local_files_only=True)
-                self.depth_model = AutoModelForDepthEstimation.from_pretrained(DEPTH_MODEL_ID, local_files_only=True)
-            except Exception:
-                self.depth_processor = AutoImageProcessor.from_pretrained(DEPTH_MODEL_ID)
-                self.depth_model = AutoModelForDepthEstimation.from_pretrained(DEPTH_MODEL_ID)
-
-            self.depth_model.to(self.device)
-            self.depth_model.eval()
-            logger.info(f"[P2] ✓ Depth-Anything-V2-Small nạp thành công trên {self.device}.")
-
-        except Exception as e:
-            logger.error(f"[P2] Không thể tải {DEPTH_MODEL_ID}: {e}", exc_info=True)
-            self.depth_model = None
-            self.depth_processor = None
-
-    def predict_depth(self, image_rgb: np.ndarray) -> np.ndarray:
-        """
-        Dự đoán Depth Map chuẩn hóa [0, 1] từ ảnh RGB đơn lẻ.
-
-        Args:
-            image_rgb: np.ndarray (H, W, 3) uint8.
-
-        Returns:
-            depth_map: np.ndarray (H, W) float32 trong khoảng [0.0, 1.0].
-                       (1.0 = gần camera nhất, 0.0 = xa camera nhất).
-        """
-        h, w = image_rgb.shape[:2]
-        if self.depth_model is None or self.depth_processor is None:
-            raise RuntimeError("[P2] Model Depth-Anything-V2 chưa được nạp.")
-
-        pil_img = Image.fromarray(image_rgb)
-        inputs = self.depth_processor(images=pil_img, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = self.depth_model(**inputs)
-            predicted_depth = outputs.predicted_depth
-
-        # Nội suy bicubic về đúng độ phân giải gốc của ảnh
-        depth_tensor = torch.nn.functional.interpolate(
-            predicted_depth.unsqueeze(1),
-            size=(h, w),
-            mode="bicubic",
-            align_corners=False,
-        )[0, 0]
-
-        depth_np = depth_tensor.cpu().numpy().astype(np.float32)
-
-        # Chuẩn hóa min-max về dải [0, 1]
-        d_min, d_max = float(depth_np.min()), float(depth_np.max())
-        if d_max - d_min > 1e-6:
-            depth_np = (depth_np - d_min) / (d_max - d_min)
-        else:
-            depth_np = np.full((h, w), 0.5, dtype=np.float32)
-
-        return depth_np
-
-    def predict_depth_batch(self, images_rgb: List[np.ndarray]) -> List[np.ndarray]:
-        """Dự đoán Depth Maps cho danh sách N ảnh."""
-        return [self.predict_depth(img) for img in images_rgb]
-
-    def predict_multiview_depth(
-        self,
-        images_rgb: List[np.ndarray],
-        alpha_masks: Optional[List[np.ndarray]] = None,
-        tau_edge: float = 0.05,
-    ) -> Dict[str, Any]:
-        """
-        Ước lượng độ sâu đa góc nhìn kết hợp lọc viền DA3-blender và mặt nạ Alpha.
-
-        Args:
-            images_rgb: Danh sách N ảnh RGB uint8 (H, W, 3).
-            alpha_masks: Danh sách N alpha masks uint8 (H, W).
-            tau_edge: Hệ số lọc viền mép rách DA3-blender.
-
-        Returns:
-            Dict chứa:
-                - 'depth_maps': List[np.ndarray (H, W) float32]
-                - 'valid_masks': List[np.ndarray (H, W) bool]
-        """
-        depth_maps = self.predict_depth_batch(images_rgb)
-        valid_masks = []
-
-        for i, d in enumerate(depth_maps):
-            edge_valid = filter_edge_discontinuity(d, tau=tau_edge)
-            if alpha_masks is not None and i < len(alpha_masks):
-                a_mask = (alpha_masks[i] > 127)
-                comb_mask = a_mask & edge_valid
-            else:
-                comb_mask = edge_valid
-            valid_masks.append(comb_mask)
-
-        return {
-            "depth_maps": depth_maps,
-            "valid_masks": valid_masks,
-        }
-
-    def reconstruct(
-        self,
-        image_rgb: np.ndarray,
-        alpha_mask: np.ndarray,
-        focal_length: Tuple[float, float],
-        output_path: str,
-        max_res: int = 384,
-        edge_threshold: float = 0.12,
-    ) -> Tuple[bool, Optional[str], float]:
-        """
-        Tái tạo bề mặt 3D hình học từ đơn ảnh (Single-view Surface Mesh).
-
-        Quy trình chuẩn hóa:
-            1. Dự đoán Depth Map chuẩn xác bằng Depth-Anything-V2-Small.
-            2. Chiếu ngược (Back-projection) tọa độ pixel thành điểm 3D (Pinhole Camera).
-            3. Dựng cấu trúc lưới tam giác Pinhole Grid với kiểm tra rách mép (Edge threshold).
-            4. Chuẩn hóa hệ trục Three.js (+Y Up, Y_min = 0) và xuất file .glb.
-
-        Returns:
-            (success, output_path, execution_time)
-        """
-        t0 = time.time()
-        logger.info(f"[P2] Bắt đầu tái tạo hình học đơn ảnh...")
-
-        try:
-            depth_map = self.predict_depth(image_rgb)
-            h_orig, w_orig = depth_map.shape[:2]
-            step = max(1, max(h_orig, w_orig) // max_res)
-
-            rows = np.arange(0, h_orig, step)
-            cols = np.arange(0, w_orig, step)
-            H_sub = len(rows)
-            W_sub = len(cols)
-
-            sub_depth = depth_map[rows[:, None], cols[None, :]]
-            if alpha_mask is not None:
-                sub_mask = (alpha_mask[rows[:, None], cols[None, :]] > 127)
-            else:
-                sub_mask = np.ones((H_sub, W_sub), dtype=bool)
-
-            sub_rgb = image_rgb[rows[:, None], cols[None, :]]
-
-            fx, fy = focal_length
-            cx, cy = w_orig / 2.0, h_orig / 2.0
-
-            u_grid = cols[None, :].repeat(H_sub, axis=0).astype(np.float32)
-            v_grid = rows[:, None].repeat(W_sub, axis=1).astype(np.float32)
-
-            # Đổi depth sang tọa độ Z thế giới (gần = Z nhỏ, xa = Z lớn)
-            z_3d = (1.0 - sub_depth) * 1.0 + 0.5
-            x_3d = (u_grid - cx) * z_3d / fx
-            y_3d = -(v_grid - cy) * z_3d / fy  # Hướng +Y lên trên
-
-            vertex_idx = np.full((H_sub, W_sub), -1, dtype=np.int32)
-            valid_coords = np.argwhere(sub_mask)
-
-            if len(valid_coords) < 3:
-                raise ValueError("Không đủ pixel tiền cảnh để dựng lưới.")
-
-            vertices = []
-            vertex_colors = []
-            for idx, (r, c) in enumerate(valid_coords):
-                vertex_idx[r, c] = idx
-                vertices.append([x_3d[r, c], y_3d[r, c], z_3d[r, c]])
-                vertex_colors.append([sub_rgb[r, c, 0], sub_rgb[r, c, 1], sub_rgb[r, c, 2], 255])
-
-            vertices = np.array(vertices, dtype=np.float32)
-            vertex_colors = np.array(vertex_colors, dtype=np.uint8)
-
-            faces = []
-            for r in range(H_sub - 1):
-                for c in range(W_sub - 1):
-                    i00 = vertex_idx[r, c]
-                    i01 = vertex_idx[r, c + 1]
-                    i10 = vertex_idx[r + 1, c]
-                    i11 = vertex_idx[r + 1, c + 1]
-
-                    # Tam giác 1: (r, c), (r+1, c), (r, c+1)
-                    if i00 >= 0 and i10 >= 0 and i01 >= 0:
-                        z00, z10, z01 = z_3d[r, c], z_3d[r + 1, c], z_3d[r, c + 1]
-                        if max(abs(z00 - z10), abs(z00 - z01), abs(z10 - z01)) <= edge_threshold:
-                            faces.append([i00, i10, i01])
-
-                    # Tam giác 2: (r+1, c), (r+1, c+1), (r, c+1)
-                    if i10 >= 0 and i11 >= 0 and i01 >= 0:
-                        z10, z11, z01 = z_3d[r + 1, c], z_3d[r + 1, c + 1], z_3d[r, c + 1]
-                        if max(abs(z10 - z11), abs(z10 - z01), abs(z11 - z01)) <= edge_threshold:
-                            faces.append([i10, i11, i01])
-
-            if len(faces) == 0:
-                for r in range(H_sub - 1):
-                    for c in range(W_sub - 1):
-                        i00 = vertex_idx[r, c]
-                        i01 = vertex_idx[r, c + 1]
-                        i10 = vertex_idx[r + 1, c]
-                        if i00 >= 0 and i10 >= 0 and i01 >= 0:
-                            faces.append([i00, i10, i01])
-
-            faces = np.array(faces, dtype=np.int32)
-
-            # Căn tâm và scale chuẩn hóa
-            center = np.mean(vertices, axis=0)
-            vertices -= center
-            span = np.max(np.ptp(vertices, axis=0))
-            if span > 1e-6:
-                vertices /= span
-
-            mesh = trimesh.Trimesh(
-                vertices=vertices,
-                faces=faces,
-                vertex_colors=vertex_colors,
-                process=True,
+            _depth_pipe = hf_pipeline(
+                "depth-estimation",
+                model=MODEL_NAME,
+                device=0 if device == "cuda" else -1,
+                local_files_only=True,
+            )
+        except OSError:
+            warnings.warn(
+                f"Model '{MODEL_NAME}' chua co trong cache cuc bo. "
+                "Se download tu HuggingFace (can ket noi internet).",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            _depth_pipe = hf_pipeline(
+                "depth-estimation",
+                model=MODEL_NAME,
+                device=0 if device == "cuda" else -1,
+                local_files_only=False,
             )
 
-            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-            export_glb(mesh, output_path)
+        return _depth_pipe
 
-            elapsed = time.time() - t0
-            logger.info(
-                f"[P2] ✓ Tái tạo đơn ảnh thành công: {len(mesh.vertices)} đỉnh, "
-                f"{len(mesh.faces)} mặt trong {elapsed:.2f}s -> {output_path}"
-            )
-            return True, output_path, elapsed
-
-        except Exception as e:
-            elapsed = time.time() - t0
-            logger.error(f"[P2] Lỗi tái tạo đơn ảnh: {e}", exc_info=True)
-            return False, None, elapsed
+    except ImportError as e:
+        raise ImportError(
+            "Can cai dat torch va transformers: pip install torch transformers"
+        ) from e
 
 
-# Backward-compatibility alias
-SurfaceMeshEngine = DepthReconstructionEngine
+# ---------------------------------------------------------------------------
+# 2. INFER DEPTH — Du doan ban do do sau
+# ---------------------------------------------------------------------------
+
+def infer_depth_map(
+    canvas_rgb: np.ndarray,
+    device: Optional[str] = None,
+) -> np.ndarray:
+    """Du doan ban do do sau cho anh canvas RGB.
+
+    Args:
+        canvas_rgb: (H, W, 3) uint8 RGB — anh da duoc co dan vao canvas.
+        device:     "cuda" / "cpu" / None (tu dong).
+
+    Returns:
+        depth_norm: (H, W) float32 in [0, 1], 1 = gan camera, 0 = xa.
+    """
+    pipe = _load_depth_pipeline(device)
+
+    from PIL import Image as PILImage
+    pil_img = PILImage.fromarray(canvas_rgb)
+    result  = pipe(pil_img)
+
+    # Ket qua la dict co "predicted_depth" (torch.Tensor hoac np.ndarray)
+    depth_raw = result["predicted_depth"]
+
+    # Chuyen sang numpy neu can
+    try:
+        import torch
+        if isinstance(depth_raw, torch.Tensor):
+            depth_raw = depth_raw.squeeze().cpu().numpy()
+    except ImportError:
+        pass
+
+    depth_raw = np.asarray(depth_raw, dtype=np.float32)
+
+    # Resize ve kich thuoc canvas neu mo hinh tra ve kich thuoc khac
+    h, w = canvas_rgb.shape[:2]
+    if depth_raw.shape != (h, w):
+        depth_raw = cv2.resize(depth_raw, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    # Chuan hoa ve [0, 1] — Depth-Anything-V2 tra ve do sau tuong doi
+    d_min, d_max = depth_raw.min(), depth_raw.max()
+    if d_max - d_min > 1e-6:
+        depth_norm = (depth_raw - d_min) / (d_max - d_min)
+    else:
+        depth_norm = np.ones_like(depth_raw, dtype=np.float32) * 0.5
+
+    return depth_norm.astype(np.float32)
+
+
+def infer_depth_batch(
+    canvases_rgb: list,
+    device: Optional[str] = None,
+) -> list:
+    """Du doan do sau cho danh sach N anh, tra ve danh sach N depth map.
+
+    Args:
+        canvases_rgb: Danh sach N anh (H, W, 3) uint8 RGB.
+        device:       "cuda" / "cpu" / None.
+
+    Returns:
+        Danh sach N ban do do sau (H, W) float32.
+    """
+    return [infer_depth_map(rgb, device=device) for rgb in canvases_rgb]
+
+
+# ---------------------------------------------------------------------------
+# 3. DA3 GRADIENT EDGE FILTER — Loc flying pixels
+# ---------------------------------------------------------------------------
+
+def compute_depth_gradient(depth_map: np.ndarray) -> np.ndarray:
+    """Tinh do lon gradient cua ban do do sau bang Sobel operator.
+
+    |gradient D| = sqrt((dD/dx)^2 + (dD/dy)^2)
+
+    Args:
+        depth_map: (H, W) float32 do sau.
+
+    Returns:
+        gradient_mag: (H, W) float32 — do lon gradient.
+    """
+    gx = cv2.Sobel(depth_map, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(depth_map, cv2.CV_32F, 0, 1, ksize=3)
+    return np.sqrt(gx ** 2 + gy ** 2)
+
+
+def filter_flying_pixels(
+    depth_map:  np.ndarray,
+    alpha_mask: np.ndarray,
+    gradient_thr_rel: float = GRADIENT_THR_REL,
+) -> tuple:
+    """Loc flying pixels tai ranh gioi foreground/background.
+
+    Ly thuyet:
+      - Flying pixels: pixel do sau bi nhiem gia tri sai tai vung chuyển tiep.
+      - Phuong phap: Tinh gradient do sau, danh dau vung co gradient cao
+        (|grad D| > thr) la vung loai bo.
+      - Ket hop voi alpha mask de chi giu pixels foreground co gradient thap.
+
+    Args:
+        depth_map:        (H, W) float32 [0, 1].
+        alpha_mask:       (H, W) float32 [0, 1].
+        gradient_thr_rel: Nguong gradient tuong doi (0.10 = 10% dai dong).
+
+    Returns:
+        (filtered_depth, valid_mask)
+        - filtered_depth: (H, W) float32 — do sau da loc.
+        - valid_mask:     (H, W) float32 — 1 = hieu le, 0 = da loc.
+    """
+    grad_mag = compute_depth_gradient(depth_map)
+    d_range  = depth_map.max() - depth_map.min()
+    if d_range < 1e-6:
+        d_range = 1.0
+    thr = gradient_thr_rel * d_range
+
+    # Vung co gradient cao -> ranh gioi, can loc bo
+    sharp_edge = grad_mag > thr
+
+    # Foreground mask (alpha > 0.5)
+    fg = alpha_mask > 0.5
+
+    # Valid pixels: foreground va KHONG phai vung ranh gioi sac net
+    valid = fg & ~sharp_edge
+
+    # Do gian no nhe (dilate) vung loai bo de khong de lai via
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    invalid_region = (~valid).astype(np.uint8)
+    invalid_region_dilated = cv2.dilate(invalid_region, kernel, iterations=1)
+    valid_final = (invalid_region_dilated == 0) & fg
+
+    filtered_depth = depth_map.copy()
+    filtered_depth[~valid_final] = 0.0
+
+    return filtered_depth, valid_final.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# 4. DEPTH MAP -> POINT CLOUD (utility)
+# ---------------------------------------------------------------------------
+
+def depth_to_pointcloud(
+    depth_map:    np.ndarray,
+    alpha_mask:   np.ndarray,
+    K_prime:      object,
+    z_scale:      float = 1.0,
+) -> tuple:
+    """Chuyen ban do do sau thanh dam may diem 3D trong he toa do camera.
+
+    Cong thuc unproject (nguoc phoi canh):
+        X = (u - cx') * Z / fx'
+        Y = (v - cy') * Z / fy'
+        Z = depth * z_scale
+
+    Args:
+        depth_map:  (H, W) float32 do sau [0, 1].
+        alpha_mask: (H, W) float32 [0, 1].
+        K_prime:    CameraIntrinsics da bu tru.
+        z_scale:    He so nhan chieu sau tuyet doi (m).
+
+    Returns:
+        (points_3d, colors_rgb_placeholder)
+        - points_3d: (N, 3) float32 — toa do XYZ.
+    """
+    h, w = depth_map.shape
+    fx, fy = K_prime.fx, K_prime.fy
+    cx, cy = K_prime.cx, K_prime.cy
+
+    u_grid = np.arange(w, dtype=np.float32)
+    v_grid = np.arange(h, dtype=np.float32)
+    uu, vv = np.meshgrid(u_grid, v_grid)
+
+    fg_mask = alpha_mask > 0.5
+    Z = depth_map[fg_mask] * z_scale
+    u_fg = uu[fg_mask]
+    v_fg = vv[fg_mask]
+
+    X = (u_fg - cx) * Z / (fx + 1e-9)
+    Y = (v_fg - cy) * Z / (fy + 1e-9)
+
+    points_3d = np.stack([X, Y, Z], axis=1).astype(np.float32)
+    return points_3d
+
+
+# ---------------------------------------------------------------------------
+# 5. PIPELINE P2 — ENTRY POINT
+# ---------------------------------------------------------------------------
+
+def estimate_depth_pipeline(
+    preprocessed_views: list,
+    device: Optional[str] = None,
+    filter_edges: bool = True,
+) -> list:
+    """Thuc hien uoc luong do sau cho toan bo danh sach views tu P1.
+
+    Args:
+        preprocessed_views: Ket qua tu preprocess.preprocess_images().
+        device:             "cuda" / "cpu" / None.
+        filter_edges:       Co loc flying pixels khong.
+
+    Returns:
+        Danh sach dict (mo rong tu preprocessed_views), them:
+          {
+            ...keys tu P1...,
+            "depth_map":    (H, W) float32 [0, 1],
+            "valid_mask":   (H, W) float32 [0, 1],
+            "depth_points": (N, 3) float32 toa do XYZ,
+          }
+    """
+    results = []
+    for view in preprocessed_views:
+        canvas_rgb = view["canvas_rgb"]
+        alpha_mask = view["alpha_mask"]
+        K_prime    = view["K_prime"]
+
+        # Infer depth
+        depth_raw = infer_depth_map(canvas_rgb, device=device)
+
+        # Loc flying pixels
+        if filter_edges:
+            depth_filtered, valid_mask = filter_flying_pixels(depth_raw, alpha_mask)
+        else:
+            depth_filtered = depth_raw
+            valid_mask     = (alpha_mask > 0.5).astype(np.float32)
+
+        # Tao dam may diem 3D so bo (camera-space)
+        pts_3d = depth_to_pointcloud(depth_filtered, valid_mask, K_prime)
+
+        result = dict(view)
+        result.update({
+            "depth_map":    depth_filtered,
+            "valid_mask":   valid_mask,
+            "depth_points": pts_3d,
+        })
+        results.append(result)
+
+    return results

@@ -1,216 +1,253 @@
 """
-Module Kiểm Soát Chất Lượng Đa Tầng (Phase 3 - P3 Quality Gate).
-Chuẩn hóa theo NVIDIA 3D Pipeline.
+quality_gate.py — P3: Cong Kiem Soat Chat Luong & Fail-safe Fallback
+=====================================================================
+Chuc nang:
+  1. Kiem dinh danh sach views sau P2 theo nhieu tieu chi:
+       - Dien tich tien canh (foreground area) > 1% canvas.
+       - Do bao phu goc (angle coverage) > 45 do.
+       - So luong views hop le >= 2 (cho multi-view).
+  2. Neu vuot nguong -> cho phep chay engine multi-view (Branch B).
+  3. Neu khong dat -> tu dong chuyen sang che do Single-View Fallback (Branch A)
+     tu anh neo (anchor image) net nhat.
 
-Trách nhiệm:
-    - Tầng 1 (Cosine Angle Verification): Kiểm tra góc chênh lệch giữa các camera để phát hiện
-      trùng lặp (duplicate views, delta_theta < 5 độ).
-    - Tầng 2 (Co-visibility & Angular Coverage): Phân tích đồ thị quan sát liên thông (NetworkX),
-      đảm bảo góc bao phủ tối thiểu >= 45 độ quanh vật thể.
-    - Tầng 3 (Confidence & Silhouette Validity): Kiểm tra tính hợp lệ của Alpha Mask và biến thiên độ sâu.
-    - Cơ chế cứu hộ (Fail-safe Fallback): Khi multi-view không đạt chuẩn, tự động đề xuất
-      chuyển sang chế độ đơn ảnh (Single-view Depth Engine) dựa trên ảnh neo (Anchor View #0).
+Tieu chi lua chon anchor:
+  - Chon anh co dien tich foreground lon nhat va gradient do sau thap nhat
+    (nen nhat, tin cay nhat).
 """
 
-import logging
-from typing import List, Dict, Any, Tuple, Optional
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass, field
+from typing import Optional
+
 import numpy as np
 
-try:
-    import networkx as nx
-    HAS_NETWORKX = True
-except ImportError:
-    HAS_NETWORKX = False
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-logger = logging.getLogger("quality_gate")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(name)s: %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+MIN_FOREGROUND_RATIO  = 0.0005   # Toi thieu 0.05% dien tich foreground (ho tro vat the dai/hep)
+MIN_ANGLE_COVERAGE    = 45.0     # Toi thieu 45 do bao phu goc
+MIN_VIEWS_MULTIVIEW   = 2        # Toi thieu 2 views de chay multi-view
+
+# ---------------------------------------------------------------------------
+# 1. TIEU CHI KIEM DINH
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ViewQuality:
+    """Chat luong cua mot view rieng le."""
+    view_idx:          int
+    orig_path:         str
+    foreground_ratio:  float   # Ty le pixel foreground / tong pixel
+    depth_grad_mean:   float   # Gradient do sau trung binh (thap = tot)
+    is_valid:          bool    # Dat tieu chi hay khong
+    reason:            str = ""
 
 
-class QualityGate:
+@dataclass
+class QualityGateResult:
+    """Ket qua tong the cua cong kiem soat."""
+    mode:              str        # "multi_view" hoac "single_view_fallback"
+    valid_views:       list       # Danh sach view dict (da loc) du tieu chuan
+    anchor_view:       dict       # Anh neo tot nhat (cho fallback)
+    view_qualities:    list       # Danh sach ViewQuality cho tung view
+    angle_coverage:    float      # Do bao phu goc do
+    reason:            str        # Giai thich quyet dinh
+    warnings:          list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 2. TINH CHAT LUONG TUNG VIEW
+# ---------------------------------------------------------------------------
+
+def _foreground_ratio(alpha_mask: np.ndarray) -> float:
+    """Tinh ty le pixel foreground (alpha > 0.5) tren tong pixel."""
+    total = alpha_mask.size
+    fg    = np.sum(alpha_mask > 0.5)
+    return float(fg) / (total + 1e-9)
+
+
+def _depth_grad_mean(depth_map: np.ndarray) -> float:
+    """Tinh do lon gradient do sau trung binh."""
+    import cv2
+    gx = cv2.Sobel(depth_map.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(depth_map.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(gx ** 2 + gy ** 2)
+    return float(grad_mag.mean())
+
+
+def evaluate_view_quality(view: dict) -> ViewQuality:
+    """Danh gia chat luong cua mot view tu P2.
+
+    Args:
+        view: Dict view tu estimate_depth_pipeline().
+
+    Returns:
+        ViewQuality.
     """
-    Hệ thống kiểm soát chất lượng dữ liệu trước khi tái tạo lưới 3D.
+    alpha   = view.get("alpha_mask",  np.zeros((512, 512), dtype=np.float32))
+    depth   = view.get("depth_map",   np.zeros((512, 512), dtype=np.float32))
+    fg_ratio   = _foreground_ratio(alpha)
+    grad_mean  = _depth_grad_mean(depth)
+
+    is_valid = fg_ratio >= MIN_FOREGROUND_RATIO
+    reason   = ""
+    if not is_valid:
+        reason = f"Foreground ratio {fg_ratio:.4f} < {MIN_FOREGROUND_RATIO}"
+
+    return ViewQuality(
+        view_idx         = view.get("view_idx", 0),
+        orig_path        = view.get("orig_path", ""),
+        foreground_ratio = fg_ratio,
+        depth_grad_mean  = grad_mean,
+        is_valid         = is_valid,
+        reason           = reason,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. DO BAO PHU GOC
+# ---------------------------------------------------------------------------
+
+def compute_angle_coverage(views: list) -> float:
+    """Tinh do bao phu goc (do) tu danh sach views co azimuth_deg.
+
+    Neu khong co thong tin azimuth, gia dinh 90*N do cho N views.
+
+    Returns:
+        Do bao phu goc (do), toi da 360.
     """
+    azimuths = [v.get("azimuth_deg") for v in views]
+    known    = [a for a in azimuths if a is not None]
+    if len(known) < 2:
+        # Uoc tinh tu so luong views
+        n = len(views)
+        return min(360.0, max(0.0, n * 90.0 - 90.0))
+    # Tinh "angular span" theo danh sach azimuth da biet
+    azs = sorted(known)
+    # Tinh khoang trong lon nhat giua cac goc lien tiep (vong)
+    gaps = []
+    for i in range(len(azs) - 1):
+        gaps.append(azs[i + 1] - azs[i])
+    # Khoang cach tu goc cuoi den goc dau (vong)
+    gaps.append((azs[0] + 360.0) - azs[-1])
+    # Do bao phu = 360 - khoang trong lon nhat
+    coverage = 360.0 - max(gaps)
+    return max(0.0, coverage)
 
-    def __init__(
-        self,
-        min_angle_deg: float = 5.0,
-        max_angle_deg: float = 120.0,
-        min_total_span_deg: float = 45.0,
-        min_foreground_ratio: float = 0.01,
-        max_foreground_ratio: float = 0.95,
-    ):
-        self.min_angle_deg = min_angle_deg
-        self.max_angle_deg = max_angle_deg
-        self.min_total_span_deg = min_total_span_deg
-        self.min_foreground_ratio = min_foreground_ratio
-        self.max_foreground_ratio = max_foreground_ratio
 
-    def evaluate_camera_poses(
-        self,
-        camera_poses: List[np.ndarray],
-    ) -> Tuple[bool, str, Dict[str, Any]]:
-        """
-        Tầng 1 & Tầng 2: Kiểm tra ma trận tư thế camera.
-        """
-        n = len(camera_poses)
-        if n < 2:
-            return True, "Chỉ có 1 camera, bỏ qua kiểm tra góc đa chiều.", {"num_views": n}
+# ---------------------------------------------------------------------------
+# 4. CHON ANH NEO (ANCHOR)
+# ---------------------------------------------------------------------------
 
-        # Trích xuất vector hướng nhìn (forward vector)
-        forward_vectors = []
-        for p in camera_poses:
-            # OpenCV convention: +Z là hướng nhìn tới vật thể
-            z_dir = p[:3, 2]
-            norm = float(np.linalg.norm(z_dir))
-            forward_vectors.append(z_dir / max(norm, 1e-6))
+def select_anchor_view(views: list, view_qualities: list) -> dict:
+    """Chon anh neo tot nhat: foreground lon nhat, gradient thap nhat.
 
-        # Tầng 1: Kiểm tra góc chênh lệch từng cặp camera (Cosine Angle Verification)
-        min_detected_angle = 360.0
-        max_detected_angle = 0.0
-        duplicate_pairs = []
+    Score = foreground_ratio / (depth_grad_mean + 1e-6)
+    -> Score cao = foreground lon, do sau muot.
 
-        for i in range(n):
-            for j in range(i + 1, n):
-                cos_theta = float(np.dot(forward_vectors[i], forward_vectors[j]))
-                cos_theta = np.clip(cos_theta, -1.0, 1.0)
-                angle = float(np.degrees(np.arccos(cos_theta)))
-                min_detected_angle = min(min_detected_angle, angle)
-                max_detected_angle = max(max_detected_angle, angle)
+    Args:
+        views:          Danh sach view dict.
+        view_qualities: Danh sach ViewQuality tuong ung.
 
-                if angle < self.min_angle_deg:
-                    duplicate_pairs.append((i, j, angle))
+    Returns:
+        View dict cua anh neo.
+    """
+    if not views:
+        raise ValueError("Khong co view nao de chon anchor.")
+    scores = []
+    for vq in view_qualities:
+        score = vq.foreground_ratio / (vq.depth_grad_mean + 1e-6)
+        scores.append(score)
+    best_idx = int(np.argmax(scores))
+    return views[best_idx]
 
-        if duplicate_pairs:
-            logger.warning(
-                f"[P3] Cảnh báo góc trùng lặp: các cặp ảnh {duplicate_pairs} "
-                f"có delta_theta < {self.min_angle_deg}°."
+
+# ---------------------------------------------------------------------------
+# 5. QUALITY GATE — ENTRY POINT
+# ---------------------------------------------------------------------------
+
+def run_quality_gate(
+    depth_views: list,
+    min_fg_ratio:       float = MIN_FOREGROUND_RATIO,
+    min_angle_coverage: float = MIN_ANGLE_COVERAGE,
+    min_views:          int   = MIN_VIEWS_MULTIVIEW,
+) -> QualityGateResult:
+    """Chay cong kiem soat chat luong cho toan bo danh sach views tu P2.
+
+    Logic quyet dinh:
+      1. Danh gia tung view -> LocFilter valid views (fg_ratio >= min).
+      2. Tinh do bao phu goc cua tap valid views.
+      3. Neu so valid views >= min_views VA angle_coverage >= min_angle:
+           -> mode = "multi_view" (Branch B).
+      4. Nguoc lai:
+           -> mode = "single_view_fallback" (Branch A).
+      5. Luon chon anchor (anh neo) tot nhat du o mode nao.
+
+    Args:
+        depth_views:        Ket qua tu estimate_depth_pipeline().
+        min_fg_ratio:       Nguong foreground ratio (mac dinh 1%).
+        min_angle_coverage: Nguong bao phu goc (mac dinh 45 do).
+        min_views:          So views toi thieu cho multi-view (mac dinh 2).
+
+    Returns:
+        QualityGateResult.
+    """
+    warn_list = []
+
+    # Buoc 1: Danh gia tung view
+    qualities = [evaluate_view_quality(v) for v in depth_views]
+    valid_views = [
+        v for v, q in zip(depth_views, qualities) if q.is_valid
+    ]
+    invalid_count = len(depth_views) - len(valid_views)
+    if invalid_count > 0:
+        warn_list.append(
+            f"{invalid_count} view bi loai do foreground ratio qua nho."
+        )
+
+    # Buoc 2: Do bao phu goc
+    coverage = compute_angle_coverage(valid_views) if valid_views else 0.0
+
+    # Buoc 3: Chon anchor (tu valid views neu co, neu khong thi tu tat ca)
+    try_views = valid_views if valid_views else depth_views
+    # Re-compute qualities cho try_views (tranh so sanh dict co numpy array)
+    try_quals = [evaluate_view_quality(v) for v in try_views]
+    anchor = select_anchor_view(try_views, try_quals)
+
+
+    # Buoc 4: Quyet dinh mode
+    enough_views = len(valid_views) >= min_views
+    enough_angle = coverage >= min_angle_coverage
+
+    if enough_views and enough_angle:
+        mode   = "multi_view"
+        reason = (
+            f"Du dieu kien multi-view: {len(valid_views)} views hop le, "
+            f"coverage={coverage:.1f} do."
+        )
+    else:
+        mode   = "single_view_fallback"
+        reason_parts = []
+        if not enough_views:
+            reason_parts.append(
+                f"Chi co {len(valid_views)} views hop le (can >= {min_views})."
             )
-
-        # Tầng 2: Phân tích đồ thị quan sát chung (Co-visibility Graph)
-        if HAS_NETWORKX:
-            G = nx.Graph()
-            G.add_nodes_from(range(n))
-            for i in range(n):
-                for j in range(i + 1, n):
-                    cos_theta = float(np.dot(forward_vectors[i], forward_vectors[j]))
-                    cos_theta = np.clip(cos_theta, -1.0, 1.0)
-                    angle = float(np.degrees(np.arccos(cos_theta)))
-                    if angle <= self.max_angle_deg:
-                        G.add_edge(i, j, weight=angle)
-
-            is_connected = nx.is_connected(G)
-            components = nx.number_connected_components(G)
-        else:
-            is_connected = True
-            components = 1
-
-        metrics = {
-            "num_views": n,
-            "min_angle": round(min_detected_angle, 2),
-            "max_angle": round(max_detected_angle, 2),
-            "duplicate_pairs": duplicate_pairs,
-            "is_connected": is_connected,
-            "components": components,
-        }
-
-        if max_detected_angle < self.min_total_span_deg:
-            return False, (
-                f"Góc bao phủ quá hẹp ({max_detected_angle:.1f}° < {self.min_total_span_deg}°). "
-                f"Các ảnh gần như chụp cùng 1 hướng, nguy cơ gây bẹt hình học."
-            ), metrics
-
-        if not is_connected:
-            return False, (
-                f"Đồ thị camera bị đứt đoạn ({components} thành phần rời rạc). "
-                f"Khoảng cách góc giữa các cụm chụp vượt quá {self.max_angle_deg}°."
-            ), metrics
-
-        return True, "Kiểm tra camera poses đạt chuẩn NVIDIA.", metrics
-
-    def evaluate_silhouettes_and_depth(
-        self,
-        alpha_masks: List[np.ndarray],
-        depth_maps: Optional[List[np.ndarray]] = None,
-    ) -> Tuple[bool, str, Dict[str, Any]]:
-        """
-        Tầng 3: Kiểm tra tính hợp lệ của Silhouette Masks và Depth Maps.
-        """
-        ratios = []
-        for idx, mask in enumerate(alpha_masks):
-            h, w = mask.shape[:2]
-            fg_count = int(np.count_nonzero(mask > 127))
-            ratio = fg_count / float(h * w)
-            ratios.append(ratio)
-
-            if ratio < self.min_foreground_ratio:
-                return False, (
-                    f"Ảnh #{idx} không phát hiện thấy vật thể "
-                    f"(diện tích tiền cảnh {ratio*100:.2f}% < {self.min_foreground_ratio*100}%)."
-                ), {"foreground_ratios": ratios}
-
-            if ratio > self.max_foreground_ratio:
-                return False, (
-                    f"Ảnh #{idx} mặt nạ tiền cảnh chiếm gần như toàn bộ khung hình "
-                    f"({ratio*100:.2f}% > {self.max_foreground_ratio*100}%), khả năng tách nền lỗi."
-                ), {"foreground_ratios": ratios}
-
-        # Kiểm tra độ biến thiên depth maps
-        depth_variances = []
-        if depth_maps is not None:
-            for idx, d in enumerate(depth_maps):
-                std_d = float(np.std(d))
-                depth_variances.append(std_d)
-                if std_d < 1e-4:
-                    return False, (
-                        f"Depth map #{idx} không có độ biến thiên hình học (std={std_d:.6f})."
-                    ), {"depth_variances": depth_variances}
-
-        return True, "Silhouette và Depth hợp lệ.", {
-            "foreground_ratios": [round(r, 4) for r in ratios],
-            "depth_variances": [round(v, 4) for v in depth_variances] if depth_variances else [],
-        }
-
-    def evaluate(
-        self,
-        camera_poses: Optional[List[np.ndarray]] = None,
-        alpha_masks: Optional[List[np.ndarray]] = None,
-        depth_maps: Optional[List[np.ndarray]] = None,
-    ) -> Tuple[bool, str, Dict[str, Any]]:
-        """
-        Đánh giá tổng hợp toàn bộ chuỗi dữ liệu đầu vào.
-
-        Returns:
-            passed: bool
-            reason: str
-            info: dict chứa chi tiết metrics và chỉ dẫn fallback_to_single_view.
-        """
-        info = {
-            "fallback_to_single_view": False,
-            "best_view_index": 0,
-        }
-
-        # 1. Kiểm tra camera poses nếu có
-        if camera_poses is not None and len(camera_poses) >= 2:
-            cam_ok, cam_reason, cam_metrics = self.evaluate_camera_poses(camera_poses)
-            info.update(cam_metrics)
-            if not cam_ok:
-                info["fallback_to_single_view"] = True
-                return False, cam_reason, info
-
-        # 2. Kiểm tra silhouettes và depth nếu có
-        if alpha_masks is not None and len(alpha_masks) > 0:
-            mask_ok, mask_reason, mask_metrics = self.evaluate_silhouettes_and_depth(
-                alpha_masks=alpha_masks,
-                depth_maps=depth_maps,
+        if not enough_angle:
+            reason_parts.append(
+                f"Do bao phu goc {coverage:.1f} do (can >= {min_angle_coverage} do)."
             )
-            info.update(mask_metrics)
-            if not mask_ok:
-                info["fallback_to_single_view"] = True
-                return False, mask_reason, info
+        reason = "Fallback sang Single-View: " + " | ".join(reason_parts)
+        warnings.warn(reason, UserWarning, stacklevel=2)
 
-        return True, "Quality passed: Dữ liệu đạt chuẩn NVIDIA 3D Pipeline.", info
+    return QualityGateResult(
+        mode           = mode,
+        valid_views    = valid_views,
+        anchor_view    = anchor,
+        view_qualities = qualities,
+        angle_coverage = coverage,
+        reason         = reason,
+        warnings       = warn_list,
+    )
