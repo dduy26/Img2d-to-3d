@@ -3,9 +3,10 @@ engine_dust3r.py — P6: DUSt3R Multi-View 3D AI Reconstruction Engine
 ===================================================================
 Tích hợp mô hình AI SOTA DUSt3R (NAVER LABS, CVPR 2024 Highlight)
 - Tự động suy luận liên kết tọa độ 3D và ước lượng góc camera unconstrained
-- Tách nền tự động bằng rembg
-- Thuật toán Solid Volumetric Fusion (Marching Cubes trên Point Cloud Distance Field)
-- Xuất file .glb nguyên khối, kín nước 100%, có màu sắc bề mặt RGB
+- Tách nền tự động bằng rembg (loại bỏ 100% phông nền / mặt bàn)
+- Nối lưới bề mặt đa góc nhìn chân thực (pts3d_to_trimesh + cat_meshes)
+- Lọc bỏ cạnh kéo dài viền (Edge Length Filter)
+- Xuất file .glb chuẩn sắc nét, đúng hình dạng thật của vật thể
 """
 
 from __future__ import annotations
@@ -53,8 +54,7 @@ def reconstruct_dust3r(
     from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
     from dust3r.utils.image import load_images
     from dust3r.utils.device import to_numpy
-    from scipy.spatial import cKDTree
-    from skimage.measure import marching_cubes
+    from dust3r.viz import pts3d_to_trimesh, cat_meshes
     import trimesh
 
     print(f"📦 Đang nạp {len(image_paths)} ảnh đầu vào cho DUSt3R (kích thước 512)...")
@@ -71,7 +71,7 @@ def reconstruct_dust3r(
     scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PointCloudOptimizer)
     scene.compute_global_alignment(init="mst", niter=niter, schedule="cosine", lr=0.01)
 
-    print(f"🔍 Đang tách nền tự động và thu thập đám mây điểm 3D vật thể...")
+    print(f"🔍 Đang tách nền tự động và dựng lưới 3D bề mặt vật thể...")
     try:
         import rembg
         rembg_session = rembg.new_session()
@@ -101,8 +101,7 @@ def reconstruct_dust3r(
         conf = to_numpy(scene.im_conf) if hasattr(scene, "im_conf") else [np.ones(p.shape[:2], bool) for p in pts3d]
         conf_masks = [(c >= min_conf_thr) if isinstance(c, np.ndarray) else np.ones(p.shape[:2], bool) for c, p in zip(conf, pts3d)]
 
-    all_pts = []
-    all_colors = []
+    meshes = []
     for i in range(len(imgs)):
         img_i = imgs[i]
         H_i, W_i = img_i.shape[:2]
@@ -114,57 +113,39 @@ def reconstruct_dust3r(
             alpha_resized = np.array(Image.fromarray(fg_masks[i]).resize((W_i, H_i), Image.Resampling.NEAREST))
             mask_i = mask_i & (alpha_resized > 128)
 
-        pts_valid = pts3d[i][mask_i]
-        cols_valid = img_i[mask_i]
-        if len(pts_valid) > 0:
-            all_pts.append(pts_valid)
-            all_colors.append(cols_valid)
+        m = pts3d_to_trimesh(img_i, pts3d[i], mask_i)
+        if len(m["faces"]) > 0:
+            verts = m["vertices"]
+            fcs = m["faces"]
+            f_cols = m["face_colors"]
+            v0, v1, v2 = verts[fcs[:, 0]], verts[fcs[:, 1]], verts[fcs[:, 2]]
+            max_edge = np.maximum(np.maximum(
+                np.linalg.norm(v0 - v1, axis=-1),
+                np.linalg.norm(v1 - v2, axis=-1)
+            ), np.linalg.norm(v2 - v0, axis=-1))
+            p50 = np.percentile(max_edge, 50)
+            valid_edge = max_edge < (p50 * 3.5)
+            if np.sum(valid_edge) > 0:
+                m["faces"] = fcs[valid_edge]
+                m["face_colors"] = f_cols[valid_edge]
+            meshes.append(m)
 
-    if not all_pts:
-        # Fallback to all points without mask
+    if not meshes:
         for i in range(len(imgs)):
-            all_pts.append(pts3d[i].reshape(-1, 3))
-            all_colors.append(imgs[i].reshape(-1, 3))
+            img_i = imgs[i]
+            if img_i.dtype != np.uint8 and img_i.max() <= 1.01:
+                img_i = (img_i * 255.0).clip(0, 255).astype(np.uint8)
+            m = pts3d_to_trimesh(img_i, pts3d[i], np.ones(pts3d[i].shape[:2], bool))
+            if len(m["faces"]) > 0:
+                meshes.append(m)
 
-    points = np.concatenate(all_pts, axis=0)
-    colors = np.concatenate(all_colors, axis=0)
-
-    print(f"🧱 Đang hợp nhất thể tích kín nước (Volumetric Marching Cubes từ {len(points):,} điểm 3D)...")
-    grid_res = 80
-    padding = 0.08
-    tree = cKDTree(points)
-    min_b = points.min(axis=0) - padding
-    max_b = points.max(axis=0) + padding
-
-    gx = np.linspace(min_b[0], max_b[0], grid_res)
-    gy = np.linspace(min_b[1], max_b[1], grid_res)
-    gz = np.linspace(min_b[2], max_b[2], grid_res)
-    grid_pts = np.stack(np.meshgrid(gx, gy, gz, indexing="ij"), axis=-1).reshape(-1, 3)
-
-    dists, _ = tree.query(grid_pts)
-    dist_vol = dists.reshape(grid_res, grid_res, grid_res)
-
-    dist_vol[0, :, :] = 1.0; dist_vol[-1, :, :] = 1.0
-    dist_vol[:, 0, :] = 1.0; dist_vol[:, -1, :] = 1.0
-    dist_vol[:, :, 0] = 1.0; dist_vol[:, :, -1] = 1.0
-
-    k_dists, _ = tree.query(points[::max(1, len(points)//2000)], k=5)
-    mean_spacing = np.mean(k_dists[:, 1:])
-    thresh = max(mean_spacing * 2.5, 0.02)
-
-    verts, faces, _, _ = marching_cubes(dist_vol, level=thresh)
-    verts = min_b + verts * (max_b - min_b) / (grid_res - 1)
-
-    _, nn_idx = tree.query(verts)
-    vert_colors = colors[nn_idx]
-
-    full_mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=vert_colors, process=True)
-
-    # Làm mịn bề mặt nhẹ
-    try:
-        full_mesh = trimesh.smoothing.filter_taubin(full_mesh, iterations=4)
-    except Exception:
-        pass
+    combined = cat_meshes(meshes)
+    full_mesh = trimesh.Trimesh(
+        vertices=combined["vertices"],
+        faces=combined["faces"],
+        face_colors=combined["face_colors"],
+        process=False,
+    )
 
     if len(full_mesh.vertices) > 0:
         full_mesh.apply_translation(-full_mesh.centroid)
