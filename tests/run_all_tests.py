@@ -35,6 +35,7 @@ TEST_MODULES = [
     "tests.test_p4_space_carving_tsdf",
     "tests.test_p5_texture_blending",
     "tests.test_e2e_objaverse_train",
+    "tests.test_p6_hunyuan3d_engine",
 ]
 
 

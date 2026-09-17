@@ -37,7 +37,7 @@ from .utils_3d import (
 # Constants
 # ---------------------------------------------------------------------------
 
-CANVAS_SIZE    = 512          # Canvas chuan DUSt3R ViT
+CANVAS_SIZE    = 512          # Canvas chuan ViT 512x512
 ALPHA_THRESH   = 0.5          # Nguong nhi phan hoa Alpha mask
 LAB_CHROMA_THR = 20.0         # Nguong Chroma Otsu cho tach nen phong studio
 MAX_IMAGES     = 8            # Toi da anh su dung (tranh OOM T4)

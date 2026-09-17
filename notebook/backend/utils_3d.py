@@ -424,7 +424,7 @@ def export_glb(
 # ---------------------------------------------------------------------------
 
 def round_to_16(x: float) -> int:
-    """Lam tron x len boi so cua 16 (chuan DUSt3R ViT patch-size).
+    """Lam tron x len boi so cua 16 (chuan ViT patch-size).
 
     Cong thuc: floor((x + 8) / 16) * 16  (lythuyet.md §1.3)
     """
