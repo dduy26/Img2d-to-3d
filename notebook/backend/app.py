@@ -132,6 +132,28 @@ def execute_3d_pipeline(job_id_or_paths, image_paths: list = None) -> dict:
 
     try:
         jobs[job_id]["status"] = "PROCESSING"
+        out_glb = str(OUTPUT_DIR / f"{job_id}.glb")
+
+        # UU TIEN: Neu N >= 2 va co GPU CUDA -> Chay DUSt3R Multi-View AI Engine
+        import torch
+        if len(image_paths) >= 2 and torch.cuda.is_available():
+            try:
+                from .engine_dust3r import reconstruct_dust3r
+                dust3r_res = reconstruct_dust3r(image_paths, out_glb, device="cuda:0")
+                jobs[job_id]["status"] = "DONE"
+                jobs[job_id]["result_path"] = out_glb
+                jobs[job_id]["mode"] = "multi_view_dust3r"
+                jobs[job_id]["mesh_info"] = dust3r_res.get("mesh_info", {})
+                return {
+                    "status": "success",
+                    "output_file": out_glb,
+                    "result_path": out_glb,
+                    "mode": "multi_view_dust3r",
+                    "pipeline": "DUSt3R Multi-View AI Engine",
+                    "mesh_info": dust3r_res.get("mesh_info", {}),
+                }
+            except Exception as d_err:
+                print(f"⚠️ DUSt3R gap loi: {d_err}. Chuyen sang fallback...")
 
         # P1: Tien xu ly
         preprocessed = preprocess_images(image_paths)
