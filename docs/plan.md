@@ -50,16 +50,16 @@ Hệ thống được thiết kế để vượt qua 4 điểm nghẽn cốt t�
 - `F1.5 - Hungarian Viewpoint Assignment`: Nhận diện các mặt tự động và gán tối ưu 1-1 các góc vật lý $[0^\circ, 90^\circ, 180^\circ, 270^\circ, +85^\circ, -85^\circ]$.
 
 ### 2. Phân hệ 2: Trích Xuất Chiều Sâu & Hình Học (Depth & Geometry AI - F2)
-- `F2.1 - Monocular Depth Prediction`: `Depth-Anything-V2-Small` (~95MB) dự đoán bản đồ chiều sâu độ nét cao $D(u, v)$ trong 0.2s/ảnh.
-- `F2.2 - DA3 Edge Discontinuity Filtering`: Quét ma trận đạo hàm độ sâu $\nabla D(u, v) = \max(|\nabla D_x|, |\nabla D_y|) \le \tau \cdot D(u, v)$ để khử sạch hiện tượng rách viền / flying pixels.
+- `F2.1 - Single-View Generative Mesh Engine`: `TripoSR` (~1.7GB, ViT + Triplane NeRF + Scikit-Image Marching Cubes) sinh mesh kín nước 100% (watertight) trong **1.5 giây**.
+- `F2.2 - Multi-View SOTA Engine`: Đánh giá & nâng cấp từ DUSt3R (Stereo Pointmap) sang **TripoSR Multi-View Hybrid** hoặc **InstantMesh (FlexiCubes LRM)** để triệt tiêu hoàn toàn lỗi mỏng dính / hở đáy. Chi tiết xem tại [docs/ke_hoach_nang_cap_model_multiview.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/ke_hoach_nang_cap_model_multiview.md).
 - `F2.3 - Dual-Pose Extrinsics Engine`:
-  - GPU Mode (Colab): DUSt3R tự động giải ma trận quay $R_i$, tịnh tiến $T_i$ và tiêu cự $f_i$ tự do.
+  - GPU Mode (Colab): Tự động giải ma trận quay $R_i$, tịnh tiến $T_i$ và tiêu cự $f_i$ tự do.
   - CPU Mode (Local): Turntable Rig kết hợp khóa mặt phẳng đáy (Ground Plane Anchor).
 
 ### 3. Phân hệ 3: Cổng Kiểm Định Chất Lượng & Cứu Hộ (Quality Gate & Fail-safe - F3)
 - `F3.1 - Cosine Angle Verification`: $\Delta\theta \ge 5^\circ$ giữa hai camera kề nhau để chống suy biến ma trận hình học.
 - `F3.2 - Co-visibility Graph Check`: Đồ thị quan sát liên thông 1 thành phần với góc quét $\ge 45^\circ$.
-- `F3.3 - Fail-Safe Fallback`: Khi đa ảnh không đạt chuẩn $\to$ Tự động chuyển về Anchor View #0 ở chế độ Đơn Ảnh (`DepthReconstructionEngine`), sinh Pinhole Surface Mesh sắc nét (92k+ đỉnh) trong **1.2s**, bảo đảm hệ thống không bao giờ bị gián đoạn.
+- `F3.3 - Fail-Safe Fallback`: Khi đa ảnh không đạt chuẩn $\to$ Tự động chuyển về Anchor View #0 ở chế độ Đơn Ảnh (`TripoSR`), sinh mô hình Watertight sắc nét trong **1.5s**, bảo đảm hệ thống không bao giờ bị gián đoạn.
 
 ### 4. Phân hệ 4: Dựng Khối Thể Tích & Triệt Tiêu Phần Dư (3D Volumetric Mesh - F4)
 - `F4.1 - True Multi-View Silhouette Space Carving (Visual Hull)`: Chiếu chùm tia voxel qua ma trận $K_i', R_i, T_i$; gọt sạch voxel nằm ngoài Alpha Mask $\to$ Triệt tiêu $100\%$ vây/phần dư thừa thãi.

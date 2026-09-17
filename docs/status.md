@@ -121,5 +121,14 @@
 - [x] **Chống Timeout 100s Cloudflare Tunnel:** Thêm API `/generate-3d/job/` trả `job_id` tức thì (<100ms) và polling thread nền, giúp kết nối Cloudflare luôn thông suốt bất kể pipeline chạy bao lâu.
 - [x] **Kiểm thử & Nghiệm thu E2E:** Chạy thử nghiệm thành công 100% trên tập ảnh chiếc giày thực tế (`input/view_*.jpg`), nhận diện đúng 5 mặt ($0^\circ, 90^\circ, 180^\circ, 270^\circ, 85^\circ$), tái tạo mesh kín nước 65k đỉnh trong 3.74s và mesh đơn ảnh trong 1.58s.
 - [x] **Bước 7 (Kết luận & Nghiệm thu):** Toàn bộ hệ thống P1-P6 đã hoàn chỉnh, ổn định và đồng bộ trên nhánh `P6-FullStack-Cloud`.
+- [x] **Đột phá (17/09/2026 - Tối ưu hóa Luồng Kép AI & Watertight Solidification):**
+  - **Kiểm chứng định dạng:** Xác nhận DUSt3R hỗ trợ 100% định dạng `.jpg`/`.jpeg` (Pillow nạp thành ma trận RGB chuẩn). Lỗi mỏng dính không liên quan tới định dạng ảnh mà do ống kính không chụp được đáy vật thể trên bàn.
+  - **Nâng cấp thuật toán `make_solid_watertight_mesh()`:**
+    1. Tự động phát hiện mặt phẳng tiếp xúc gầm bàn (Ground Plane Sole Cap) và đóng kín đế giày bằng màu cao su tự nhiên.
+    2. Đắp thành vách dày 3D (Normal Extrusion Solidification) tạo độ dày thực thể và vá kín 100% các lỗ hở.
+    3. Đạt chuẩn **100% Watertight (kín nước), 0 cạnh hở (0 boundary edges), 1 khối duy nhất**, bảo toàn nguyên vẹn màu sắc thực tế từ 5 ảnh điện thoại.
+  - **Đồng bộ toàn diện:** Đã cập nhật vào cả Backend (`engine_dust3r.py`) và Colab Notebook (`demo_colab.ipynb` Cell 3 & Cell 5).
+  - **Kiểm thử chất lượng:** 19/19 unit & integration tests vượt qua xuất sắc trong 2.16s.
 
 ---
+
