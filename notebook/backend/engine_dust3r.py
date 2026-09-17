@@ -94,25 +94,49 @@ def reconstruct_dust3r(
     temp_outdir = Path(output_glb).parent / "temp_dust3r"
     temp_outdir.mkdir(parents=True, exist_ok=True)
 
-    import inspect
-    sig = inspect.signature(get_3D_model_from_scene)
-    kwargs = dict(min_conf_thr=min_conf_thr, as_pointcloud=False, cam_size=0.0)
-    valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    # Vô hiệu hóa việc vẽ hình nón camera ảo (tránh lỗi IndexError cam.vertices và làm sạch mô hình)
+    try:
+        import dust3r.viz
+        dust3r.viz.add_scene_cam = lambda *args, **kwargs: None
+    except Exception:
+        pass
 
-    if "silent" in sig.parameters:
-        glb_gen_path = get_3D_model_from_scene(str(temp_outdir), True, scene, **valid_kwargs)
-    else:
-        glb_gen_path = get_3D_model_from_scene(str(temp_outdir), scene, **valid_kwargs)
+    glb_gen_path = None
+    try:
+        import inspect
+        sig = inspect.signature(get_3D_model_from_scene)
+        kwargs = dict(min_conf_thr=min_conf_thr, as_pointcloud=False, cam_size=0.0)
+        valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        if "silent" in sig.parameters:
+            glb_gen_path = get_3D_model_from_scene(str(temp_outdir), True, scene, **valid_kwargs)
+        else:
+            glb_gen_path = get_3D_model_from_scene(str(temp_outdir), scene, **valid_kwargs)
+    except Exception as export_err:
+        print(f"⚠️ get_3D_model_from_scene gặp lỗi: {export_err}. Kích hoạt trích xuất mesh trực tiếp...")
 
     if glb_gen_path and os.path.exists(glb_gen_path):
         shutil.copy2(glb_gen_path, output_glb)
     else:
-        # Fallback nếu get_3D_model_from_scene lưu file dưới tên khác
         candidates = list(temp_outdir.glob("*.glb"))
         if candidates:
             shutil.copy2(candidates[0], output_glb)
         else:
-            raise RuntimeError("Không tìm thấy file .glb được xuất từ DUSt3R!")
+            from dust3r.viz import pts3d_to_trimesh, cat_meshes
+            from dust3r.utils.device import to_numpy
+            import trimesh
+            pts3d = to_numpy(scene.get_pts3d())
+            imgs = to_numpy(scene.imgs)
+            conf = to_numpy(scene.im_conf) if hasattr(scene, 'im_conf') else [np.ones(p.shape[:2], bool) for p in pts3d]
+            masks = [(c >= min_conf_thr) if isinstance(c, np.ndarray) else np.ones(p.shape[:2], bool) for c, p in zip(conf, pts3d)]
+            meshes = []
+            for i in range(len(imgs)):
+                m = pts3d_to_trimesh(imgs[i], pts3d[i], masks[i])
+                if len(m.faces) > 0:
+                    meshes.append(m)
+            if not meshes:
+                meshes = [pts3d_to_trimesh(imgs[i], pts3d[i], np.ones(pts3d[i].shape[:2], bool)) for i in range(len(imgs))]
+            full_mesh = trimesh.Trimesh(**cat_meshes(meshes))
+            full_mesh.export(output_glb)
 
     # Đo lường thông số lưới
     import trimesh
