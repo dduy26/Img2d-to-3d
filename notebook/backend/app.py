@@ -185,6 +185,7 @@ def execute_3d_pipeline(job_id_or_paths, image_paths: list = None) -> dict:
     return {
         "status":      "success" if info["status"] == "DONE" else "error",
         "output_file": info.get("result_path"),
+        "result_path": info.get("result_path"),
         "mode":        info.get("mode"),
         "pipeline":    "P1-P5 Full TSDF Mesh",
         "mesh_info":   info.get("mesh_info"),
