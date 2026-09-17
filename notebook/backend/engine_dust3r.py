@@ -90,10 +90,30 @@ def reconstruct_dust3r(
     scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PointCloudOptimizer)
     scene.compute_global_alignment(init="mst", niter=niter, schedule="cosine", lr=0.01)
 
-    print(f"🎨 Đang trích xuất lưới đa giác 3D và gán vân bề mặt (Ngưỡng tin cậy {min_conf_thr})...")
+    print(f"🔍 Đang tách nền tự động và trích xuất lưới 3D vật thể (Ngưỡng tin cậy {min_conf_thr})...")
     from dust3r.viz import pts3d_to_trimesh, cat_meshes
     from dust3r.utils.device import to_numpy
+    from PIL import Image
     import trimesh
+
+    try:
+        import rembg
+        rembg_session = rembg.new_session()
+    except Exception:
+        rembg_session = None
+
+    fg_masks = []
+    for p in image_paths:
+        try:
+            if rembg_session is not None:
+                im = Image.open(p).convert("RGB")
+                rgba = rembg.remove(im, session=rembg_session)
+                alpha = np.array(rgba.split()[-1])
+                fg_masks.append(alpha)
+            else:
+                fg_masks.append(None)
+        except Exception:
+            fg_masks.append(None)
 
     pts3d = to_numpy(scene.get_pts3d())
     imgs = to_numpy(scene.imgs)
@@ -108,10 +128,30 @@ def reconstruct_dust3r(
     meshes = []
     for i in range(len(imgs)):
         img_i = imgs[i]
+        H_i, W_i = img_i.shape[:2]
         if img_i.dtype != np.uint8 and img_i.max() <= 1.01:
             img_i = (img_i * 255.0).clip(0, 255).astype(np.uint8)
-        m = pts3d_to_trimesh(img_i, pts3d[i], masks[i])
+
+        mask_i = masks[i].copy() if isinstance(masks[i], np.ndarray) else np.ones((H_i, W_i), bool)
+        if i < len(fg_masks) and fg_masks[i] is not None:
+            alpha_resized = np.array(Image.fromarray(fg_masks[i]).resize((W_i, H_i), Image.Resampling.NEAREST))
+            mask_i = mask_i & (alpha_resized > 128)
+
+        m = pts3d_to_trimesh(img_i, pts3d[i], mask_i)
         if len(m["faces"]) > 0:
+            verts = m["vertices"]
+            fcs = m["faces"]
+            f_cols = m["face_colors"]
+            v0, v1, v2 = verts[fcs[:, 0]], verts[fcs[:, 1]], verts[fcs[:, 2]]
+            max_edge = np.maximum(np.maximum(
+                np.linalg.norm(v0 - v1, axis=-1),
+                np.linalg.norm(v1 - v2, axis=-1)
+            ), np.linalg.norm(v2 - v0, axis=-1))
+            p50 = np.percentile(max_edge, 50)
+            valid_edge = max_edge < (p50 * 3.5)
+            if np.sum(valid_edge) > 0:
+                m["faces"] = fcs[valid_edge]
+                m["face_colors"] = f_cols[valid_edge]
             meshes.append(m)
 
     if not meshes:
