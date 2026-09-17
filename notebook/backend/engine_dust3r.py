@@ -94,12 +94,15 @@ def reconstruct_dust3r(
     temp_outdir = Path(output_glb).parent / "temp_dust3r"
     temp_outdir.mkdir(parents=True, exist_ok=True)
 
-    glb_gen_path = get_3D_model_from_scene(
-        str(temp_outdir),
-        scene,
-        min_conf_thr=min_conf_thr,
-        as_pointcloud=False,
-    )
+    import inspect
+    sig = inspect.signature(get_3D_model_from_scene)
+    kwargs = dict(min_conf_thr=min_conf_thr, as_pointcloud=False, cam_size=0.0)
+    valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+    if "silent" in sig.parameters:
+        glb_gen_path = get_3D_model_from_scene(str(temp_outdir), True, scene, **valid_kwargs)
+    else:
+        glb_gen_path = get_3D_model_from_scene(str(temp_outdir), scene, **valid_kwargs)
 
     if glb_gen_path and os.path.exists(glb_gen_path):
         shutil.copy2(glb_gen_path, output_glb)
