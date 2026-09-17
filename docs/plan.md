@@ -51,7 +51,7 @@ Hệ thống được thiết kế để vượt qua 4 điểm nghẽn cốt t�
 
 ### 2. Phân hệ 2: Trích Xuất Chiều Sâu & Hình Học (Depth & Geometry AI - F2)
 - `F2.1 - Single-View Generative Mesh Engine`: `TripoSR` (~1.7GB, ViT + Triplane NeRF + Scikit-Image Marching Cubes) sinh mesh kín nước 100% (watertight) trong **1.5 giây**.
-- `F2.2 - Multi-View SOTA Engine`: Đánh giá & nâng cấp từ DUSt3R (Stereo Pointmap) sang **TripoSR Multi-View Hybrid** hoặc **InstantMesh (FlexiCubes LRM)** để triệt tiêu hoàn toàn lỗi mỏng dính / hở đáy. Chi tiết xem tại [docs/ke_hoach_nang_cap_model_multiview.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/ke_hoach_nang_cap_model_multiview.md).
+- `F2.2 - Multi-View SOTA Engine`: **Tencent Hunyuan3D-2mv** (DiT Flow Matching Pipeline - `tencent/Hunyuan3D-2mv`). Nhận trực tiếp đa ảnh (Front, Right, Back, Left) thông qua bộ Hungarian Viewpoint Assignment, sinh khối 3D đặc kín nước 100% chuẩn CAD/Game, tối ưu hóa bộ nhớ cho Colab T4 GPU (~6-8GB VRAM). Chi tiết xem tại [docs/ke_hoach_nang_cap_model_multiview.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/ke_hoach_nang_cap_model_multiview.md).
 - `F2.3 - Dual-Pose Extrinsics Engine`:
   - GPU Mode (Colab): Tự động giải ma trận quay $R_i$, tịnh tiến $T_i$ và tiêu cự $f_i$ tự do.
   - CPU Mode (Local): Turntable Rig kết hợp khóa mặt phẳng đáy (Ground Plane Anchor).

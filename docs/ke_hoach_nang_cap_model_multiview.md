@@ -82,52 +82,47 @@ Mục tiêu: Tìm mô hình xử lý đầu vào **đa ảnh (Multi-View)** tạ
 
 | Mô hình | Nhà phát triển | Bản chất kiến trúc | VRAM yêu cầu | Tốc độ suy luận | Độ kín nước (Watertight) | Tính khả thi trên Colab T4 |
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: |
-| **InstantMesh** | Tencent ARC (CVPR 2024) | Sparse-view LRM + **FlexiCubes** | ~8 - 10 GB | ~12 - 15 giây | **100% (Khối kín hoàn hảo)** | ⭐⭐⭐⭐⭐ **Cực cao** |
-| **TripoSR Multi-View Hybrid** | StabilityAI + Tự phát triển | Triplane NeRF + Multi-View Texture Projection | ~4 - 6 GB | ~2 - 4 giây | **100% (Khối kín đặc)** | ⭐⭐⭐⭐⭐ **Tối ưu nhất** |
+| **Hunyuan3D-2mv** | Tencent (2025/2026) | DiT Flow Matching + Multiview Input | ~6 - 8 GB (Shape) | ~20 - 30 giây | **100% (Khối kín hoàn hảo)** | ⭐⭐⭐⭐⭐ **Tối ưu nhất** |
+| **InstantMesh** | Tencent ARC (CVPR 2024) | Single-view Diffusion + FlexiCubes LRM | ~8 - 10 GB | ~12 - 15 giây | **100% (Khối kín hoàn hảo)** | ⭐⭐⭐⭐ Chỉ nhận 1 ảnh gốc |
+| **TripoSR Multi-View Hybrid** | StabilityAI + Tự phát triển | Triplane NeRF + Multi-View Texture Projection | ~4 - 6 GB | ~2 - 4 giây | **100% (Khối kín đặc)** | ⭐⭐⭐⭐⭐ Siêu tốc |
 | **LGM** | Tsinghua & Shengshu | Large Multi-View Gaussian Model | ~10 - 12 GB | ~5 giây | 70% (cần thuật toán trích mesh) | ⭐⭐⭐⭐ Tốt |
 | **TRELLIS** | Microsoft Research (2024/25) | Structured Latent (SLaT) | ~14 - 16 GB | ~30 giây | 100% (Sắc nét) | ⭐⭐⭐ Cực hạn VRAM T4, dễ OOM |
-| **Hunyuan3D-2.0** | Tencent | 2-Stage Multi-view Diffusion | > 16 GB | ~60 giây | 100% | ⭐⭐ Quá nặng cho T4 Free |
 
 ---
 
-## 📌 PHẦN 4: HAI PHƯƠNG ÁN NÂNG CẤP ĐỀ XUẤT (DETAILED PROPOSALS)
+## 📌 PHẦN 4: CÁC PHƯƠNG ÁN NÂNG CẤP ĐỀ XUẤT (DETAILED PROPOSALS)
 
-### 🌟 PHƯƠNG ÁN 1 (KHUYÊN DÙNG NHẤT): TripoSR Multi-View Hybrid Engine
-> **Ý tưởng:** Kết hợp sức mạnh sinh khối 3D hoàn hảo của TripoSR với dữ liệu màu sắc đa góc nhìn của người dùng.
+### 🌟 PHƯƠNG ÁN 1 (ĐỀ CỬ CHÍNH THỨC): Tencent Hunyuan3D-2mv
+> **Ý tưởng:** Sử dụng mô hình tạo sinh hình học đa góc nhìn tiên tiến nhất của Tencent (`tencent/Hunyuan3D-2mv`).
 
 ```mermaid
 flowchart LR
-    A[N Ảnh đầu vào của người dùng] --> B[Chọn Anchor View #0 góc đẹp nhất]
-    B --> C[TripoSR tạo khối 3D Watertight Solid Mesh trong 1.5s]
-    A --> D[N-1 Ảnh các góc còn lại]
-    C --> E[Chiếu & Nướng Texture Đa Góc Nhìn Angle-Weighted Blending]
-    D --> E
-    E --> F[Xuất file 3D .glb hoàn chỉnh: Kín đáy + Nét chuẩn màu thực tế]
+    A[N Ảnh chụp ngoài đời của người dùng] --> B[P1 Hungarian Viewpoint: Gán tự động vào front, back, left, right]
+    B --> C[Hunyuan3DDiTFlowMatchingPipeline DiT Transformer]
+    C --> D[Khối 3D đặc kín nước 100% chuẩn CAD/Game của Tencent]
+    D --> E[P5 Texture Blender: Nướng vân PBR sắc nét từ ảnh thật]
+    E --> F[Xuất file 3D .glb hoàn hảo: Không lệch trục + Form chuẩn]
 ```
 
 - **Cách hoạt động:**
-  1. Lấy ảnh chính diện (Anchor View) đưa qua **TripoSR** $\to$ Sinh ngay một mesh 3D **kín nước 100%**, có đầy đủ đế giày, form giày và độ dày vật thể.
-  2. Dùng module P5 có sẵn (`texture_blender.py`) để chiếu (project) màu sắc từ toàn bộ 5 góc chụp của người dùng lên các mặt tương ứng của mesh.
+  1. Module P1 `classify_viewpoints()` tự động nhận diện hướng chụp và gán 4 bức ảnh tiêu biểu vào dict `{"front": ..., "back": ..., "left": ..., "right": ...}`.
+  2. Mạng nơ-ron **Hunyuan3DDiTFlowMatchingPipeline** xử lý tương quan hình học giữa 4 góc nhìn và dự đoán trường Flow Matching 3D.
+  3. Trích xuất lưới tam giác `output_type='trimesh'` đạt độ kín nước 100%, có đế giày và lòng giày tự nhiên.
+  4. Module P5 nướng màu sắc thực tế từ các góc chụp lên mô hình.
 - **Ưu điểm vượt trội:**
-  - **Không bao giờ lỗi môi trường:** TripoSR và scikit-image đã chạy ổn định 100% trên Colab.
-  - **Siêu nhanh:** Toàn bộ quá trình chỉ mất **dưới 4 giây**.
-  - **Giải quyết triệt để vấn đề "hở đáy":** Đáy giày được TripoSR tự động tạo khối đặc tự nhiên.
+  - **100% Multi-View thực thụ:** Hình học được tính toán và nội suy từ tất cả các góc chụp.
+  - **Form chuẩn đồ họa cao:** Do Tencent huấn luyện trên tập dữ liệu 3D chất lượng cao.
+  - **Khả thi trên Colab T4:** Khâu sinh hình học chỉ tốn ~6 - 8GB VRAM khi bật `torch_dtype=torch.float16` và `use_safetensors=True`.
 
 ---
 
-### 🚀 PHƯƠNG ÁN 2: InstantMesh (Tencent Sparse-View LRM)
-> **Ý tưởng:** Dùng mạng nơ-ron sinh mesh thế hệ mới chuyên biệt cho tái tạo khối từ nhiều góc nhìn.
+### 🚀 PHƯƠNG ÁN 2 (DỰ PHÒNG SIÊU TỐC): TripoSR Multi-View Hybrid Engine
+> **Ý tưởng:** Kết hợp sức mạnh sinh khối 3D hoàn hảo của TripoSR với dữ liệu màu sắc đa góc nhìn của người dùng.
 
 - **Cách hoạt động:**
-  - Nhận chuỗi ảnh các góc nhìn (Front, Right, Back, Left).
-  - Sử dụng mạng Transformer Sparse-view Reconstruction Model dự đoán trực tiếp trường SDF trên lưới **FlexiCubes**.
-  - Trích xuất mesh và nướng texture đồng thời.
-- **Ưu điểm:**
-  - Thiết kế chuyên sâu cho bài toán tái tạo 3D từ đa góc nhìn rời rạc.
-  - Sinh ra lưới tam giác kín nước, bề mặt láng mịn chuẩn CAD/Game asset.
-- **Nhược điểm:**
-  - Cần tải thêm checkpoint InstantMesh (~3.5GB).
-  - Cần biên dịch hoặc cài đặt một số thư viện phụ trợ (`pytorch3d` hoặc `nvdiffrast`).
+  1. Lấy ảnh chính diện (Anchor View) đưa qua **TripoSR** $\to$ Sinh ngay một mesh 3D **kín nước 100%** trong 1.5 giây.
+  2. Dùng module P5 (`texture_blender.py`) để chiếu và nướng màu sắc từ toàn bộ 5 góc chụp của người dùng lên các mặt tương ứng của mesh.
+- **Ưu điểm:** Siêu nhanh (< 4 giây), cực kỳ nhẹ máy, 100% không lo lỗi bộ nhớ.
 
 ---
 

@@ -128,7 +128,11 @@
     2. Đắp thành vách dày 3D (Normal Extrusion Solidification) tạo độ dày thực thể và vá kín 100% các lỗ hở.
     3. Đạt chuẩn **100% Watertight (kín nước), 0 cạnh hở (0 boundary edges), 1 khối duy nhất**, bảo toàn nguyên vẹn màu sắc thực tế từ 5 ảnh điện thoại.
   - **Đồng bộ toàn diện:** Đã cập nhật vào cả Backend (`engine_dust3r.py`) và Colab Notebook (`demo_colab.ipynb` Cell 3 & Cell 5).
-  - **Kiểm thử chất lượng:** 19/19 unit & integration tests vượt qua xuất sắc trong 2.16s.
+- [ ] **Mốc kế hoạch tiếp theo (Chuẩn bị nâng cấp Luồng 2 sang Tencent Hunyuan3D-2mv):**
+  - Đã nghiên cứu và lập Kế hoạch Triển khai (Implementation Plan) cho **Tencent Hunyuan3D-2mv** (`tencent/Hunyuan3D-2mv`).
+  - Sử dụng mạng DiT Flow Matching hỗ trợ trực tiếp Multi-View images (`front`, `back`, `left`, `right`), kết hợp bộ gán góc Hungarian của P1 để biến các ảnh chụp điện thoại tự do thành 3D đặc kín nước 100% chuẩn CAD/Game.
+  - Tối ưu VRAM ~6-8GB cho Colab T4 Free.
 
 ---
+
 
