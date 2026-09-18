@@ -27,6 +27,13 @@ def get_hunyuan3d_pipeline(
     global _hunyuan_pipeline
     if _hunyuan_pipeline is None:
         try:
+            try:
+                import pymeshlab
+            except ImportError:
+                import subprocess
+                print("📦 Đang tự động bổ sung thư viện thiếu: pymeshlab...")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "pymeshlab"])
+
             from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
             print(f"🚀 Đang nạp mô hình pretrained Tencent Hunyuan3D-2mv ({model_name})...")
             _hunyuan_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
