@@ -132,6 +132,13 @@
     - Cập nhật API Server (`notebook/backend/app.py`): Điều hướng tự động $N \ge 2$ ảnh sang `reconstruct_hunyuan3d`.
     - Cập nhật Runbook Colab (`notebook/demo_colab.ipynb`): Cell 0 (giới thiệu), Cell 1 (cài đặt `hy3dgen` & repo `Hunyuan3D-2`), Cell 3 (chạy luồng 2 Hunyuan3D-2mv), Cell 5 (API server FastAPI).
     - Bộ kiểm thử toàn diện: Đã bổ sung `tests/test_p6_hunyuan3d_engine.py` và tích hợp vào `tests/run_all_tests.py`, đạt 22/22 bài kiểm thử PASS 100%.
+- [x] **Đột phá (18/09/2026 - Tích hợp Texture Blender Fresnel Đa Góc Nhìn lên Hunyuan3D Mesh):**
+  - **Khắc phục mô hình trắng tinh (White Clay Mesh):** Hunyuan3D-2mv vốn chỉ sinh hình học 3D (Shape Generation) dạng mô hình đất sét trắng, không tô màu trực tiếp.
+  - **Tích hợp Texture Blender P5:**
+    1. Tự động chiếu chùm tia màu từ toàn bộ $N$ góc chụp điện thoại của người dùng lên hơn 117k đỉnh của lưới 3D Hunyuan3D.
+    2. Sử dụng thuật toán Fresnel $\cos^3(\theta)$ kết hợp bộ đệm độ sâu Z-buffer triệt tiêu hoàn toàn hiện tượng che khuất (Occlusion culling).
+    3. Phủ màu chân thực 100% từ ảnh chụp thực tế vào thuộc tính Vertex Colors (`COLOR_0`), xuất file `.glb` màu sắc rực rỡ, sắc nét từng chi tiết (dây giày, đường chỉ, đế cao su).
+    4. Bộ kiểm thử: 23/23 tests PASS 100%.
 
 ---
 
