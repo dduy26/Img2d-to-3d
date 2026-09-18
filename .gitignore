@@ -32,9 +32,11 @@ Thumbs.db
 # Node
 node_modules/
 
-# Output dữ liệu sinh ra
-data/output/*
-!data/output/.gitkeep
+# Thư mục Input & Output duy nhất (chỉ track .gitkeep)
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
 
 # ============================================================================
 # TripoSR — Mã nguồn bên thứ 3 (clone riêng theo hướng dẫn README)
@@ -50,8 +52,22 @@ notebook/backend/tsr/
 *.pth
 *.onnx
 
-# Temp uploads & generated outputs (dữ liệu runtime)
+# Thư mục tạm & dữ liệu cũ (Legacy cleanup)
 temp_uploads/
 outputs/
 notebook/backend/temp_uploads/
-notebook/backend/outputs/
+notebook/backend/outputs/
+
+# Dữ liệu ảnh benchmark (track bộ ảnh thật và bộ ảnh chuẩn Objaverse)
+data/*
+!data/gso/
+!data/gso/view_*.jpg
+!data/objaverse_apple/
+!data/objaverse_apple/view_*.png
+!data/objaverse_apple/cameras.json
+!data/input/
+!data/input/multi_view/
+!data/input/multi_view/view_*.jpg
+
+# Scratch files
+scratch/

@@ -1,8 +1,21 @@
-# KẾ HOẠCH TỔNG THỂ DỰ ÁN 2D → 3D (MASTER IMPLEMENTATION PLAN)
+# KẾ HOẠCH TỔNG THỂ DỰ ÁN 2D → 3D (MASTER PLAN v2 - DUAL-ENGINE ARCHITECTURE)
 
-> **Căn cứ phương pháp luận:** Chuẩn hóa nghiêm ngặt theo **Quy trình chuẩn 7 bước** tại [docs/flow.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/flow.md).  
-> **Căn cứ kỹ thuật:** Dựa trên kết quả đánh giá phản biện chuyên sâu tại [docs/danh_gia_va_luong_hoat_dong_2d_to_3d.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/danh_gia_va_luong_hoat_dong_2d_to_3d.md), phân tích 3 repo tham khảo tại [docs/phan_tich_chuyen_sau_reference_repos.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/phan_tich_chuyen_sau_reference_repos.md) và đặc tả yêu cầu tại [docs/require.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/require.md).  
-> **Môi trường thực thi mục tiêu:** Google Colab Free (NVIDIA T4 15GB VRAM, RAM 12GB, 2 vCPU, Timeout 90 phút).
+> **Phương pháp luận:** Chuẩn hóa theo **Quy trình chuẩn 7 bước** tại [docs/flow.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/flow.md).  
+> **Kiến trúc tham chiếu:** Kết hợp tinh hoa từ 3 chuẩn công nghiệp:
+> 1. `NVIDIA/3DObjectReconstruction`: TSDF Volumetric Fusion, Marching Cubes Watertight, Configurable Color Fusion ($\cos^3\theta$).
+> 2. `xy-gao/DA3-blender`: Edge Discontinuity Gradient Filtering ($\nabla D \le \tau D$), chống hiện tượng rách viền/màng nhện.
+> 3. `DepthAnything/Depth-Anything-V2`: Foundation Model ước lượng chiều sâu độ nét cao.
+> **Môi trường thực thi mục tiêu:** Google Colab Free (NVIDIA T4 15GB VRAM, RAM 12GB, 2 vCPU, Timeout 90 phút) & Môi trường Local PC.
+
+---
+
+## 📌 PHẦN I: PHÂN TÍCH THỰC TẾ & BẢO TOÀN NGUYÊN LÝ TOÁN HỌC
+
+Hệ thống được thiết kế để vượt qua 4 điểm nghẽn cốt tử:
+1. **Quang học vs. Điểm bám (Optical vs. Feature Matching):** Không xóa nền sớm trên ảnh RGB gốc; giữ nguyên bối cảnh cho khâu trích xuất đặc trưng và nướng Albedo Texture; chỉ dùng Alpha Mask làm bộ lọc thể tích trong không gian 3D.
+2. **Bảo toàn hình học Epipolar:** Khi đưa ảnh vào khung vuông chuẩn, áp dụng **Global Uniform Scale** $s$ đồng nhất trên toàn bộ $N$ ảnh. Khi có độ dời tâm $(\Delta x_i, \Delta y_i)$, **bắt buộc bù trừ vào ma trận Camera Intrinsics $K_i \to K_i'$** để tia chiếu không bị cắt cụt đối với vật thể bất đối xứng.
+3. **Linh hoạt tư thế Camera & Điều phối Đa Góc Nhìn:** Hỗ trợ cơ chế gán góc nhìn thông minh Hungarian Bipartite Assignment $[0^\circ, 90^\circ, 180^\circ, 270^\circ]$ kết hợp Tencent Hunyuan3D-2mv DiT Flow Matching trên GPU Colab, và Turntable Rig có khóa phẳng đáy (Ground Plane Anchor) trên CPU Local.
+4. **Hình học kín nước (Watertight Manifold 100%):** TSDF Space Carving + Marching Cubes với lớp đệm không khí, bảo đảm 0 cạnh hở (Boundary Edges = 0), 1 khối duy nhất, tương thích tuyệt đối mọi phần mềm Slicer in 3D (BambuStudio, Cura, Prusa).
 
 ---
 
@@ -11,223 +24,84 @@
 | Bước | Tên giai đoạn | Trọng tâm công việc | Trạng thái | Sản phẩm bàn giao (Deliverables) |
 | :---: | :--- | :--- | :---: | :--- |
 | **B1** | **Phân tích yêu cầu (Refine Requirement)** | Khóa chặt phạm vi (In/Out-of-scope), mục tiêu và ràng buộc | ✅ Hoàn thành | [docs/require.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/require.md) |
-| **B2** | **Hiểu về dữ liệu (Data Understanding)** | Phân loại dữ liệu ảnh (đơn/đa ảnh), chuẩn hóa bộ benchmark test | 🟡 Đang thực hiện | Cấu trúc thư mục dữ liệu & Dataset mẫu trong `data/` |
-| **B3** | **Xác định tính năng (Feature Definition)** | Đặc tả tính năng: Tiền xử lý, Tái tạo 3D (2 Option) & Web UI | ✅ Hoàn thành | Bảng đặc tả tính năng F1.x → F3.x |
-| **B4** | **Giải pháp Kỹ thuật (Technical Solution)** | Kiến trúc 2 Option: Phần Logic (Backend/Geometry) & Phần AI | ✅ Hoàn thành | Sơ đồ kiến trúc & Bóc tách giải thuật chi tiết |
-| **B5** | **Hiện thực hóa (Implementation)** | Lập trình Backend (`notebook/backend/`) và Frontend (`notebook/frontend/`) | ⏳ Tiếp theo | Mã nguồn Python FastAPI + Giao diện React Three.js |
-| **B6** | **Kiểm thử và Đánh giá (Testing & Eval)** | Đánh giá 2 tầng: Tầng mô hình (Model) & Tầng toàn luồng (Full Flow) | ⏳ Tiếp theo | Báo cáo benchmark (FPS, VRAM, Watertightness, Latency) |
-| **B7** | **Kết luận & Bàn giao (Conclusion)** | Đúc kết kinh nghiệm, so sánh 2 Option, viết Runbook Colab 1-click | ⏳ Tiếp theo | Báo cáo tổng kết & Notebook demo |
+| **B2** | **Hiểu về dữ liệu (Data Understanding)** | Phân loại dữ liệu ảnh thực tế & Objaverse-1k, chuẩn hóa benchmark | ✅ Hoàn thành | Dữ liệu kiểm thử trong `input/` và scratch |
+| **B3** | **Xác định tính năng (Feature Definition)** | Đặc tả tính năng P1 (Tiền xử lý), P2 (Depth/Pose), P3 (Quality Gate), P4 (TSDF Mesh), P5 (Texture), P6 (Web UI) | ✅ Hoàn thành | Bảng đặc tả tính năng F1.x → F6.x |
+| **B4** | **Giải pháp Kỹ thuật (Technical Solution)** | Chuẩn hóa toàn bộ Pipeline theo triết lý NVIDIA 3D & Dual-Engine | ✅ Hoàn thành | [docs/nvidia_3d_pipeline_flow.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/nvidia_3d_pipeline_flow.md) |
+| **B5** | **Hiện thực hóa (Implementation)** | Lập trình Backend (`notebook/backend/`) và Frontend Web UI (`notebook/frontend/`) | ✅ Hoàn thành | Mã nguồn Python FastAPI + Three.js Viewer |
+| **B6** | **Kiểm thử và Đánh giá (Testing & Eval)** | Kiểm định hình học Mesh Health (Watertight, 0 non-manifold edges, Latency) | ✅ Hoàn thành | Slicer in 3D kiểm tra đạt chuẩn xanh 100% |
+| **B7** | **Kết luận & Bàn giao (Conclusion)** | Bàn giao tài liệu, Runbook Colab 1-click, đồng bộ Git | ✅ Hoàn thành | Branch `P6-FullStack-Cloud` |
 
 ---
 
-## 📌 CHI TIẾT KẾ HOẠCH TRIỂN KHAI TỪNG BƯỚC
+## 📌 BẢNG ĐẶC TẢ TÍNH NĂNG CHUẨN NVIDIA DUAL-ENGINE (F1 → F6)
+
+### 1. Phân hệ 1: Tiền Xử Lý Dữ Liệu & Bảo Toàn Quang Học (Data & Preprocessing - F1)
+- `F1.1 - Validating Loader`: Kiểm tra định dạng (JPG/PNG), lọc file hỏng, giữ nguyên kênh Native Alpha nếu có (PNG RGBA).
+- `F1.2 - CIE Lab Luminance Synchronization`:
+  - Chọn ảnh chính diện (#0) làm **Anchor View**.
+  - Thực hiện **Histogram Matching duy nhất trên kênh độ sáng L (CIE Lab)** cho $N-1$ ảnh còn lại theo Anchor View, giữ nguyên hai kênh sắc độ $a, b$ để bảo toàn màu sắc nguyên bản của vật thể.
+- `F1.3 - Dual-Tier Background Segmentation`:
+  - **Tầng 1 (Studio Solid Backdrop):** Khoảng cách sắc độ Lab $\|[a, b] - \text{corner}_{ab}\|$, phân ngưỡng tự động Otsu, lọc hình thái học Closing (vá lỗ phản quang) và Opening (xóa nhiễu viền nền).
+  - **Tầng 2 (Natural Complex Background):** AI Rembg / BiRefNet vá kín lỗ hổng phản quang.
+- `F1.4 - Global Uniform Scale & Camera Intrinsics Compensation`:
+  - Áp dụng DUY NHẤT một tỉ lệ phóng $s = \frac{S_{\text{target}} \cdot \eta}{\max_i(\max(H_i, W_i))}$ cho toàn bộ chuỗi ảnh.
+  - Khi có độ dời tâm $(\Delta x_i, \Delta y_i)$, **cập nhật bù trừ ma trận nội thông số camera $K_i \to K_i'$**:
+    $$K_i' = \begin{bmatrix} s \cdot f_x & 0 & s \cdot c_x + \Delta x_i \\ 0 & s \cdot f_y & s \cdot c_y + \Delta y_i \\ 0 & 0 & 1 \end{bmatrix}$$
+- `F1.5 - Hungarian Viewpoint Assignment`: Nhận diện các mặt tự động và gán tối ưu 1-1 các góc vật lý $[0^\circ, 90^\circ, 180^\circ, 270^\circ, +85^\circ, -85^\circ]$.
+
+### 2. Phân hệ 2: Trích Xuất Chiều Sâu & Hình Học (Depth & Geometry AI - F2)
+- `F2.1 - Single-View Generative Mesh Engine`: `TripoSR` (~1.7GB, ViT + Triplane NeRF + Scikit-Image Marching Cubes) sinh mesh kín nước 100% (watertight) trong **1.5 giây**.
+- `F2.2 - Multi-View SOTA Engine`: **Tencent Hunyuan3D-2mv** (DiT Flow Matching Pipeline - `tencent/Hunyuan3D-2mv`). Nhận trực tiếp đa ảnh (Front, Right, Back, Left) thông qua bộ Hungarian Viewpoint Assignment, sinh khối 3D đặc kín nước 100% chuẩn CAD/Game, tối ưu hóa bộ nhớ cho Colab T4 GPU (~6-8GB VRAM). Chi tiết xem tại [docs/ke_hoach_nang_cap_model_multiview.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/ke_hoach_nang_cap_model_multiview.md).
+- `F2.3 - Dual-Pose Extrinsics Engine`:
+  - GPU Mode (Colab): Tự động giải ma trận quay $R_i$, tịnh tiến $T_i$ và tiêu cự $f_i$ tự do.
+  - CPU Mode (Local): Turntable Rig kết hợp khóa mặt phẳng đáy (Ground Plane Anchor).
+
+### 3. Phân hệ 3: Cổng Kiểm Định Chất Lượng & Cứu Hộ (Quality Gate & Fail-safe - F3)
+- `F3.1 - Cosine Angle Verification`: $\Delta\theta \ge 5^\circ$ giữa hai camera kề nhau để chống suy biến ma trận hình học.
+- `F3.2 - Co-visibility Graph Check`: Đồ thị quan sát liên thông 1 thành phần với góc quét $\ge 45^\circ$.
+- `F3.3 - Fail-Safe Fallback`: Khi đa ảnh không đạt chuẩn $\to$ Tự động chuyển về Anchor View #0 ở chế độ Đơn Ảnh (`TripoSR`), sinh mô hình Watertight sắc nét trong **1.5s**, bảo đảm hệ thống không bao giờ bị gián đoạn.
+
+### 4. Phân hệ 4: Dựng Khối Thể Tích & Triệt Tiêu Phần Dư (3D Volumetric Mesh - F4)
+- `F4.1 - True Multi-View Silhouette Space Carving (Visual Hull)`: Chiếu chùm tia voxel qua ma trận $K_i', R_i, T_i$; gọt sạch voxel nằm ngoài Alpha Mask $\to$ Triệt tiêu $100\%$ vây/phần dư thừa thãi.
+- `F4.2 - Ray TSDF Truncation`: Tích lũy độ sâu quan sát $d_i(\mathbf{P})$ khôi phục chi tiết phần lõm bề mặt.
+- `F4.3 - Marching Cubes Watertight Extraction`: Trích xuất Iso-surface tại $SDF = 0.0$ với lớp đệm không khí bảo vệ ở 6 mặt ngoài $\implies$ **Kín nước 100% (Watertight Manifold), 0 cạnh hở, 1 khối duy nhất**.
+- `F4.4 - Quadric Mesh Decimation`: Tối ưu hóa số lượng đa giác tam giác về khoảng $15,000 \sim 25,000$ mặt, tăng tốc UV unwrapping.
+
+### 5. Phân hệ 5: Trải Phẳng UV & Nướng Màu Chân Thực (Texture & UV Shading - F5)
+- `F5.1 - XAtlas UV Parameterization`: Trải phẳng các mảng tam giác vào không gian UV $[0, 1] \times [0, 1]$ không bị chồng lấn.
+- `F5.2 - Angle-Weighted Color Blending (NVIDIA Fresnel Principle)`: Trọng số hòa trộn màu lũy thừa $\text{Weight} = \max(0, \vec{n} \cdot \vec{v}_{\text{cam}})^3$, loại bỏ ánh sáng chói bóng và xử lý che khuất (Occlusion) qua Z-buffer.
+- `F5.3 - PBR GLB Packaging`: Xuất mô hình chuẩn nhị phân `.glb` nhúng kèm Albedo Texture Map (+Y Up, chân đặt tại $Y_{\min} = 0$).
+
+### 6. Phân hệ 6: Điện Toán Đám Mây & Giao Diện Web 3D (Full-Stack & Cloud - F6)
+- `F6.1 - Asynchronous Job Polling Engine`: `POST /generate-3d/job/` phản hồi tức thì ($<100$ms), frontend polling `GET /generate-3d/job/{id}` mỗi 1.5s, miễn nhiễm hoàn toàn lỗi HTTP 524 / 100s timeout của Cloudflare Tunnel trên Google Colab.
+- `F6.2 - Three.js Interactive Viewer`: Web UI nhẹ, hiển thị mô hình 3D xoay 360°, chế độ khung dây (Wireframe), tự động xoay và tải `.glb`.
+- `F6.3 - Runbook Colab 1-click`: Chạy trơn tru trên Colab T4 GPU, tự động dọn dẹp tiến trình cũ, khởi động máy chủ dưới 5 giây.
 
 ---
 
-### BƯỚC 1: PHÂN TÍCH YÊU CẦU (REFINE REQUIREMENT)
-- **Tình trạng:** Đã hoàn thiện và chuẩn hóa trong [docs/require.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/require.md).
-- **Các nguyên tắc cốt lõi đã chốt:**
-  1. *Khóa phạm vi (Scope):* Tập trung vào vật thể tĩnh đơn lập (Rigid static object); không train mô hình từ đầu; không làm cảnh lớn (scene) hoặc vật thể động/rigging hoạt hình.
-  2. *Đầu vào:* 1 ảnh đơn (Single-view) hoặc $N = 2 \sim 8$ ảnh (Multi-view).
-  3. *Đầu ra:* 1 file `.glb` nhúng Mesh + UV Map + Base-Color Texture (không nhầm lẫn với PBR).
-  4. *Ràng buộc tài nguyên:* VRAM $\le 10$ GB, RAM $\le 8$ GB, thời gian chạy $\le 25$ giây trên Colab T4.
+## 🏗️ CẤU TRÚC THƯ MỤC CHUẨN HOÁ
 
----
-
-### BƯỚC 2: HIỂU VỀ DỮ LIỆU (DATA UNDERSTANDING)
-- **Mục tiêu:** Nắm vững đặc tính quang học, cấu trúc hình học của dữ liệu đầu vào và thiết lập bộ dữ liệu kiểm chuẩn (Benchmark Dataset).
-- **Phân tích đặc tính dữ liệu ảnh:**
-  - *Độ phân giải & Tỉ lệ (Resolution & Aspect Ratio):* Ảnh chụp từ điện thoại thường có tỉ lệ $4:3, 16:9$, dọc hoặc ngang. Cần chuẩn hóa qua loader về kích thước chuẩn (cạnh lớn nhất 512px) bảo toàn aspect ratio.
-  - *Độ chồng lấn (Visual Overlap trong Đa ảnh):* Góc xoay giữa 2 ảnh kề nhau lý tưởng là $\approx 45^\circ \sim 60^\circ$ (tương ứng $6 \sim 8$ ảnh quanh vật thể) để đảm bảo độ chồng lấn $\ge 40\%$. Nếu chụp 4 ảnh ($90^\circ$), overlap chỉ đạt $\sim 15\%$, nguy cơ trôi pose cao.
-  - *Đặc điểm nền (Background):* Nền chứa texture phong phú hỗ trợ DUSt3R tìm điểm đặc trưng neo camera. Nền đơn sắc đòi hỏi bản thân vật thể phải có nhiều vân chi tiết.
-- **Kế hoạch chuẩn bị dữ liệu kiểm thử (Benchmark Testcases):**
-  ```
-  data/
-  ├── input/
-  │   ├── single_view/                 # Testcase cho luồng Đơn ảnh
-  │   │   ├── 01_rigid_cube_chair.jpg  # Khối đặc, góc cạnh rõ ràng
-  │   │   ├── 02_organic_statue.jpg    # Bề mặt hữu cơ gồ ghề, chi tiết phức tạp
-  │   │   └── 03_smooth_ceramic_mug.jpg# Bề mặt trơn nhẵn, ít texture
-  │   └── multi_view/                  # Testcase cho luồng Đa ảnh
-  │       ├── dataset_shoe_6views/     # Giày thể thao (6 góc quanh thân, nghiêng 30°)
-  │       ├── dataset_toy_figure_6views/# Tượng đồ chơi (6 góc có nền tự nhiên)
-  │       └── dataset_4views_orthogonal/# 4 góc trực giao chuẩn (Front, Right, Back, Left)
-  └── output/
-      └── models_glb/                  # Lưu trữ file .glb xuất ra sau khi test
-  ```
-
----
-
-### BƯỚC 3: XÁC ĐỊNH TÍNH NĂNG (FEATURE DEFINITION)
-
-Hệ thống được phân rã thành 3 nhóm tính năng chính:
-
-#### 1. Nhóm Tính năng Tiền xử lý (Preprocessing Features - F1)
-- `F1.1 - Validating Loader`: Kiểm tra số lượng ảnh ($N = 1$ cho đơn ảnh, hoặc $N = 4 \sim 8$ cho đa ảnh), định dạng hợp lệ (JPG/PNG), lọc ảnh mờ nhòe.
-- `F1.2A - Single-view Preprocessor (Cho N = 1)`:
-  - Tách nền RMBG-2.0 lấy Alpha Mask.
-  - **Canh tâm & Scale Normalization:** Crop Bounding Box $\to$ Canh giữa tâm $\to$ Scale bảo toàn Aspect Ratio để vật thể chiếm $80\% \sim 85\%$ khung hình $512 \times 512$ $\to$ Square Letterbox Padding.
-  - Cập nhật ma trận Camera Intrinsics $K \to K'$ theo hệ số scale $s$ và offset dời tâm $(\Delta x, \Delta y)$ để bảo toàn tính hội tụ quang học 3D.
-- `F1.2B - Multi-view Geometric Resizer (Cho N = 4 ~ 8 ảnh, tối ưu 6 ảnh)`:
-  - Giới hạn tải lên tối ưu từ $4$ đến $8$ ảnh (nếu người dùng tải thừa $>8$ ảnh, hệ thống tự động lọc giữ 6~8 ảnh có góc phân bổ đều nhất).
-  - Sử dụng DUSt3R standard image loader (Resize giữ aspect ratio về max 512px).
-  - **TUYỆT ĐỐI KHÔNG crop riêng lẻ từng ảnh** nhằm bảo toàn quan hệ hình học quang học và vị trí tâm camera giữa các góc nhìn.
-  - Chạy RMBG-2.0 song song trích xuất Alpha Mask $M_i$ (lưu tạm để loại bỏ điểm nền ở khâu Fusion).
-  - Cân bằng màu sắc & ánh sáng giữa các ảnh (Multi-view Histogram Matching).
-
-#### 2. Nhóm Tính năng Tái tạo 3D Đa Chế Độ (3D Reconstruction Engines - F2)
-
-Hệ thống cung cấp **2 LỰA CHỌN (OPTIONS)** linh hoạt:
-
-* **OPTION 1: HƯỚNG TÁI TẠO HÌNH HỌC CHUYÊN SÂU (GEOMETRIC PIPELINE)**  
-  *(Trọng tâm học thuật, thể hiện rõ bản chất xử lý ảnh số & thị giác máy tính)*
-  - `F2.1A - Single-view Depth Engine`: Ảnh 2D $\to$ Depth-Anything-V2-Metric $\to$ Back-projection $\to$ Poisson Surface Reconstruction $\to$ Camera Texture Projection.
-  - `F2.1B - Multi-view DUSt3R Engine (Pipeline v1)`: $N$ ảnh $\to$ DUSt3R Pairwise Matching & Global Alignment $\to$ Xuất đồng thời Camera Poses $[R \mid T]$, tiêu cự $K$, 3D Point-maps và Confidence map trong cùng hệ tọa độ. *(Không trộn Depth-Anything vào để tránh lệch scale).*
-  - `F2.1C - Quality Gate Validation`: Kiểm soát chất lượng sau Global Alignment (kiểm tra đồ thị Co-visibility liên thông, mật độ pixel confidence cao, và alignment loss).
-  - `F2.1D - Background Point Pruning`: Áp mặt nạ Alpha Mask RMBG-2.0 để loại bỏ 100% điểm thuộc về hậu cảnh trên Point-map.
-  - `F2.1E - TSDF Volumetric Fusion & Marching Cubes`: Tích lũy các điểm 3D vào lưới thể tích Voxel TSDF qua Open3D $\to$ Marching Cubes trích xuất bề mặt lưới tam giác kín nước 360°.
-  - `F2.1F - Base-Color Texture Blending`: XAtlas mở phẳng UV $\to$ Angle-weighted Color Blending nướng màu khuếch tán từ $N$ ảnh gốc (Base-Color Texture, không gọi PBR).
-
-* **OPTION 2: HƯỚNG MÔ HÌNH SINH TRỰC TIẾP (FAST FEED-FORWARD LRM PIPELINE)**  
-  *(Trọng tâm tốc độ, demo tức thì & đóng vai trò túi khí cứu hộ Fail-safe)*
-  - `F2.2A - TripoSR Single-view Engine`: Đưa 1 ảnh (đã tách nền) qua Transformer TripoSR $\to$ Sinh thẳng Textured Mesh hoàn chỉnh trong 1-2 giây.
-  - `F2.2B - LGM 4-View Engine`: Nhận 4 góc trực giao chuẩn $\to$ Sinh trực tiếp 3D Gaussians / Mesh trong ~5 giây.
-  - `F2.2C - Fail-safe Auto Fallback`: Khi Option 1B (DUSt3R đa ảnh) bị Quality Gate đánh trượt (do góc chụp không đủ overlap) $\to$ Tự động chọn ảnh nét nhất chuyển sang TripoSR để xuất ngay file `.glb`, kèm thông báo cảnh báo trên giao diện.
-
-#### 3. Nhóm Tính năng Giao diện & Trực quan hóa (Web UI & Viewer - F3)
-- `F3.1 - Upload Zone & Mode Selector`: Kéo thả ảnh; cho phép chọn chế độ (Đơn ảnh / Đa ảnh) và chọn giải thuật (Option 1 Hình học / Option 2 Tốc độ).
-- `F3.2 - 2D Inspection Panel`: Xem ảnh gốc và mặt nạ tách nền.
-- `F3.3 - 3D Interactive Canvas`: Khung nhìn WebGL (Three.js / `<model-viewer>`) xoay 360°, zoom, pan, bật/tắt lưới tam giác (Wireframe mode).
-- `F3.4 - GLB Export & Download`: Tải file `.glb` về máy tính.
-
----
-
-### BƯỚC 4: GIẢI PHÁP KỸ THUẬT (TECHNICAL SOLUTION ARCHITECTURE)
-
-Hệ thống được chia tách mạch lạc thành 2 phần: **Phần Logic** và **Phần AI**:
-
+```text
+Img2d-to-3d/
+├── input/                   # Thư mục nhận ảnh đầu vào từ người dùng
+├── output/                  # Thư mục xuất file mô hình .glb
+├── docs/                    # Tài liệu kiến trúc và hướng dẫn
+│   ├── require.md           # Đặc tả yêu cầu & phạm vi
+│   ├── plan.md              # Kế hoạch tổng thể (Master Plan v2)
+│   ├── planforAI.md         # Phân chia chi tiết cho các thành viên & AI
+│   ├── status.md            # Bảng theo dõi tiến độ thực tế
+│   └── nvidia_3d_pipeline_flow.md # Luồng kỹ thuật chi tiết
+└── notebook/
+    ├── frontend/            # Giao diện Web 3D (HTML5 + Three.js)
+    │   └── index.html
+    ├── demo_colab.ipynb     # Notebook Colab 1-click chạy tự động
+    └── backend/             # Máy chủ FastAPI và các module lõi P1 → P5
+        ├── app.py           # API Controller & Asynchronous Job Polling
+        ├── preprocess.py    # P1: Lab Optical Norm + Intrinsics K Compensation + Dual-tier Mask
+        ├── engine_hunyuan3d.py # P2/P6: Tencent Hunyuan3D-2mv DiT Multi-View Pipeline + Texture Blender
+        ├── engine_depth.py  # P2: Depth-Anything-V2 + DA3 Edge Filter
+        ├── quality_gate.py  # P3: Cổng kiểm tra góc chụp 3 lớp & Fail-safe
+        ├── engine_tsdf_mesh.py # P4: Space Carving + TSDF + Marching Cubes
+        ├── texture_blender.py  # P5: XAtlas UV + Fresnel Angle-Weighted Blending
+        └── utils_3d.py      # Đóng gói xuất file .glb
 ```
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                                   PHẦN LOGIC (BACKEND & I/O)                           │
-│ • Web Server: FastAPI xử lý REST API bất đồng bộ (async).                              │
-│ • Geometry & Math: Open3D Scalable TSDF, Marching Cubes CPU, Back-projection.          │
-│ • UV & Mesh Processing: xatlas-python, PyMCubes, Trimesh export GLB.                   │
-│ • Validation: Quality Gate (Phân tích đồ thị liên thông NetworkX, tính reprojection). │
-│ • Cache Manager: Quản lý cache weights model trên Colab (tránh tải lại sau 90p).       │
-└────────────────────────────────────────────────────────────────────────────────────────┘
-                                           │
-                                           ▼
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                                   PHẦN AI (NEURAL MODELS)                              │
-│ • Phân đoạn ảnh: briaai/RMBG-2.0 (Torch, <0.5GB VRAM).                                 │
-│ • Hình học đa ảnh: DUSt3R (ViT-Large backbone, tự sinh Pose + Focal + Pts3D, ~5GB VRAM)│
-│ • Độ sâu đơn ảnh: Depth-Anything-V2-Small (DINOv2 backbone, ~0.3GB VRAM).              │
-│ • Sinh khối nhanh: TripoSR (Transformer LRM, ~6GB VRAM, inference 1.5s).               │
-│ • Multi-view nhanh: LGM (4-view Gaussian Model, ~7.5GB VRAM).                          │
-└────────────────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-### BƯỚC 5: HIỆN THỰC HÓA (IMPLEMENTATION ROADMAP)
-
-Kế hoạch xây dựng mã nguồn theo cấu trúc thư mục mô-đun hóa:
-
-```
-ImgToModel/
-├── notebook/
-│   ├── backend/
-│   │   ├── __init__.py
-│   │   ├── main.py                  # Entrypoint FastAPI Server
-│   │   ├── preprocess.py            # Module loader, resize và tách nền RMBG-2.0
-│   │   ├── quality_gate.py          # Module 3 lớp kiểm tra lỗi DUSt3R
-│   │   ├── pipeline_geometric.py    # Option 1: DUSt3R + TSDF + Marching Cubes + XAtlas
-│   │   ├── pipeline_feedforward.py  # Option 2: TripoSR & LGM Generator
-│   │   └── utils_3d.py              # Export Trimesh GLB, tính normals, làm mịn Laplace
-│   └── frontend/
-│       ├── package.json
-│       ├── index.html
-│       ├── src/
-│       │   ├── main.jsx             # Entrypoint React
-│       │   ├── App.jsx              # Giao diện chính điều khiển pipeline
-│       │   ├── components/
-│       │   │   ├── UploadZone.jsx   # Kéo thả ảnh đơn/đa ảnh
-│       │   │   ├── ModeToggle.jsx   # Nút chuyển Option 1 / Option 2
-│       │   │   ├── Viewer3D.jsx     # Canvas Three.js xoay 360 độ
-│       │   │   └── ProgressBar.jsx  # Tiến trình thực thi từng chặng
-│       │   └── index.css            # Styling Vanilla CSS hiện đại (Dark Glassmorphism)
-```
-
-#### Lộ trình thực hiện chi tiết (Phân Chia Công Việc Cho Nhóm 6 Người - Kịch Bản 2 Đa Ảnh Làm Trước):
-
-Để 6 thành viên có thể làm việc song song (Parallel Development) mà không bị nghẽn (bottleneck), nhóm áp dụng nguyên tắc **Hợp đồng giao diện (Interface Contract)**: mỗi người phụ trách 1 module độc lập có quy định rõ ràng về Input và Output.
-
-```
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                        SƠ ĐỒ PHÂN CHIA 6 THÀNH VIÊN (KỊCH BẢN 2)                       │
-│                                                                                        │
-│ [Thành viên 1] ──► preprocess.py (Loader, RMBG-2.0 Alpha Mask, Histogram Matching)     │
-│       │                                                                                │
-│       ▼                                                                                │
-│ [Thành viên 2] ──► engine_dust3r.py (Pairwise Matching, Global Alignment, Point-maps)   │
-│       │                                                                                │
-│       ▼                                                                                │
-│ [Thành viên 3] ──► quality_gate.py + engine_triposr.py (Kiểm tra 3 lớp & Cứu hộ)      │
-│       │                                                                                │
-│  (Pass ✅)                                                                             │
-│       ▼                                                                                │
-│ [Thành viên 4] ──► engine_tsdf_mesh.py [Phần Hình Học] (Voxel TSDF & Marching Cubes)   │
-│       │                                                                                │
-│       ▼                                                                                │
-│ [Thành viên 5] ──► utils_3d.py + texture_blender.py (XAtlas UV, Color Blending, GLB)   │
-│       │                                                                                │
-│       ▼                                                                                │
-│ [Thành viên 6] ──► main.py (FastAPI), React Three.js Frontend & Colab Runbook Tunnel   │
-└────────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-| STT | Vị trí đảm nhiệm | File mã nguồn chịu trách nhiệm | Input nhận vào | Output bàn giao | Tiêu chí nghiệm thu (DoD) |
-|:---:|:---|:---|:---|:---|:---|
-| **P1** | **Data & Preprocessing Engineer** | `notebook/backend/preprocess.py` & `data/input/multi_view/` | $N=4\sim 8$ ảnh chụp từ người dùng | `images_tensor`, `alpha_masks`, `focals_init` | Tách sạch nền không lẹm vật thể, giữ nguyên epipolar geometry, xử lý $\le 1.5$s. |
-| **P2** | **Pose & 3D Geometry Engineer** | `notebook/backend/engine_dust3r.py` | `images_tensor` từ P1 | Ma trận $R, T$, tiêu cự $K$, `pts3d`, `confidence` | Global Alignment hội tụ, Poses và Point-maps cùng 1 hệ tọa độ, VRAM $\le 5$GB. |
-| **P3** | **Quality Gate & Fail-safe Engineer** | `notebook/backend/quality_gate.py` & `engine_triposr.py` | Pose, confidence, loss từ P2 | Cờ `is_valid` (True/False); nếu False $\to$ Model `.glb` cứu hộ từ TripoSR | Bắt đúng 100% ảnh thiếu overlap/lệch góc; fallback trả ra model 3D hợp lệ $\le 2$s. |
-| **P4** | **3D Volumetric Mesh Engineer** | `notebook/backend/engine_tsdf_mesh.py` (Phần hình học) | `pts3d`, `poses`, `alpha_masks` | Lưới tam giác thô `raw_mesh (V, F, N)` | Marching Cubes sinh lưới khép kín 360°, dọn sạch cụm rác, chạy CPU $\le 2$s. |
-| **P5** | **Texture & UV Shading Engineer** | `notebook/backend/utils_3d.py` & `texture_blender.py` | `raw_mesh` từ P4, ảnh gốc, `poses` | File `.glb` hoàn chỉnh có Albedo Texture | Trải UV XAtlas không chồng lấn (zero overlap), hòa trộn màu mượt không vệt cắt. |
-| **P6** | **Full-Stack & Cloud Deployment Lead** | `notebook/backend/main.py`, `frontend/`, `demo_colab.ipynb` | Toàn bộ module của P1 $\to$ P5 | API REST, Web UI Three.js, Notebook Colab 1-click | Chạy mượt trên Colab T4, tunnel Cloudflare mở web từ máy tính, tải được file `.glb`. |
-
----
-
-### BƯỚC 6: KIỂM THỬ VÀ ĐÁNH GIÁ (TESTING & EVALUATION PLAN)
-
-Thực hiện đánh giá nghiêm ngặt ở 2 tầng theo đúng phương pháp luận của `flow.md`:
-
-#### 1. Tầng 1: Đánh giá ở mức mô hình (Model-Level Evaluation)
-- **Tính trọn vẹn hình học (Geometric Integrity):**
-  - Kiểm tra tính kín nước: Hàm `mesh.is_watertight` của Trimesh (Bắt buộc `True` với Option 1B đa ảnh).
-  - Không có mặt lộn ngược: Kiểm tra pháp tuyến bề mặt (Normal consistency check).
-  - Triệt tiêu mạng nhện/điểm rác: Kiểm tra số lượng thành phần cô lập (Connected components $\le 2$).
-- **Độ phân giải lưới đa giác:** Đảm bảo số mặt tam giác nằm trong khoảng $50.000 \le \text{Faces} \le 150.000$ (vừa đủ nét mà không làm đơ trình duyệt).
-- **Độ trung thực màu sắc (Texture Fidelity):** So sánh trực quan màu sắc khuếch tán nướng trên UV với ảnh chụp gốc.
-
-#### 2. Tầng 2: Đánh giá ở mức toàn bộ luồng (Full-Flow Evaluation)
-- **Thời gian đáp ứng (End-to-End Latency):**
-  - Luồng Đơn ảnh (Option 1A / Option 2A): $\le 3$ giây.
-  - Luồng Đa ảnh 6 ảnh (Option 1B): $\le 10$ giây.
-- **Mức tiêu thụ tài nguyên GPU/RAM (Resource Benchmark trên Colab T4):**
-  - Mức đỉnh VRAM $\le 6.0$ GB (giới hạn an toàn của T4 là 15GB).
-  - Mức tiêu thụ RAM hệ thống $\le 7.0$ GB (giới hạn an toàn của Colab là 12GB).
-- **Tỷ lệ thành công (Pipeline Robustness):**
-  - Chạy thử nghiệm trên 10 bộ dữ liệu benchmark khác nhau.
-  - Tỷ lệ ra được file `.glb` hợp lệ: Mục tiêu **100%** (nhờ cơ chế Quality Gate + TripoSR Fallback).
-
----
-
-### BƯỚC 7: KẾT LUẬN & BÀN GIAO (CONCLUSION & FINAL DELIVERABLES)
-
-- **So sánh & Tổng kết:**
-  - Đối chiếu ưu/nhược điểm thực nghiệm giữa Option 1 (Hình học TSDF) và Option 2 (Feed-forward LRM).
-  - Rút ra bài học chuyên môn về Epipolar Geometry, Point Cloud Pruning và Color Blending.
-- **Sản phẩm đóng gói nghiệm thu:**
-  1. Toàn bộ mã nguồn sạch, có docstring giải thích chi tiết.
-  2. File Jupyter Notebook chạy thử nghiệm 1-click (`demo_colab.ipynb`) tích hợp ngrok mở Web UI.
-  3. Báo cáo nghiệm thu đầy đủ số liệu đo đạc (latency, VRAM, hình ảnh so sánh trước/sau khi chuyển đổi).

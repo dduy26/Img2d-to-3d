@@ -1,534 +1,586 @@
 """
-Module Tái Tạo Lưới 3D Bằng Không Gian Voxel TSDF & Marching Cubes (Pipeline v1).
-Thành viên 4 (P4) - 3D Volumetric Mesh Engineer.
+engine_tsdf_mesh.py — P4: True Space Carving + TSDF Fusion + Mesh
+==================================================================
+Chuc nang:
+  1. True Silhouette Space Carving (Visual Hull):
+       Chieu tia 3D qua K' -> loai bo voxel nam ngoai Alpha Mask.
+  2. Ray-TSDF Volumetric Fusion:
+       Tich luy gia tri TSDF (Truncated Signed Distance Function) tren luoi voxel
+       cho moi depth map va view.
+  3. Marching Cubes:
+       Trich xuat be mat dang Isosurface (isovalue = 0) tu truong TSDF.
+  4. Taubin Smoothing:
+       Lam muot be mat 2 buoc lien tiep (lambda, mu) de giu the tich.
+  5. Quadric Decimation:
+       Giam so mat xuong ~35,000 de tang toc unwrap UV (P5).
 
-Kế thừa kiến trúc từ:
-    - NVIDIA 3DObjectReconstruction (TSDF Volumetric Fusion & Marching Cubes)
-    - DA3-blender (Edge Discontinuity Gradient Filtering)
-    - DUSt3R (Global Point-maps & Camera Poses)
+Rang buoc phan cung:
+  - CPU: i5-12450HX, RAM 16GB.
+  - Kich thuoc luoi voxel toi da: 128^3 (cho RTX 3050 6GB VRAM an toan).
+  - Toi uu: Su dung numpy vectorized, tranh vong lap Python thuon.
 
-Các thuật toán cốt lõi:
-    1. Thuật toán 1: Lọc viền độ sâu (Edge Discontinuity Filtering) & Pruning điểm nền
-    2. Thuật toán 2: Dựng Lưới 3D Bằng Không Gian Voxel TSDF (Volumetric Fusion)
-    3. Thuật toán 3: Trích xuất mặt đẳng trị (Marching Cubes)
-
-Tài liệu tham khảo:
-    - docs/phan_tich_chuyen_sau_reference_repos.md (Phần 4)
-    - docs/lythuyet.md
+Ly thuyet:
+  - TSDF Fusion: Curless & Levoy, 1996.
+  - Space Carving (Visual Hull): Laurentini, 1994.
+  - Taubin Smoothing: Taubin, 1995.
 """
 
-import logging
-import time
-from typing import List, Tuple, Optional, Dict, Any, Union
+from __future__ import annotations
+
+import warnings
+from typing import Optional
 
 import numpy as np
-from scipy import ndimage
-import trimesh
 
-try:
-    from skimage import measure
-    HAS_SKIMAGE = True
-except ImportError:
-    HAS_SKIMAGE = False
+from .utils_3d import (
+    CameraIntrinsics,
+    MeshHealth,
+    check_mesh_health,
+    get_orthographic_camera_poses,
+    compute_normals,
+)
 
-try:
-    import torch
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-logger = logging.getLogger(__name__)
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(name)s: %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+DEFAULT_VOXEL_RES  = 96     # Do phan giai luoi voxel (96^3 ~ 884K voxels)
+TSDF_TRUNCATION    = 0.04   # Truncation distance (don vi: fraction of voxel grid)
+MIN_WEIGHT         = 2      # Trong so toi thieu de voxel duoc tin cay
+TARGET_FACE_COUNT  = 35_000 # So mat muc tieu sau Quadric Decimation
+TAUBIN_LAMBDA      = 0.5    # Buoc lam muot dau (positive)
+TAUBIN_MU          = -0.53  # Buoc lam muot thu hai (negative, |mu| > lambda)
+TAUBIN_ITERS       = 10     # So vong lap Taubin
 
-# ============================================================================
-# CONSTANTS & DEFAULT PARAMETERS
-# ============================================================================
+# ---------------------------------------------------------------------------
+# 1. VOXEL GRID — Khoi toa do voxel
+# ---------------------------------------------------------------------------
 
-# Ngưỡng lọc độ tin cậy điểm từ DUSt3R (Confidence threshold)
-DEFAULT_CONF_THRESHOLD: float = 0.35
+def create_voxel_grid(
+    resolution: int = DEFAULT_VOXEL_RES,
+    extent: float = 1.0,
+) -> tuple:
+    """Tao luoi voxel deu deu trong hop don vi [-extent, +extent]^3.
 
-# Ngưỡng biến thiên gradient độ sâu lọc viền xơ xác (Edge filter tau)
-DEFAULT_DEPTH_EDGE_TAU: float = 0.07
+    Args:
+        resolution: So voxel moi chieu.
+        extent:     Ban kinh hop voxel (don vi tuong doi).
 
-# Kích thước lưới voxel mặc định (số ô mỗi chiều: 128^3)
-DEFAULT_VOXEL_RESOLUTION: int = 128
+    Returns:
+        (voxel_coords, voxel_size)
+        - voxel_coords: (res, res, res, 3) float32 toa do trung tam voxel.
+        - voxel_size:   float — canh mot voxel.
+    """
+    lin = np.linspace(-extent, extent, resolution, dtype=np.float32)
+    xs, ys, zs = np.meshgrid(lin, lin, lin, indexing='ij')
+    voxel_coords = np.stack([xs, ys, zs], axis=-1)   # (R, R, R, 3)
+    voxel_size   = float(2.0 * extent / (resolution - 1))
+    return voxel_coords, voxel_size
 
-# Bán kính cắt ngắn TSDF (Truncation margin factor so với voxel size)
-DEFAULT_TRUNC_MARGIN_FACTOR: float = 3.0
 
-# Ngưỡng trọng số tối thiểu để coi voxel đã được quan sát (Min accumulated weight)
-DEFAULT_MIN_WEIGHT: float = 0.15
+# ---------------------------------------------------------------------------
+# 2. TRUE SPACE CARVING (VISUAL HULL)
+# ---------------------------------------------------------------------------
 
-
-# ============================================================================
-# THUẬT TOÁN 1: LỌC VIỀN ĐỘ SÂU & PRUNING ĐIỂM NỀN
-# ============================================================================
-
-def filter_depth_discontinuity(
-    depth_map: np.ndarray,
-    tau: float = DEFAULT_DEPTH_EDGE_TAU,
+def space_carving(
+    voxel_coords: np.ndarray,
+    alpha_masks:  list,
+    K_primes:     list,
+    Rs:           list,
+    ts:           list,
+    canvas_size:  int = 512,
 ) -> np.ndarray:
-    """
-    Thuật toán 1 (Kế thừa từ DA3-blender):
-    Lọc viền độ sâu (Edge Discontinuity Filtering).
+    """Goi voxel bang Visual Hull Space Carving.
 
-    Vấn đề: Tại ranh giới giữa vật thể và hậu cảnh, gradient độ sâu biến thiên đột ngột
-    sinh ra hàng loạt điểm point cloud "lơ lửng" kéo dài (flying pixels/edge tearing).
-
-    Công thức:
-        Gx(u, v) = |D(u+1, v) - D(u-1, v)|
-        Gy(u, v) = |D(u, v+1) - D(u, v-1)|
-        EdgeMask(u, v) = 1 nếu max(Gx, Gy) <= tau * D(u, v) ngược lại 0
+    Thuat toan:
+      For each voxel X:
+        For each view i:
+          Chieu X vao anh i: uv = pi(K'_i, R_i, t_i, X)
+          Neu uv nam trong canvas:
+            Neu alpha_mask_i[v, u] < 0.5: danh dau voxel = voi (loai bo)
+      Giu lai voxel chua bi loai boi bat ky view nao.
 
     Args:
-        depth_map: Ma trận độ sâu 2D shape (H, W), float32.
-        tau: Hệ số ngưỡng biến thiên (mặc định 0.07).
+        voxel_coords: (R, R, R, 3) float32.
+        alpha_masks:  Danh sach N mang (H, W) float32 [0, 1].
+        K_primes:     Danh sach N CameraIntrinsics da bu tru.
+        Rs:           Danh sach N ma tran quay (3, 3).
+        ts:           Danh sach N vector tinh tien (3,).
+        canvas_size:  Kich thuoc canvas (mac dinh 512).
 
     Returns:
-        edge_mask: Ma trận boolean shape (H, W), True là điểm hợp lệ (không phải mép rách).
+        carved_mask: (R, R, R) bool — True = con lai (foreground voxel).
     """
-    h, w = depth_map.shape
-    if h < 3 or w < 3:
-        return np.ones((h, w), dtype=bool)
+    R_res = voxel_coords.shape[0]
+    carved_mask = np.ones((R_res, R_res, R_res), dtype=bool)
 
-    # Tính biến thiên đạo hàm theo hướng x (ngang) và y (dọc)
-    gx = np.zeros_like(depth_map)
-    gy = np.zeros_like(depth_map)
+    # Flatten voxels de vectorize
+    pts_flat = voxel_coords.reshape(-1, 3).T   # (3, N_vox)
 
-    gx[:, 1:-1] = np.abs(depth_map[:, 2:] - depth_map[:, :-2]) * 0.5
-    gy[1:-1, :] = np.abs(depth_map[2:, :] - depth_map[:-2, :]) * 0.5
+    for alpha, K, Rm, t in zip(alpha_masks, K_primes, Rs, ts):
+        # Chuyen sang he toa do camera
+        Xc = Rm @ pts_flat + t[:, None]          # (3, N_vox)
+        depth = Xc[2]                              # (N_vox,)
+        valid_depth = depth > 0
 
-    # Viền biên ngoài cùng
-    gx[:, 0] = gx[:, 1]
-    gx[:, -1] = gx[:, -2]
-    gy[0, :] = gy[1, :]
-    gy[-1, :] = gy[-2, :]
+        Km = K.as_matrix()
+        # Chieu phoi canh
+        uvh = Km @ Xc                              # (3, N_vox)
+        u = uvh[0] / (uvh[2] + 1e-9)
+        v = uvh[1] / (uvh[2] + 1e-9)
 
-    grad_max = np.maximum(gx, gy)
-    threshold = tau * np.maximum(depth_map, 1e-6)
+        u_int = np.round(u).astype(np.int32)
+        v_int = np.round(v).astype(np.int32)
 
-    # True = pixel an toàn, False = pixel viền mép rách
-    edge_mask = grad_max <= threshold
-    return edge_mask
-
-
-def prune_background_points(
-    pointmaps_3d: np.ndarray,
-    alpha_masks: List[np.ndarray],
-    confidence_masks: np.ndarray,
-    tau_conf: float = DEFAULT_CONF_THRESHOLD,
-    tau_edge: float = DEFAULT_DEPTH_EDGE_TAU,
-) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    """
-    Kết hợp Mặt nạ Alpha (RMBG-2.0), Độ tin cậy DUSt3R và Bộ lọc viền độ sâu:
-    Loại bỏ 100% điểm nền và rác biên:
-        X_{i, valid}(u, v) = X_i(u, v) nếu M_i(u, v) == 1 và C_i(u, v) > tau_conf và EdgeMask == 1
-
-    Args:
-        pointmaps_3d: np.ndarray shape (N, H, W, 3).
-        alpha_masks: List N ma trận nhị phân {0, 1} shape (H, W).
-        confidence_masks: np.ndarray shape (N, H, W).
-        tau_conf: Ngưỡng lọc độ tin cậy.
-        tau_edge: Ngưỡng lọc rách biên độ sâu.
-
-    Returns:
-        valid_masks: List N boolean masks (H, W).
-        filtered_points_list: List N mảng điểm 3D (K_i, 3) hợp lệ.
-    """
-    n_views, h, w, _ = pointmaps_3d.shape
-    valid_masks = []
-    filtered_points_list = []
-
-    for i in range(n_views):
-        pts = pointmaps_3d[i]  # (H, W, 3)
-        conf = confidence_masks[i]  # (H, W)
-        alpha = alpha_masks[i]  # (H, W)
-
-        # Tính độ sâu quan sát (chiều Z hoặc khoảng cách Euclidean)
-        depth = np.linalg.norm(pts, axis=-1)
-        if np.all(depth < 1e-6):
-            depth = np.abs(pts[:, :, 2])
-
-        # Lọc viền rách mép
-        edge_mask = filter_depth_discontinuity(depth, tau=tau_edge)
-
-        # Mặt nạ hợp lệ tổng hợp
-        alpha_binary = (alpha > 0.5)
-        conf_binary = (conf >= tau_conf)
-        finite_mask = np.isfinite(pts).all(axis=-1)
-
-        valid_mask = alpha_binary & conf_binary & edge_mask & finite_mask
-        valid_masks.append(valid_mask)
-
-        valid_pts = pts[valid_mask]
-        filtered_points_list.append(valid_pts)
-
-    total_valid = sum(len(p) for p in filtered_points_list)
-    logger.info(
-        f"Pruning: Giữ lại {total_valid} điểm 3D hợp lệ "
-        f"từ {n_views} góc nhìn sau khi lọc nền & viền."
-    )
-    return valid_masks, filtered_points_list
-
-
-# ============================================================================
-# THUẬT TOÁN 2: DỰNG LƯỚI 3D BẰNG KHÔNG GIAN VOXEL TSDF (VOLUMETRIC FUSION)
-# ============================================================================
-
-class TSDFVolume:
-    """
-    Hệ thống tích lũy thể tích không gian 3D theo giải thuật Truncated Signed Distance Function.
-    Thiết kế vector hóa tối ưu bằng NumPy/SciPy, hoạt động mượt mà trên CPU trong < 2 giây.
-    """
-
-    def __init__(
-        self,
-        bounds_min: np.ndarray,
-        bounds_max: np.ndarray,
-        resolution: int = DEFAULT_VOXEL_RESOLUTION,
-        trunc_margin: Optional[float] = None,
-    ):
-        """
-        Khởi tạo lưới thể tích Voxel TSDF.
-
-        Args:
-            bounds_min: Tọa độ nhỏ nhất [X_min, Y_min, Z_min] của thể tích.
-            bounds_max: Tọa độ lớn nhất [X_max, Y_max, Z_max] của thể tích.
-            resolution: Số ô voxel mỗi cạnh (mặc định 128).
-            trunc_margin: Khoảng cách cắt ngắn mu (nếu None sẽ tự động tính theo voxel size).
-        """
-        self.bounds_min = bounds_min.astype(np.float32)
-        self.bounds_max = bounds_max.astype(np.float32)
-        self.resolution = resolution
-
-        # Kích thước mỗi ô voxel
-        center = (self.bounds_min + self.bounds_max) / 2.0
-        max_extent = float(np.max(self.bounds_max - self.bounds_min))
-        self.voxel_size = max_extent / float(self.resolution)
-
-        # Căn chỉnh lại bounds đối xứng qua tâm để các voxel đều là khối lập phương
-        half_cube = (self.voxel_size * self.resolution) / 2.0
-        self.bounds_min = (center - half_cube).astype(np.float32)
-        self.bounds_max = (center + half_cube).astype(np.float32)
-        self.extent = self.bounds_max - self.bounds_min
-
-        # Truncation margin mu
-        if trunc_margin is None:
-            self.trunc_margin = float(self.voxel_size * DEFAULT_TRUNC_MARGIN_FACTOR)
-        else:
-            self.trunc_margin = float(trunc_margin)
-
-        # Lưới TSDF: khởi tạo 1.0 (free space / trống)
-        self.tsdf_grid = np.ones((resolution, resolution, resolution), dtype=np.float32)
-
-        # Lưới trọng số tích lũy: khởi tạo 0.0
-        self.weight_grid = np.zeros((resolution, resolution, resolution), dtype=np.float32)
-
-        logger.info(
-            f"Khởi tạo TSDF Volume: {resolution}^3 voxels, "
-            f"vsize={self.voxel_size:.4f}m, trunc_margin={self.trunc_margin:.4f}m"
+        in_canvas = (
+            valid_depth &
+            (u_int >= 0) & (u_int < canvas_size) &
+            (v_int >= 0) & (v_int < canvas_size)
         )
 
-    def integrate(
-        self,
-        pointmap: np.ndarray,
-        valid_mask: np.ndarray,
-        conf_map: np.ndarray,
-        camera_pose: np.ndarray,
-        focal_length: Tuple[float, float],
-    ):
-        """
-        Chiếu và tích lũy một góc quan sát camera vào thể tích Voxel TSDF.
+        # Lay gia tri alpha mask tai toa do chieu
+        alpha_vals = np.zeros(pts_flat.shape[1], dtype=np.float32)
+        valid_idx  = np.where(in_canvas)[0]
+        if len(valid_idx) > 0:
+            u_v = u_int[valid_idx]
+            v_v = v_int[valid_idx]
+            alpha_vals[valid_idx] = alpha[v_v, u_v]
 
-        Bản chất toán học:
-            xi = K(R_i * p + T_i)
-            di(p) = D_i(xi) - z
-            tsdf_i(p) = max(-1, min(1, di(p) / mu))
-            D_new(p) = (W_old * D_old + wi * tsdf_i) / (W_old + wi)
-            W_new(p) = W_old + wi
-        """
-        h, w = valid_mask.shape
-        fx, fy = focal_length
-        cx, cy = w / 2.0, h / 2.0
+        # Voxel chieu ra ngoai vat the (alpha < 0.5) va trong canvas -> loai bo
+        outside = in_canvas & (alpha_vals < 0.5)
+        carved_flat = carved_mask.reshape(-1)
+        carved_flat[outside] = False
+        carved_mask = carved_flat.reshape(R_res, R_res, R_res)
 
-        # Ma trận nội suy K
-        K = np.array([
-            [fx, 0.0, cx],
-            [0.0, fy, cy],
-            [0.0, 0.0, 1.0]
-        ], dtype=np.float32)
-
-        # Pose chuyển từ camera sang world (camera_pose)
-        # World to Camera: T_cw = inv(P_c2w)
-        c2w = camera_pose.astype(np.float32)
-        if c2w.shape == (3, 4):
-            c2w_homo = np.eye(4, dtype=np.float32)
-            c2w_homo[:3, :4] = c2w
-            c2w = c2w_homo
-
-        R_c2w = c2w[:3, :3]
-        t_c2w = c2w[:3, 3]
-        R_w2c = R_c2w.T
-        t_w2c = -R_w2c @ t_c2w
-
-        # Trích xuất bản đồ độ sâu Z từ pointmap trong hệ camera
-        pts_cam = (pointmap.reshape(-1, 3) @ R_w2c.T + t_w2c).reshape(h, w, 3)
-        depth_obs = pts_cam[:, :, 2]
-
-        # Tối ưu hóa hiệu năng bằng cách xử lý theo các lớp Z-slice của Voxel Grid
-        xs = np.linspace(self.bounds_min[0], self.bounds_max[0], self.resolution, endpoint=False, dtype=np.float32)
-        ys = np.linspace(self.bounds_min[1], self.bounds_max[1], self.resolution, endpoint=False, dtype=np.float32)
-        zs = np.linspace(self.bounds_min[2], self.bounds_max[2], self.resolution, endpoint=False, dtype=np.float32)
-
-        # Lưới 2D X-Y
-        grid_x, grid_y = np.meshgrid(xs, ys, indexing='ij')
-
-        for k in range(self.resolution):
-            z_val = zs[k]
-            # Tọa độ 3D các voxel tại lát cắt k: shape (res, res, 3)
-            pts_world_slice = np.stack([grid_x, grid_y, np.full_like(grid_x, z_val)], axis=-1)
-
-            # Chiếu sang hệ camera: p_c = R_w2c * p_w + t_w2c
-            flat_pts = pts_world_slice.reshape(-1, 3)
-            p_cam = flat_pts @ R_w2c.T + t_w2c
-            z_cam = p_cam[:, 2]
-
-            # Loại bỏ voxel nằm phía sau camera
-            valid_z = z_cam > 0.01
-
-            # Chiếu lên màn hình 2D
-            u_proj = np.round((fx * p_cam[:, 0] / np.maximum(z_cam, 1e-6)) + cx).astype(np.int32)
-            v_proj = np.round((fy * p_cam[:, 1] / np.maximum(z_cam, 1e-6)) + cy).astype(np.int32)
-
-            in_image = valid_z & (u_proj >= 0) & (u_proj < w) & (v_proj >= 0) & (v_proj < h)
-
-            if not np.any(in_image):
-                continue
-
-            # Chỉ số trong slice
-            valid_indices = np.where(in_image)[0]
-            u_valid = u_proj[valid_indices]
-            v_valid = v_proj[valid_indices]
-            z_c_valid = z_cam[valid_indices]
-
-            # Kiểm tra pixel quan sát được có hợp lệ không
-            mask_obs = valid_mask[v_valid, u_valid]
-            sub_indices = valid_indices[mask_obs]
-            if len(sub_indices) == 0:
-                continue
-
-            u_sub = u_proj[sub_indices]
-            v_sub = v_proj[sub_indices]
-            z_c_sub = z_cam[sub_indices]
-
-            # Độ sâu thực tế quan sát được từ bề mặt
-            d_surface = depth_obs[v_sub, u_sub]
-
-            # Khoảng cách có dấu đến bề mặt: d(p) = d_surface - z_cam
-            signed_dist = d_surface - z_c_sub
-
-            # Cắt ngắn: chỉ tích lũy trong khoảng [-trunc_margin, +trunc_margin]
-            within_trunc = signed_dist >= -self.trunc_margin
-            final_sub = sub_indices[within_trunc]
-            if len(final_sub) == 0:
-                continue
-
-            s_dist = signed_dist[within_trunc]
-            tsdf_val = np.clip(s_dist / self.trunc_margin, -1.0, 1.0)
-
-            # Trọng số theo confidence
-            u_fin = u_proj[final_sub]
-            v_fin = v_proj[final_sub]
-            weight = conf_map[v_fin, u_fin]
-
-            # Tọa độ 2D trong lát cắt k
-            i_idx = final_sub // self.resolution
-            j_idx = final_sub % self.resolution
-
-            old_tsdf = self.tsdf_grid[i_idx, j_idx, k]
-            old_w = self.weight_grid[i_idx, j_idx, k]
-
-            new_w = old_w + weight
-            new_tsdf = (old_w * old_tsdf + weight * tsdf_val) / np.maximum(new_w, 1e-6)
-
-            self.tsdf_grid[i_idx, j_idx, k] = new_tsdf
-            self.weight_grid[i_idx, j_idx, k] = new_w
+    return carved_mask
 
 
-# ============================================================================
-# THUẬT TOÁN 3: TRÍCH XUẤT MẶT ĐẲNG TRỊ MARCHING CUBES
-# ============================================================================
+# ---------------------------------------------------------------------------
+# 3. TSDF FUSION
+# ---------------------------------------------------------------------------
+
+def tsdf_fusion(
+    voxel_coords:    np.ndarray,
+    depth_maps:      list,
+    valid_masks:     list,
+    K_primes:        list,
+    Rs:              list,
+    ts:              list,
+    voxel_size:      float,
+    trunc_factor:    float = TSDF_TRUNCATION,
+    carved_mask:     Optional[np.ndarray] = None,
+    canvas_size:     int = 512,
+) -> tuple:
+    """Tich luy truong TSDF tren luoi voxel tu nhieu depth map.
+
+    Thuat toan (Curless & Levoy 1996):
+      For each voxel X, each view i:
+        depth_obs = depth_map_i[project(X, K'_i, R_i, t_i)]
+        sdf_i     = depth_obs - depth_camera(X)    # Signed Distance
+        tsdf_i    = clip(sdf_i / trunc, -1, 1)
+        Tich luy: tsdf += w * tsdf_i; weight += w
+
+    Args:
+        voxel_coords: (R, R, R, 3) float32.
+        depth_maps:   Danh sach N (H, W) float32.
+        valid_masks:  Danh sach N (H, W) float32.
+        K_primes:     Danh sach N CameraIntrinsics.
+        Rs, ts:       Danh sach N poses.
+        voxel_size:   Canh mot voxel.
+        trunc_factor: He so truncation (tinh theo voxel_size * resolution).
+        carved_mask:  (R, R, R) bool tu Space Carving (co the None).
+        canvas_size:  Kich thuoc canvas.
+
+    Returns:
+        (tsdf_vol, weight_vol)
+        - tsdf_vol:   (R, R, R) float32 — gia tri TSDF.
+        - weight_vol: (R, R, R) float32 — trong so tich luy.
+    """
+    R_res = voxel_coords.shape[0]
+    tsdf_vol   = np.zeros((R_res, R_res, R_res), dtype=np.float32)
+    weight_vol = np.zeros((R_res, R_res, R_res), dtype=np.float32)
+
+    trunc_dist = trunc_factor * R_res * voxel_size
+
+    pts_flat = voxel_coords.reshape(-1, 3).T   # (3, N_vox)
+    N_vox = pts_flat.shape[1]
+
+    for depth_map, valid_mask, K, Rm, t in zip(depth_maps, valid_masks, K_primes, Rs, ts):
+        h, w = depth_map.shape
+
+        # Chuyen sang he toa do camera
+        Xc    = Rm @ pts_flat + t[:, None]
+        depth_cam = Xc[2]                          # Chieu sau thuc te trong camera
+        valid_depth = depth_cam > 0
+
+        # Chieu phoi canh
+        Km  = K.as_matrix()
+        uvh = Km @ Xc
+        u   = uvh[0] / (uvh[2] + 1e-9)
+        v   = uvh[1] / (uvh[2] + 1e-9)
+
+        u_int = np.round(u).astype(np.int32)
+        v_int = np.round(v).astype(np.int32)
+
+        in_canvas = (
+            valid_depth &
+            (u_int >= 0) & (u_int < w) &
+            (v_int >= 0) & (v_int < h)
+        )
+
+        # Lay gia tri depth va valid tai toa do chieu
+        depth_obs = np.zeros(N_vox, dtype=np.float32)
+        valid_px  = np.zeros(N_vox, dtype=bool)
+        idx_valid = np.where(in_canvas)[0]
+        if len(idx_valid) > 0:
+            depth_obs[idx_valid] = depth_map[v_int[idx_valid], u_int[idx_valid]]
+            valid_px[idx_valid]  = valid_mask[v_int[idx_valid], u_int[idx_valid]] > 0.5
+
+        # TSDF calculation
+        # depth_obs la [0,1] tuong doi -> scale theo depth_cam range
+        depth_obs_abs = depth_obs * depth_cam.max()
+        sdf    = depth_obs_abs - depth_cam
+        tsdf_v = np.clip(sdf / (trunc_dist + 1e-9), -1.0, 1.0)
+
+        # Chi tich luy cho voxel hop le
+        active = in_canvas & valid_px
+        tsdf_flat   = tsdf_vol.reshape(-1)
+        weight_flat = weight_vol.reshape(-1)
+        w_inc       = active.astype(np.float32)
+        tsdf_flat   += tsdf_v * w_inc
+        weight_flat += w_inc
+        tsdf_vol   = tsdf_flat.reshape(R_res, R_res, R_res)
+        weight_vol = weight_flat.reshape(R_res, R_res, R_res)
+
+    # Trung binh trong so
+    safe_w = np.where(weight_vol > 0, weight_vol, 1.0)
+    tsdf_vol = tsdf_vol / safe_w
+
+    # Ap dung Space Carving mask (voxel bi khac = set tsdf = +1 -> ben ngoai)
+    if carved_mask is not None:
+        tsdf_vol[~carved_mask] = 1.0
+        weight_vol[~carved_mask] = 0.0
+
+    return tsdf_vol, weight_vol
+
+
+# ---------------------------------------------------------------------------
+# 4. MARCHING CUBES — Trich xuat be mat
+# ---------------------------------------------------------------------------
 
 def extract_mesh_marching_cubes(
-    tsdf_volume: TSDFVolume,
-    min_weight: float = DEFAULT_MIN_WEIGHT,
-) -> trimesh.Trimesh:
-    """
-    Thuật toán 3: Trích xuất mặt đẳng trị (Marching Cubes).
-
-    Quét qua các khối lập phương trong lưới Voxel TSDF:
-    Tìm vị trí bề mặt cắt ngang (nơi TSDF = 0), nội suy tuyến tính tạo các mặt tam giác 3D.
+    tsdf_vol:   np.ndarray,
+    weight_vol: np.ndarray,
+    voxel_size: float,
+    extent:     float = 1.0,
+    min_weight: int   = MIN_WEIGHT,
+) -> tuple:
+    """Trich xuat be mat tu truong TSDF bang Marching Cubes.
 
     Args:
-        tsdf_volume: Đối tượng TSDFVolume đã tích lũy.
-        min_weight: Ngưỡng trọng số tối thiểu để voxel được công nhận là bề mặt.
+        tsdf_vol:   (R, R, R) float32.
+        weight_vol: (R, R, R) float32.
+        voxel_size: Canh voxel.
+        extent:     Ban kinh hop voxel.
+        min_weight: Trong so toi thieu de voxel co gia tri hop le.
 
     Returns:
-        trimesh.Trimesh: Mô hình lưới tam giác kín 360°.
+        (vertices, faces) float32 / int32, hoac (None, None) neu khong co mat.
     """
-    if not HAS_SKIMAGE:
-        raise ImportError("Cần cài scikit-image để chạy Marching Cubes: pip install scikit-image")
-
-    volume = tsdf_volume.tsdf_grid.copy()
-    weights = tsdf_volume.weight_grid
-
-    # Những vùng chưa từng được camera nào quan sát sẽ đặt giá trị 1.0 (ngoài vật thể)
-    unobserved = weights < min_weight
-    volume[unobserved] = 1.0
-
-    # Marching Cubes tìm iso-surface tại level = 0.0
     try:
-        verts, faces, normals, _ = measure.marching_cubes(
-            volume=volume,
-            level=0.0,
-            spacing=(tsdf_volume.voxel_size, tsdf_volume.voxel_size, tsdf_volume.voxel_size),
-            allow_degenerate=False,
-        )
-    except Exception as e:
-        logger.warning(f"Marching Cubes level 0.0 gặp lỗi ({e}), thử level 0.05...")
-        verts, faces, normals, _ = measure.marching_cubes(
-            volume=volume,
-            level=0.05,
-            spacing=(tsdf_volume.voxel_size, tsdf_volume.voxel_size, tsdf_volume.voxel_size),
-            allow_degenerate=False,
-        )
+        from skimage.measure import marching_cubes
+    except ImportError:
+        raise ImportError("Can cai dat scikit-image: pip install scikit-image")
 
-    # Chuyển đổi tọa độ từ Voxel Grid Index sang Tọa độ Không gian Thực (World Coordinates)
-    verts_world = verts + tsdf_volume.bounds_min
+    # Mask voxel co trong so qua thap -> set tsdf = 1 (loai bo)
+    low_weight_mask = weight_vol < min_weight
+    tsdf_clean = tsdf_vol.copy()
+    tsdf_clean[low_weight_mask] = 1.0
 
-    # Đóng gói đối tượng Trimesh
-    mesh = trimesh.Trimesh(
-        vertices=verts_world,
-        faces=faces,
-        vertex_normals=normals,
-        process=True,
-    )
+    # Chon level phu hop: uu tien 0.0, fallback ve median cua vung co weight
+    d_min, d_max = tsdf_clean.min(), tsdf_clean.max()
+    if d_min < 0.0 < d_max:
+        level = 0.0
+    else:
+        # TSDF khong cat qua 0 (e.g., depth phang) -> dung median lam isosurface
+        weighted_vals = tsdf_clean[weight_vol >= min_weight]
+        if len(weighted_vals) > 0:
+            level = float(np.median(weighted_vals))
+        else:
+            level = float((d_min + d_max) / 2.0)
 
-    # Dọn dẹp lưới: Giữ lại thành phần liên thông lớn nhất (loại bỏ các cụm vụn nổi lơ lửng)
-    components = mesh.split(only_watertight=False)
-    if components and len(components) > 1:
-        largest = max(components, key=lambda m: len(m.vertices))
-        mesh = largest
+    # Pad 1 voxel voi gia tri ngoai bien (> level) de dam bao luoi kin nuoc 100%
+    pad_val = max(1.0, level + 0.5)
+    padded_tsdf = np.pad(tsdf_clean, pad_width=1, mode="constant", constant_values=pad_val)
 
-    logger.info(
-        f"Marching Cubes hoàn thành: Sinh mesh với {len(mesh.vertices)} đỉnh, "
-        f"{len(mesh.faces)} tam giác (Watertight: {mesh.is_watertight})."
-    )
-    return mesh
-
-
-# ============================================================================
-# ĐỘNG CƠ TỔNG HỢP: TSDFMeshEngine (GIAO DIỆN BÀN GIAO CHO APP)
-# ============================================================================
-
-class TSDFMeshEngine:
-    """
-    Lớp điều phối toàn bộ chu trình P4:
-    Lọc viền độ sâu -> Pruning điểm nền -> Tích lũy Voxel TSDF -> Trích xuất Marching Cubes.
-    """
-
-    def __init__(
-        self,
-        resolution: int = DEFAULT_VOXEL_RESOLUTION,
-        tau_conf: float = DEFAULT_CONF_THRESHOLD,
-        tau_edge: float = DEFAULT_DEPTH_EDGE_TAU,
-    ):
-        self.resolution = resolution
-        self.tau_conf = tau_conf
-        self.tau_edge = tau_edge
-
-    def reconstruct(
-        self,
-        pointmaps_3d: Union[np.ndarray, Any],
-        alpha_masks: List[np.ndarray],
-        confidence_masks: Union[np.ndarray, Any],
-        camera_poses: List[np.ndarray],
-        focal_lengths: List[Tuple[float, float]],
-    ) -> trimesh.Trimesh:
-        """
-        Thực thi pipeline tái tạo lưới 3D từ các góc nhìn DUSt3R.
-
-        Args:
-            pointmaps_3d: (N, H, W, 3) tọa độ 3D các điểm.
-            alpha_masks: List N mặt nạ nhị phân {0, 1} từ RMBG-2.0.
-            confidence_masks: (N, H, W) độ tin cậy từ DUSt3R.
-            camera_poses: List N ma trận camera 4x4.
-            focal_lengths: List N cặp tiêu cự (fx, fy).
-
-        Returns:
-            trimesh.Trimesh: Lưới tam giác hoàn chỉnh.
-        """
-        t0 = time.time()
-        logger.info("═══ [P4] BẮT ĐẦU TÁI TẠO LƯỚI 3D (TSDF + MARCHING CUBES) ═══")
-
-        # Chuyển đổi tensor sang numpy nếu cần
-        if hasattr(pointmaps_3d, 'cpu'):
-            pointmaps_3d = pointmaps_3d.cpu().numpy()
-        if hasattr(confidence_masks, 'cpu'):
-            confidence_masks = confidence_masks.cpu().numpy()
-
-        n_views = len(camera_poses)
-
-        # ── Bước 1: Lọc viền độ sâu & Pruning điểm nền ──
-        valid_masks, filtered_points = prune_background_points(
-            pointmaps_3d=pointmaps_3d,
-            alpha_masks=alpha_masks,
-            confidence_masks=confidence_masks,
-            tau_conf=self.tau_conf,
-            tau_edge=self.tau_edge,
-        )
-
-        all_valid_pts = np.concatenate([p for p in filtered_points if len(p) > 0], axis=0)
-        if len(all_valid_pts) < 100:
-            raise ValueError(f"Số lượng điểm 3D hợp lệ quá ít ({len(all_valid_pts)} điểm) không đủ để dựng lưới.")
-
-        # ── Bước 2: Khởi tạo thể tích TSDF theo Bounding Box ──
-        # Tính percentile để loại bỏ ngoại lai cực đoan (outliers)
-        p_min = np.percentile(all_valid_pts, 1.0, axis=0)
-        p_max = np.percentile(all_valid_pts, 99.0, axis=0)
-
-        # Thêm padding 15% vào bounding box
-        center = (p_min + p_max) / 2.0
-        extent = (p_max - p_min) * 1.3
-        bounds_min = center - extent / 2.0
-        bounds_max = center + extent / 2.0
-
-        tsdf_vol = TSDFVolume(
-            bounds_min=bounds_min,
-            bounds_max=bounds_max,
-            resolution=self.resolution,
-        )
-
-        # ── Bước 3: Tích lũy đa góc nhìn vào Voxel Grid ──
-        for i in range(n_views):
-            logger.info(f"[P4] Tích lũy TSDF góc nhìn #{i+1}/{n_views}...")
-            tsdf_vol.integrate(
-                pointmap=pointmaps_3d[i],
-                valid_mask=valid_masks[i],
-                conf_map=confidence_masks[i],
-                camera_pose=camera_poses[i],
-                focal_length=focal_lengths[i],
+    try:
+        try:
+            verts, fcs, normals, values = marching_cubes(
+                padded_tsdf,
+                level=level,
+                spacing=(voxel_size, voxel_size, voxel_size),
+                method="lorensen",
             )
+        except (TypeError, ValueError):
+            # Fallback ve method mac dinh neu scikit-image cu khong co lorensen
+            verts, fcs, normals, values = marching_cubes(
+                padded_tsdf,
+                level=level,
+                spacing=(voxel_size, voxel_size, voxel_size),
+            )
+    except Exception as e:
+        warnings.warn(f"Marching Cubes that bai: {e}", RuntimeWarning)
+        return None, None
 
-        # ── Bước 4: Trích xuất Iso-surface Marching Cubes ──
-        logger.info("[P4] Trích xuất bề mặt Marching Cubes...")
-        mesh = extract_mesh_marching_cubes(tsdf_vol)
+    if len(verts) == 0 or len(fcs) == 0:
+        warnings.warn("Marching Cubes tra ve mesh rong.", RuntimeWarning)
+        return None, None
 
-        elapsed = time.time() - t0
-        logger.info(f"═══ [P4] HOÀN THÀNH TÁI TẠO MESH TRONG {elapsed:.2f} GIÂY ═══")
-        return mesh
+    # Bu tru toa do do da pad 1 voxel o moi chieu
+    verts = verts - voxel_size
+
+    # Chuyen doi toa do voxel -> the gioi (dich ve trung tam [-extent, extent])
+    origin = np.array([-extent, -extent, -extent], dtype=np.float32)
+    verts  = verts.astype(np.float32) + origin
+    fcs    = fcs.astype(np.int32)
+
+    # Loc loai bo cac dao vun roi rac (chi giu khoi lien thong chinh lon nhat)
+    try:
+        import trimesh
+        tm = trimesh.Trimesh(verts, fcs, process=False)
+        comps = tm.split(only_watertight=False)
+        if len(comps) > 1:
+            main_comp = max(comps, key=lambda c: len(c.faces))
+            verts = main_comp.vertices.astype(np.float32)
+            fcs   = main_comp.faces.astype(np.int32)
+    except Exception:
+        pass
+
+    return verts, fcs
+
+
+
+# ---------------------------------------------------------------------------
+# 5. TAUBIN SMOOTHING — Lam muot giu the tich
+# ---------------------------------------------------------------------------
+
+def taubin_smooth(
+    vertices: np.ndarray,
+    faces:    np.ndarray,
+    lam:      float = TAUBIN_LAMBDA,
+    mu:       float = TAUBIN_MU,
+    iters:    int   = TAUBIN_ITERS,
+) -> np.ndarray:
+    """Lam muot be mat bang thuat toan Taubin (1995).
+
+    Buoc 1: dich chuyen dinh theo huong Laplacian * lambda (tren mat phang).
+    Buoc 2: dich chuyen theo huong nguoc lai * |mu| (bu khoi the tich).
+    Lap lai 'iters' lan.
+
+    Args:
+        vertices: (V, 3) float32.
+        faces:    (F, 3) int32.
+        lam, mu:  He so lam muot (lam > 0, mu < 0, |mu| > lam).
+        iters:    So vong lap.
+
+    Returns:
+        vertices_smoothed: (V, 3) float32.
+    """
+    verts = vertices.astype(np.float64)
+    V = len(verts)
+
+    # Xay dung danh sach hang xom (adjacency)
+    adj: list = [set() for _ in range(V)]
+    for tri in faces:
+        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+        adj[a].update([b, c])
+        adj[b].update([a, c])
+        adj[c].update([a, b])
+
+    def laplacian_step(v: np.ndarray, factor: float) -> np.ndarray:
+        new_v = v.copy()
+        for i in range(V):
+            nb = list(adj[i])
+            if nb:
+                centroid = v[nb].mean(axis=0)
+                new_v[i] = v[i] + factor * (centroid - v[i])
+        return new_v
+
+    for _ in range(iters):
+        verts = laplacian_step(verts, lam)
+        verts = laplacian_step(verts, mu)
+
+    return verts.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# 6. QUADRIC DECIMATION — Giam so mat
+# ---------------------------------------------------------------------------
+
+def quadric_decimate(
+    vertices: np.ndarray,
+    faces:    np.ndarray,
+    target_faces: int = TARGET_FACE_COUNT,
+) -> tuple:
+    """Giam so mat bang Quadric Error Metrics Decimation.
+
+    Thu tu uu tien:
+      1. open3d SimplifymeshQuadricDecimation.
+      2. pymeshlab QEM.
+      3. Fallback: giu nguyen neu ca hai that bai.
+
+    Args:
+        vertices:     (V, 3) float32.
+        faces:        (F, 3) int32.
+        target_faces: So mat muc tieu.
+
+    Returns:
+        (verts_dec, faces_dec) sau decimation.
+    """
+    F = len(faces)
+    if F <= target_faces:
+        return vertices, faces
+
+    # Method 1: open3d
+    try:
+        import open3d as o3d
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices  = o3d.utility.Vector3dVector(vertices.astype(np.float64))
+        mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+        mesh_dec = mesh.simplify_quadric_decimation(target_faces)
+        verts_dec = np.asarray(mesh_dec.vertices, dtype=np.float32)
+        faces_dec = np.asarray(mesh_dec.triangles, dtype=np.int32)
+        return verts_dec, faces_dec
+    except Exception:
+        pass
+
+    # Method 2: pymeshlab
+    try:
+        import pymeshlab
+        ms = pymeshlab.MeshSet()
+        m  = pymeshlab.Mesh(
+            vertex_matrix=vertices.astype(np.float64),
+            face_matrix=faces.astype(np.int32),
+        )
+        ms.add_mesh(m)
+        ms.apply_filter(
+            "meshing_decimation_quadric_edge_collapse",
+            targetfacenum=target_faces,
+        )
+        out = ms.current_mesh()
+        return out.vertex_matrix().astype(np.float32), out.face_matrix().astype(np.int32)
+    except Exception:
+        pass
+
+    warnings.warn(
+        "Quadric Decimation khong kha dung (can open3d hoac pymeshlab). "
+        "Giu nguyen mesh.",
+        RuntimeWarning,
+    )
+    return vertices, faces
+
+
+# ---------------------------------------------------------------------------
+# 7. PIPELINE P4 — ENTRY POINT
+# ---------------------------------------------------------------------------
+
+def reconstruct_mesh(
+    depth_views:    list,
+    voxel_resolution: int   = DEFAULT_VOXEL_RES,
+    extent:           float = 1.0,
+    use_carving:      bool  = True,
+    smooth:           bool  = True,
+    decimate:         bool  = True,
+) -> tuple:
+    """Chay toan bo pipeline P4: Space Carving + TSDF Fusion + Mesh.
+
+    Args:
+        depth_views:      Ket qua tu estimate_depth_pipeline() (da qua Quality Gate).
+        voxel_resolution: Do phan giai luoi voxel.
+        extent:           Ban kinh hop voxel.
+        use_carving:      Co dung Space Carving hay khong.
+        smooth:           Co dung Taubin Smoothing hay khong.
+        decimate:         Co dung Quadric Decimation hay khong.
+
+    Returns:
+        (vertices, faces, mesh_health)
+        - vertices:    (V, 3) float32.
+        - faces:       (F, 3) int32.
+        - mesh_health: MeshHealth.
+
+    Raises:
+        RuntimeError: Neu mesh dau ra rong.
+    """
+    N = len(depth_views)
+    if N == 0:
+        raise RuntimeError("Khong co view nao de reconstruct.")
+
+    # Trich du lieu tu views
+    alphas     = [v["alpha_mask"] for v in depth_views]
+    depths     = [v["depth_map"]  for v in depth_views]
+    valids     = [v["valid_mask"] for v in depth_views]
+    K_primes   = [v["K_prime"]    for v in depth_views]
+    canvas_sz  = depth_views[0]["canvas_rgb"].shape[1]
+
+    # Sinh camera poses (su dung 4-view ortho convention)
+    poses = get_orthographic_camera_poses(n_views=N)
+    Rs = [p[0] for p in poses]
+    ts = [p[1] for p in poses]
+
+    # Tao luoi voxel
+    voxel_coords, voxel_size = create_voxel_grid(voxel_resolution, extent)
+
+    # Buoc 1: Space Carving
+    carved_mask = None
+    if use_carving:
+        carved_mask = space_carving(
+            voxel_coords, alphas, K_primes, Rs, ts, canvas_size=canvas_sz
+        )
+
+    # Buoc 2: TSDF Fusion
+    tsdf_vol, weight_vol = tsdf_fusion(
+        voxel_coords, depths, valids, K_primes, Rs, ts,
+        voxel_size, carved_mask=carved_mask, canvas_size=canvas_sz
+    )
+
+    # Buoc 3: Marching Cubes
+    vertices, faces = extract_mesh_marching_cubes(
+        tsdf_vol, weight_vol, voxel_size, extent
+    )
+    if vertices is None:
+        raise RuntimeError("Marching Cubes tra ve mesh rong — kiem tra du lieu dau vao.")
+
+    # Buoc 4: Taubin Smoothing
+    if smooth:
+        vertices = taubin_smooth(vertices, faces)
+
+    # Buoc 5: Quadric Decimation
+    if decimate:
+        vertices, faces = quadric_decimate(vertices, faces)
+
+    # Kiem dinh chat luong
+    health = check_mesh_health(vertices, faces)
+
+    return vertices, faces, health
+
+
+def mesh_health(mesh_or_verts, faces=None) -> dict:
+    """Helper tra ve dict mesh health tu Trimesh object hoac (vertices, faces)."""
+    if hasattr(mesh_or_verts, "vertices") and hasattr(mesh_or_verts, "faces"):
+        v = mesh_or_verts.vertices
+        f = mesh_or_verts.faces
+        vol = float(mesh_or_verts.volume) if getattr(mesh_or_verts, "is_watertight", False) else 0.0
+    else:
+        v = mesh_or_verts
+        f = faces
+        vol = 0.0
+    h = check_mesh_health(v, f)
+    return {
+        "watertight": h.is_watertight,
+        "boundary_edges": h.boundary_edges,
+        "components": h.components,
+        "faces": h.face_count,
+        "vertices": h.vertex_count,
+        "volume": h.volume_m3 if h.volume_m3 > 0 else vol,
+        "euler_number": h.euler_number,
+    }

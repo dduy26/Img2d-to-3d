@@ -1,248 +1,344 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from typing import List
-import uvicorn
-import shutil
+"""
+app.py — P6: FastAPI Server & Asynchronous Job Queue
+=====================================================
+Chuc nang:
+  1. Endpoint POST /reconstruct: Nhan N file anh, dua vao hang doi xu ly.
+  2. Endpoint GET  /status/{job_id}: Kiem tra trang thai xu ly.
+  3. Endpoint GET  /download/{job_id}: Tai file .glb ket qua.
+  4. Endpoint GET  /: Phuc vu giao dien Web UI (index.html).
+  5. Background worker chay async, mien nhiem timeout 100s cua Cloudflare.
+
+Kien truc:
+  - FastAPI + asyncio.Queue (khong can Redis/Celery cho local).
+  - Job co vong doi: PENDING -> PROCESSING -> DONE / ERROR.
+  - Ket qua .glb luu tam vao output/ va phuc vu download.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import os
 import time
-import glob
-import numpy as np
-import logging
+import uuid
+import traceback
+import tempfile
+from pathlib import Path
+from typing import Optional
 
-try:
-    import torch
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 
-# Import các module trong pipeline
-from preprocess import preprocess_multiview
-from engine_dust3r import DUSt3REngine
-from quality_gate import QualityGate
-from engine_triposr import TripoSREngine
-from engine_tsdf_mesh import TSDFMeshEngine
-from texture_blender import TextureBlender
+# Internal pipeline imports
+from .preprocess      import preprocess_images
+from .engine_depth    import estimate_depth_pipeline
+from .quality_gate    import run_quality_gate
+from .engine_tsdf_mesh import reconstruct_mesh
+from .texture_blender import apply_texture
+from .utils_3d        import (
+    check_mesh_health,
+    compute_normals,
+    export_glb,
+    get_orthographic_camera_poses,
+)
 
-# Cấu hình logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Constants & Paths
+# ---------------------------------------------------------------------------
 
-app = FastAPI(title="2D to 3D Generation API - Full Pipeline")
+BASE_DIR    = Path(__file__).parent.parent   # notebook/
+OUTPUT_DIR  = BASE_DIR.parent / "output"
+FRONTEND_DIR = BASE_DIR / "frontend"
+TEMP_DIR    = Path(tempfile.gettempdir()) / "imgtomodel_jobs"
 
-os.makedirs("temp_uploads", exist_ok=True)
-os.makedirs("outputs", exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# ============================================================================
-# KHỞI TẠO TẤT CẢ ENGINE (Chỉ chạy 1 lần lúc bật server)
-# ============================================================================
-device = "cuda" if (HAS_TORCH and torch.cuda.is_available()) else "cpu"
-logger.info(f"Sử dụng device: {device}")
+MAX_UPLOAD_SIZE_MB = 50
+MAX_FILES          = 8
 
-# P3: Quality Gate
-q_gate = QualityGate()
+# ---------------------------------------------------------------------------
+# FastAPI App
+# ---------------------------------------------------------------------------
 
-# P3: TripoSR Fail-safe Engine (nạp sẵn vào RAM)
-triposr_engine = TripoSREngine()
+app = FastAPI(
+    title="ImgToModel 3D Reconstruction API",
+    description="Chuyen doi anh 2D sang mo hinh 3D .glb (GLTF 2.0 Binary)",
+    version="2.0.0",
+)
 
-# P2: DUSt3R Engine
-dust3r_engine = DUSt3REngine(device=device)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# P4: TSDF Volumetric Mesh Engine (NVIDIA reference TSDF + Marching Cubes)
-tsdf_engine = TSDFMeshEngine(resolution=128)
+# Mount static files (frontend)
+if FRONTEND_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
-# P5: XAtlas UV Parameterization & Base-Color Texture Blender
-texture_blender = TextureBlender()
+# ---------------------------------------------------------------------------
+# Job Store (in-memory)
+# ---------------------------------------------------------------------------
 
-logger.info("═══ TẤT CẢ ENGINE P1-P5 ĐÃ SẴN SÀNG ═══")
+jobs: dict = {}   # job_id -> {"status", "created_at", "result_path", "error", "mode"}
 
+def new_job() -> str:
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status":     "PENDING",
+        "created_at": time.time(),
+        "result_path": None,
+        "error":      None,
+        "mode":       None,
+        "mesh_info":  None,
+    }
+    return job_id
 
-# ============================================================================
-# API 1: Upload NHIỀU ẢNH → Full Pipeline (Preprocessing → DUSt3R → QGate → TripoSR fallback)
-# ============================================================================
-@app.post("/generate-3d/")
-async def generate_3d(files: List[UploadFile] = File(...)):
+# ---------------------------------------------------------------------------
+# Core Pipeline Execution
+# ---------------------------------------------------------------------------
+
+def execute_3d_pipeline(job_id_or_paths, image_paths: list = None) -> dict:
+    """Chay toan bo pipeline 3D cho mot job hoac danh sach anh.
+
+    Ho tro 2 cach goi:
+      1. execute_3d_pipeline(image_paths) -> tra ve dict ket qua (dung trong Colab / script)
+      2. execute_3d_pipeline(job_id, image_paths) -> cap nhat jobs[job_id] va tra ve dict
+
+    Thu tu:
+      P1 -> P2 -> P3 (Quality Gate) -> P4 (TSDF) -> P5 (Texture) -> GLB Export.
     """
-    Full Pipeline: Upload nhiều ảnh đa góc nhìn.
-    
-    Luồng xử lý:
-        1 ảnh  → Đi thẳng TripoSR (không cần DUSt3R multi-view)
-        ≥2 ảnh → P1 Preprocessing → P2 DUSt3R → P3 Quality Gate
-                  → Nếu PASS: Dùng kết quả DUSt3R (TODO: P4 TSDF Mesh)
-                  → Nếu FAIL: Fallback TripoSR từ ảnh đầu tiên
-    """
-    pipeline_start = time.time()
-    saved_paths = []
-
-    try:
-        # ── Bước 0: Lưu tất cả ảnh upload ──
-        for f in files:
-            input_path = f"temp_uploads/{f.filename}"
-            with open(input_path, "wb") as buffer:
-                shutil.copyfileobj(f.file, buffer)
-            saved_paths.append(input_path)
-            logger.info(f"Đã lưu: {f.filename}")
-
-        # Tạo output path chuẩn .glb
-        base_name = os.path.splitext(files[0].filename)[0]
-        output_glb_path = f"outputs/result_{base_name}.glb"
-
-        # ════════════════════════════════════════════════════════════════
-        # NHÁNH 1: Chỉ có 1 ảnh → Đi thẳng TripoSR (Single-Image Reconstruction)
-        # ════════════════════════════════════════════════════════════════
-        if len(saved_paths) == 1:
-            logger.info("═══ CHẾ ĐỘ 1 ẢNH → TripoSR trực tiếp ═══")
-            success, model_path, exec_time = triposr_engine.run_fallback(
-                saved_paths[0], output_glb_path
-            )
-            return {
-                "status": "success" if success else "failed",
-                "mode": "single_image_triposr",
-                "quality_passed": None,
-                "gate_reason": "Chỉ 1 ảnh, bỏ qua DUSt3R multi-view",
-                "execution_time_seconds": round(exec_time, 2),
-                "output_file": model_path,
-                "num_input_images": 1,
+    if image_paths is None:
+        if isinstance(job_id_or_paths, (list, tuple)):
+            job_id = new_job()
+            image_paths = list(job_id_or_paths)
+        else:
+            job_id = str(job_id_or_paths)
+            image_paths = []
+    else:
+        job_id = str(job_id_or_paths)
+        if job_id not in jobs:
+            jobs[job_id] = {
+                "status":     "PENDING",
+                "created_at": time.time(),
+                "result_path": None,
+                "error":      None,
+                "mode":       None,
+                "mesh_info":  None,
             }
 
-        # ════════════════════════════════════════════════════════════════
-        # NHÁNH 2: Nhiều ảnh → Full Pipeline
-        # ════════════════════════════════════════════════════════════════
-        logger.info(f"═══ CHẾ ĐỘ MULTI-VIEW ({len(saved_paths)} ảnh) → Full Pipeline ═══")
-
-        # ── Bước 1 (P1): Preprocessing ──
-        logger.info("[P1] Tiền xử lý ảnh đa góc nhìn...")
-        preprocess_result = preprocess_multiview(
-            image_paths=saved_paths,
-            target_size=512,
-            device=device,
-        )
-        logger.info(
-            f"[P1] Hoàn tất: {preprocess_result['num_images']} ảnh, "
-            f"tensor shape: {preprocess_result['images_normalized'].shape}"
-        )
-
-        # ── Bước 2 (P2): DUSt3R Multi-view Reconstruction ──
-        logger.info("[P2] Chạy DUSt3R pairwise matching + global alignment...")
-        if HAS_TORCH:
-            images_tensor = torch.from_numpy(preprocess_result["images_normalized"]).to(device)
-        else:
-            images_tensor = preprocess_result["images_normalized"]
-
-        dust3r_result = dust3r_engine.process({
-            "images_dust3r": images_tensor
-        })
-
-        pointmaps_3d = dust3r_result["pointmaps_3d"]
-        confidence_masks = dust3r_result["confidence_masks"]
-        camera_poses = dust3r_result["camera_poses"]
-        focal_lengths = dust3r_result["focal_lengths"]
-
-        logger.info(
-            f"[P2] Hoàn tất: pointmaps shape={pointmaps_3d.shape}, "
-            f"poses={len(camera_poses)}, focals={len(focal_lengths)}"
-        )
-
-        # ── Bước 3 (P3): Quality Gate ──
-        logger.info("[P3] Đánh giá chất lượng qua Quality Gate...")
-        
-        # Tính BA loss giả lập (TODO: lấy từ DUSt3R global alignment thực tế)
-        ba_loss = 1.0  # Placeholder - sẽ được thay bằng loss thực từ DUSt3R
-        
-        if hasattr(confidence_masks, 'cpu'):
-            confidence_np = confidence_masks.cpu().numpy()
-        else:
-            confidence_np = np.asarray(confidence_masks)
-
-        is_high_quality, reason = q_gate.evaluate(
-            poses=camera_poses,
-            confidence_map=confidence_np,
-            ba_loss=ba_loss,
-        )
-        logger.info(f"[P3] Kết quả: {'PASS ✓' if is_high_quality else 'FAIL ✗'} — {reason}")
-
-        # ── Bước 4: Phân luồng theo kết quả Quality Gate ──
-        if is_high_quality:
-            # ✓ PASS: Chạy luồng NVIDIA P4 TSDF Mesh & P5 Texture Blender
-            logger.info("[P4] Quality PASS → Dựng Mesh TSDF 360°...")
-            mesh = tsdf_engine.reconstruct(
-                pointmaps_3d=pointmaps_3d,
-                alpha_masks=preprocess_result["alpha_masks"],
-                confidence_masks=confidence_masks,
-                camera_poses=camera_poses,
-                focal_lengths=focal_lengths,
-            )
-
-            logger.info("[P5] Trải UV XAtlas & Nướng màu Base-Color Texture vào Mesh...")
-            success, model_path = texture_blender.process_and_export(
-                mesh=mesh,
-                images_rgb=preprocess_result["images_rgb"],
-                camera_poses=camera_poses,
-                focal_lengths=focal_lengths,
-                output_path=output_glb_path,
-            )
-            # Fallback an toàn nếu nướng texture gặp sự cố: xuất mesh thô trực tiếp
-            if not success or not os.path.exists(output_glb_path):
-                logger.warning("[P5] Nướng texture không thành công, fallback xuất mesh thô của P4.")
-                mesh.export(output_glb_path, file_type="glb")
-                success = os.path.exists(output_glb_path)
-                model_path = output_glb_path
-
-            pipeline_type = "nvidia_tsdf_mesh"
-        else:
-            # ✗ FAIL: Kích hoạt cứu hộ TripoSR
-            logger.info(f"[P3→Cứu hộ] Quality FAIL ({reason}) → Gọi TripoSR fallback")
-            success, model_path, _ = triposr_engine.run_fallback(
-                saved_paths[0], output_glb_path
-            )
-            pipeline_type = "triposr_fallback"
-
-        total_time = time.time() - pipeline_start
-
-        return {
-            "status": "success" if success else "failed",
-            "mode": "multiview_pipeline",
-            "pipeline_type": pipeline_type,
-            "quality_passed": is_high_quality,
-            "gate_reason": reason,
-            "num_input_images": preprocess_result["num_images"],
-            "execution_time_seconds": round(total_time, 2),
-            "output_file": model_path,
-        }
-
-    except Exception as e:
-        logger.error(f"Pipeline lỗi: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================================
-# API 2: Upload 1 ẢNH DUY NHẤT → TripoSR trực tiếp (giữ API cũ tương thích)
-# ============================================================================
-@app.post("/generate-3d/single/")
-async def generate_3d_single(file: UploadFile = File(...)):
-    """
-    API đơn giản: Upload 1 ảnh → TripoSR trực tiếp.
-    Giữ nguyên tương thích API cũ.
-    """
     try:
-        input_path = f"temp_uploads/{file.filename}"
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        jobs[job_id]["status"] = "PROCESSING"
+        out_glb = str(OUTPUT_DIR / f"{job_id}.glb")
 
-        output_glb_path = f"outputs/result_{os.path.splitext(file.filename)[0]}.glb"
+        # UU TIEN: Neu N >= 2 va co GPU CUDA -> Chay Tencent Hunyuan3D-2mv Multi-View AI Engine
+        import torch
+        if len(image_paths) >= 2 and torch.cuda.is_available():
+            try:
+                from .engine_hunyuan3d import reconstruct_hunyuan3d
+                hy3d_res = reconstruct_hunyuan3d(image_paths, out_glb, device="cuda:0")
+                jobs[job_id]["status"] = "DONE"
+                jobs[job_id]["result_path"] = out_glb
+                jobs[job_id]["mode"] = "multi_view_hunyuan3d"
+                jobs[job_id]["mesh_info"] = hy3d_res.get("mesh_info", {})
+                return {
+                    "status": "success",
+                    "output_file": out_glb,
+                    "result_path": out_glb,
+                    "mode": "multi_view_hunyuan3d",
+                    "pipeline": "Tencent Hunyuan3D-2mv Multi-View AI Engine",
+                    "mesh_info": hy3d_res.get("mesh_info", {}),
+                }
+            except Exception as d_err:
+                print(f"⚠️ Hunyuan3D gap loi: {d_err}. Chuyen sang fallback...")
 
-        success, model_path, exec_time = triposr_engine.run_fallback(
-            input_path, output_glb_path
-        )
+        # P1: Tien xu ly
+        preprocessed = preprocess_images(image_paths)
 
-        return {
-            "status": "success" if success else "failed",
-            "mode": "single_image_triposr",
-            "execution_time_seconds": round(exec_time, 2),
-            "output_file": model_path,
+        # P2: Uoc luong do sau
+        depth_views = estimate_depth_pipeline(preprocessed)
+
+        # P3: Quality Gate
+        gate_result = run_quality_gate(depth_views)
+        jobs[job_id]["mode"] = gate_result.mode
+
+        if gate_result.mode == "multi_view":
+            active_views = gate_result.valid_views
+        else:
+            # Single-view fallback: chi dung anchor
+            active_views = [gate_result.anchor_view]
+
+        # P4: Reconstruct Mesh
+        vertices, faces, mesh_health = reconstruct_mesh(active_views)
+        jobs[job_id]["mesh_info"] = {
+            "vertex_count":   mesh_health.vertex_count,
+            "face_count":     mesh_health.face_count,
+            "is_watertight":  mesh_health.is_watertight,
+            "boundary_edges": mesh_health.boundary_edges,
+            "components":     mesh_health.components,
+            "euler_number":   mesh_health.euler_number,
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # P5: Texture
+        N = len(active_views)
+        poses = get_orthographic_camera_poses(n_views=N)
+        Rs = [p[0] for p in poses]
+        ts = [p[1] for p in poses]
 
+        texture_result = apply_texture(vertices, faces, active_views, Rs, ts)
+
+        # Export GLB
+        normals = texture_result["normals"]
+        colors  = texture_result["vertex_colors"]
+        out_glb = str(OUTPUT_DIR / f"{job_id}.glb")
+        export_glb(vertices, faces, colors=colors, normals=normals, out_path=out_glb)
+
+        jobs[job_id]["status"]      = "DONE"
+        jobs[job_id]["result_path"] = out_glb
+
+    except Exception as e:
+        jobs[job_id]["status"] = "ERROR"
+        jobs[job_id]["error"]  = str(e) + "\n" + traceback.format_exc()
+
+    info = jobs[job_id]
+    return {
+        "status":      "success" if info["status"] == "DONE" else "error",
+        "output_file": info.get("result_path"),
+        "result_path": info.get("result_path"),
+        "mode":        info.get("mode"),
+        "pipeline":    "P1-P5 Full TSDF Mesh",
+        "mesh_info":   info.get("mesh_info"),
+        "error":       info.get("error"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# API Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse, summary="Web UI")
+async def serve_ui():
+    """Phuc vu giao dien Web UI (Three.js viewer)."""
+    index_path = FRONTEND_DIR / "index.html"
+    if index_path.exists():
+        return HTMLResponse(content=index_path.read_text(encoding="utf-8"))
+    return HTMLResponse(content="""
+<!DOCTYPE html>
+<html lang="vi">
+<head><meta charset="UTF-8"><title>ImgToModel</title></head>
+<body>
+  <h1>ImgToModel API</h1>
+  <p>Frontend chua duoc build. Vui long tao notebook/frontend/index.html.</p>
+  <p><a href="/docs">API Docs (Swagger UI)</a></p>
+</body>
+</html>
+""")
+
+
+@app.post("/reconstruct", summary="Bat dau tai tao 3D tu anh")
+async def reconstruct(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(..., description="1-8 file anh (JPEG/PNG)"),
+):
+    """Nhan N file anh va bat dau qua trinh tai tao 3D.
+
+    Returns:
+        {"job_id": "...", "status": "PENDING"}
+    """
+    # Kiem tra so luong
+    if len(files) < 1:
+        raise HTTPException(400, "Vui long tai len it nhat 1 anh.")
+    if len(files) > MAX_FILES:
+        raise HTTPException(400, f"Toi da {MAX_FILES} anh moi lan.")
+
+    # Luu file tam thoi
+    job_id  = new_job()
+    job_dir = TEMP_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths = []
+    for f in files:
+        # Kiem tra dinh dang
+        suffix = Path(f.filename or "img.jpg").suffix.lower()
+        if suffix not in (".jpg", ".jpeg", ".png", ".webp"):
+            raise HTTPException(400, f"Dinh dang khong ho tro: {suffix}")
+        dest = job_dir / f"{len(saved_paths):04d}{suffix}"
+        content = await f.read()
+        if len(content) > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+            raise HTTPException(400, f"File {f.filename} qua lon (>{MAX_UPLOAD_SIZE_MB}MB).")
+        dest.write_bytes(content)
+        saved_paths.append(str(dest))
+
+    # Chay pipeline trong background task
+    background_tasks.add_task(execute_3d_pipeline, job_id, saved_paths)
+
+    return JSONResponse({
+        "job_id": job_id,
+        "status": "PENDING",
+        "message": f"Da nhan {len(saved_paths)} anh. Pipeline dang chay.",
+    })
+
+
+@app.get("/status/{job_id}", summary="Kiem tra trang thai job")
+async def get_status(job_id: str):
+    """Tra ve trang thai hien tai cua job.
+
+    Status values: PENDING | PROCESSING | DONE | ERROR
+    """
+    if job_id not in jobs:
+        raise HTTPException(404, f"Khong tim thay job: {job_id}")
+    job = jobs[job_id]
+    resp = {
+        "job_id":    job_id,
+        "status":    job["status"],
+        "mode":      job.get("mode"),
+        "mesh_info": job.get("mesh_info"),
+        "elapsed_s": round(time.time() - job["created_at"], 2),
+    }
+    if job["status"] == "ERROR":
+        resp["error"] = job["error"]
+    if job["status"] == "DONE":
+        resp["download_url"] = f"/download/{job_id}"
+    return JSONResponse(resp)
+
+
+@app.get("/download/{job_id}", summary="Tai file .glb ket qua")
+async def download_result(job_id: str):
+    """Tra ve file .glb da tai tao."""
+    if job_id not in jobs:
+        raise HTTPException(404, f"Khong tim thay job: {job_id}")
+    job = jobs[job_id]
+    if job["status"] != "DONE":
+        raise HTTPException(400, f"Job chua hoan thanh. Trang thai: {job['status']}")
+    result_path = job.get("result_path")
+    if not result_path or not Path(result_path).exists():
+        raise HTTPException(500, "File ket qua khong ton tai.")
+    return FileResponse(
+        path=result_path,
+        media_type="model/gltf-binary",
+        filename=f"model_{job_id[:8]}.glb",
+    )
+
+
+@app.get("/api/health", summary="Health check (API alias)")
+@app.get("/health", summary="Health check")
+async def health_check():
+    """Kiem tra server co dang hoat dong khong."""
+    return {"status": "ok", "jobs_count": len(jobs)}
+
+
+# ---------------------------------------------------------------------------
+# Chay thu cuc bo
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
+    import uvicorn
+    uvicorn.run(
+        "notebook.backend.app:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+    )

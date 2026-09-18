@@ -1,87 +1,99 @@
-# Cổng Kiểm Định Chất Lượng & Động Cơ Cứu Hộ 3D (Quality Gate & Fail-safe Engine)
+# Hệ Thống Tái Tạo Mô Hình 3D Từ Ảnh 2D (2D to 3D Dual-Engine Studio)
 
-Phân hệ này là một phần của hệ thống tạo mô hình 3D từ ảnh 2D. Nhiệm vụ chính của phân hệ là kiểm tra chất lượng dữ liệu đầu vào (Quality Gate) và cung cấp một cơ chế tạo mô hình 3D dự phòng siêu tốc bằng **TripoSR** trong trường hợp dữ liệu không đạt chuẩn (Fail-safe), đảm bảo KPI thời gian phản hồi $\le 2$s.
+Hệ thống tái tạo mô hình 3D nguyên khối hoàn chỉnh từ ảnh 2D (đơn ảnh hoặc 2–8 ảnh đa góc 360°) sử dụng kiến trúc kết hợp các mô hình Deep Learning SOTA:
+1. **⚡ Luồng 1 (Single-View - 1 ảnh):** **TripoSR** (ViT + Triplane NeRF + Marching Cubes) sinh mesh 3D kín nước 100% (Watertight) trong **~1.5 giây**.
+2. **🌐 Luồng 2 (Multi-View - $N \ge 2$ ảnh):** **Tencent Hunyuan3D-2mv** (DiT Flow Matching Pipeline) kết hợp bộ gán góc Hungarian Viewpoint Assignment (P1) sinh lưới 3D đặc kín nước 100% chuẩn CAD/Game asset, phủ màu chân thực từ ảnh chụp thực tế bằng **Multi-View Texture Blender** (Fresnel $\cos^3\theta$ + Z-buffer Occlusion culling).
 
----
-.\.venv\Scripts\python.exe notebook/backend/app.py --single data/input/multi_view/test.jpg
-
-## Mục lục
-1. [Cấu trúc thư mục](#1-cấu-trúc-thư-mục)
-2. [Yêu cầu hệ thống & Cài đặt](#2-yêu-cầu-hệ-thống--cài-đặt)
-3. [Luồng hoạt động (Workflow)](#3-luồng-hoạt-động-workflow)
-4. [Hướng dẫn chạy & Nghiệm thu](#4-hướng-dẫn-chạy--nghiệm-thu)
 ---
 
 ## 1. Cấu trúc thư mục
 
-Để hệ thống hoạt động đúng, kiến trúc thư mục cần được tổ chức như sau:
+Kiến trúc thư mục được tổ chức tinh gọn và chuẩn hoá:
 
 ```text
 Img2d-to-3d/
+├── input/                # Thư mục nhận ảnh đầu vào
+├── output/               # Thư mục xuất file mô hình 3D .glb
 └── notebook/
+    ├── frontend/         # Giao diện Web 3D Viewer (Three.js CDN + HTML5)
+    │   └── index.html
+    ├── demo_colab.ipynb  # Sổ tay chạy trọn gói trên Google Colab (T4 GPU)
+    ├── local_app.py      # Trình khách Gradio UI chạy cục bộ
     └── backend/
-        ├── tsr/                  # Thư mục mã nguồn lõi của TripoSR
-        ├── app.py                # Máy chủ FastAPI (API Điều phối)
-        ├── quality_gate.py       # Cổng lọc chất lượng (Thuật toán Cosine Similarity)
-        ├── engine_triposr.py     # Động cơ Cứu hộ (TripoSR + Rembg)
-        ├── temp_uploads/         # (Tự động tạo khi run app.py) Chứa ảnh user upload
-        └── outputs/              # (Tự động tạo khi run app.py) Chứa model .glb xuất ra
+        ├── app.py               # Máy chủ FastAPI (API Điều phối & Job Polling)
+        ├── preprocess.py        # P1: Tách nền, vá lỗ PET/highlights, nhận diện mặt (CLIP/HOG)
+        ├── engine_hunyuan3d.py  # P2: Tencent Hunyuan3D-2mv DiT Multi-View Pipeline
+        ├── engine_depth.py      # P2: Depth-Anything-V2 dự đoán độ sâu đa góc & đơn ảnh
+        ├── quality_gate.py      # P3: Kiểm định chất lượng góc chụp & bao phủ camera
+        ├── engine_tsdf_mesh.py  # P4: Volumetric TSDF Space Carving & Marching Cubes 360°
+        ├── texture_blender.py   # P5: Trải phẳng UV & nướng màu bề mặt chân thực
+        └── utils_3d.py          # Xuất định dạng GLB chuẩn PBR / Vertex Colors
 ```
+
+---
+
 ## 2. Yêu cầu hệ thống & Cài đặt
 
-- **Ngôn ngữ:** Python 3.10
-- **Môi trường:** Trình biên dịch C++ (Microsoft C++ Build Tools) để build thư viện `torchmcubes`.
+- **Ngôn ngữ:** Python 3.10 – 3.13.
+- **Phần cứng:** Chạy tối ưu trên GPU NVIDIA (Google Colab T4 15GB VRAM) và hỗ trợ chạy trên CPU / GPU cục bộ.
 
 **Cài đặt các thư viện cần thiết:**
-Mở Terminal, di chuyển vào thư mục dự án và chạy các lệnh sau:
 
 ```bash
-pip install torch torchvision
-pip install fastapi uvicorn trimesh rembg onnxruntime
+pip install fastapi uvicorn python-multipart trimesh rembg onnxruntime
+pip install transformers xatlas roma einops safetensors matplotlib tqdm fast-simplification scipy
 ```
-**Cài đặt mã nguồn TripoSR (Bắt buộc):**
-Hệ thống yêu cầu mã nguồn lõi của TripoSR để khởi tạo mô hình Cứu hộ. Thực hiện các bước sau:
 
-1. Mở Terminal ở một thư mục bất kỳ và tải kho lưu trữ chính thức của TripoSR:
+*(Trên Google Colab GPU T4, notebook `demo_colab.ipynb` tự động cài đặt `hy3dgen` và nạp mô hình `tencent/Hunyuan3D-2mv`).*
 
-   ```bash
-   git clone https://github.com/VAST-AI-Research/TripoSR.git
-   ```
-2. Mở thư mục `TripoSR` vừa tải về, copy toàn bộ thư mục `tsr/`.
-3. Dán thư mục `tsr/` vào bên trong thư mục `notebook/backend/` của dự án để cấu trúc khớp với sơ đồ trên.
+---
 
-*(Lưu ý: Trọng số mô hình `model.ckpt` nặng ~2GB sẽ được hệ thống tự động kết nối và tải về từ Hugging Face trong lần khởi chạy server đầu tiên).*
-## 3. Luồng hoạt động (Workflow)
+## 3. Luồng hoạt động (Workflow P1 → P6)
 
-Hệ thống được cấu thành từ 3 file chính, hoạt động theo dây chuyền:
+Hệ thống hoạt động theo quy trình 6 phân hệ khép kín:
 
-1. **`app.py` (Nhạc trưởng):** Khởi tạo máy chủ ở cổng `8000`. Nhận ảnh từ người dùng, lưu vào `temp_uploads` và kích hoạt luồng kiểm định.
-2. **`quality_gate.py` (Bộ lọc):**
-   - Đánh giá Pose (góc camera) bằng Cosine Similarity.
-   - Bắt chính xác 100% các góc chụp bị trùng lặp (ví dụ: góc lệch = 0 độ) hoặc điểm Confidence thấp.
-   - Nếu lỗi -> Kích hoạt cứu hộ.
-3. **`engine_triposr.py` (Cứu hộ):**
-   - Được nạp vào RAM ngay khi boot server để tối ưu tốc độ.
-   - Xóa nền ảnh gốc, đắp nền trắng và đưa ảnh về chuẩn RGB.
-   - Feed-forward qua TripoSR, nặn lưới 3D (Mesh) và xuất thẳng ra định dạng chuẩn `.glb` vào thư mục `outputs`.
+1. **P1 Preprocessing (`preprocess.py`):**
+   - Tách nền vật thể bằng Rembg / RMBG-2.0.
+   - Thuật toán `refine_alpha_mask` tự động lấp kín lỗ thủng phản xạ trên chai nhựa trong suốt / kim loại bóng.
+   - Phân loại mặt ảnh (`classify_viewpoints`) bằng CLIP ViT Zero-shot kết hợp HOG Bilateral Gradient Symmetry, giải thuật gán cặp Hungarian (`linear_sum_assignment`) gán đúng góc thực $0^\circ, 90^\circ, 180^\circ, 270^\circ$ mà không bị ghép loạn góc.
+2. **P2 3D Geometry Generation:**
+   - **Đơn ảnh:** `TripoSR` sinh mesh 3D kín nước trong 1.5s.
+   - **Đa ảnh ($N \ge 2$):** `Tencent Hunyuan3D-2mv` DiT Flow Matching Pipeline sinh khối 3D chuẩn CAD/Game asset có đầy đủ mặt đế và lòng vật thể.
+   - **Dự phòng Local:** `Depth-Anything-V2` dự đoán độ sâu đa góc.
+3. **P3 Quality Gate (`quality_gate.py`):**
+   - Kiểm tra độ bao phủ góc chụp, tránh hiện tượng chụp trùng 1 góc hoặc thiếu góc đối xứng; tự động fallback về luồng đơn ảnh nếu bộ ảnh đa góc không đạt chuẩn.
+4. **P4 Volumetric TSDF Mesh (`engine_tsdf_mesh.py`):**
+   - Không gian voxel thích ứng hình dáng vật thể (Bounding Box thích ứng vật thể thon cao/dẹt).
+   - Chiếu chùm tia ngược Space Carving loại bỏ voxel thừa ngoài silhouette.
+   - Marching Cubes nặn lưới đa giác 3D đặc, kín nước (Watertight Solid Mesh).
+5. **P5 Multi-View Texture Blender (`texture_blender.py`):**
+   - Chiếu chùm tia màu từ toàn bộ các góc chụp thực tế lên lưới 3D.
+   - Sử dụng trọng số Fresnel $\cos^3\theta$ kết hợp bộ đệm độ sâu Z-buffer triệt tiêu che khuất và bóng chói, nướng màu sắc rực rỡ vào file `.glb`.
+6. **P6 Web App & Cloud (`app.py`, `frontend/index.html`, `demo_colab.ipynb`):**
+   - API bất đồng bộ với Job Polling chống timeout 100s của Cloudflare Tunnel.
+   - Trình hiển thị Three.js xoay lật 360°, hỗ trợ tải file `.glb`.
+
+---
+
 ## 4. Hướng dẫn chạy & Nghiệm thu
 
-### Bước 1: Khởi động máy chủ
-Di chuyển vào thư mục `backend` và chạy lệnh Uvicorn:
+### Bước 1: Khởi động máy chủ Local
 
 ```bash
 cd notebook/backend
-python -m uvicorn app:app --reload
+python -m uvicorn app:app --reload --port 8000
 ```
-*Đợi đến khi Terminal báo:* `Application startup complete.`
+*Đợi thông báo:* `Application startup complete.`
 
-### Bước 2: Upload ảnh test
-1. Mở trình duyệt web truy cập vào giao diện Swagger UI: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
-2. Mở rộng mục `POST /generate-3d/` → Chọn **Try it out**.
-3. Upload 1 bức ảnh (Nên chọn ảnh có vật thể rõ ràng, độ tương phản cao với nền).
-4. Bấm **Execute**.
+### Bước 2: Thao tác Web UI
+1. Truy cập trình duyệt: [http://127.0.0.1:8000/](http://127.0.0.1:8000/) (hoặc Swagger UI: `http://127.0.0.1:8000/docs`).
+2. Kéo thả 1 ảnh (Đơn ảnh) hoặc 2–8 ảnh các mặt của vật thể.
+3. Nhấn **Tạo mô hình 3D**.
+4. Hoặc khởi chạy giao diện Gradio:
+   ```bash
+   python notebook/local_app.py
+   ```
 
 ### Bước 3: Nghiệm thu kết quả
-- **Thời gian (KPI):** Kiểm tra log trả về trên web, `execution_time_seconds` phải ≤ 2.0 giây.
-- **Model 3D:** Mở thư mục `outputs`, tìm file `.glb` vừa được tạo.
-- **Cách xem:** Sử dụng phần mềm **3D Viewer** (có sẵn trên Windows) hoặc kéo thả file vào web [glTF Viewer](https://gltf-viewer.donmccurdy.com/) để chiêm ngưỡng mô hình 360 độ.
+- Mô hình 3D được tự động tải về hoặc xem trực tiếp trên Three.js viewer.
+- File kết quả được lưu tại thư mục `output/<tên_file>.glb`.
