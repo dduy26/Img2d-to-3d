@@ -14,7 +14,7 @@
 Hệ thống được thiết kế để vượt qua 4 điểm nghẽn cốt tử:
 1. **Quang học vs. Điểm bám (Optical vs. Feature Matching):** Không xóa nền sớm trên ảnh RGB gốc; giữ nguyên bối cảnh cho khâu trích xuất đặc trưng và nướng Albedo Texture; chỉ dùng Alpha Mask làm bộ lọc thể tích trong không gian 3D.
 2. **Bảo toàn hình học Epipolar:** Khi đưa ảnh vào khung vuông chuẩn, áp dụng **Global Uniform Scale** $s$ đồng nhất trên toàn bộ $N$ ảnh. Khi có độ dời tâm $(\Delta x_i, \Delta y_i)$, **bắt buộc bù trừ vào ma trận Camera Intrinsics $K_i \to K_i'$** để tia chiếu không bị cắt cụt đối với vật thể bất đối xứng.
-3. **Linh hoạt tư thế Camera $[R \mid T]$:** Hỗ trợ cả 2 chế độ: DUSt3R tự giải Pose tự do trên GPU Colab, và Turntable Rig có khóa phẳng đáy (Ground Plane Anchor) trên CPU Local.
+3. **Linh hoạt tư thế Camera & Điều phối Đa Góc Nhìn:** Hỗ trợ cơ chế gán góc nhìn thông minh Hungarian Bipartite Assignment $[0^\circ, 90^\circ, 180^\circ, 270^\circ]$ kết hợp Tencent Hunyuan3D-2mv DiT Flow Matching trên GPU Colab, và Turntable Rig có khóa phẳng đáy (Ground Plane Anchor) trên CPU Local.
 4. **Hình học kín nước (Watertight Manifold 100%):** TSDF Space Carving + Marching Cubes với lớp đệm không khí, bảo đảm 0 cạnh hở (Boundary Edges = 0), 1 khối duy nhất, tương thích tuyệt đối mọi phần mềm Slicer in 3D (BambuStudio, Cura, Prusa).
 
 ---
@@ -98,6 +98,7 @@ Img2d-to-3d/
     └── backend/             # Máy chủ FastAPI và các module lõi P1 → P5
         ├── app.py           # API Controller & Asynchronous Job Polling
         ├── preprocess.py    # P1: Lab Optical Norm + Intrinsics K Compensation + Dual-tier Mask
+        ├── engine_hunyuan3d.py # P2/P6: Tencent Hunyuan3D-2mv DiT Multi-View Pipeline + Texture Blender
         ├── engine_depth.py  # P2: Depth-Anything-V2 + DA3 Edge Filter
         ├── quality_gate.py  # P3: Cổng kiểm tra góc chụp 3 lớp & Fail-safe
         ├── engine_tsdf_mesh.py # P4: Space Carving + TSDF + Marching Cubes

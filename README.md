@@ -36,7 +36,7 @@ notebook/
 └── local_app.py               # Trình khách Gradio UI chạy cục bộ
 
 tests/
-├── run_all_tests.py           # Bộ chạy kiểm thử toàn diện (22/22 tests PASS)
+├── run_all_tests.py           # Bộ chạy kiểm thử toàn diện (23/23 tests PASS)
 ├── test_p1_optical_normalization.py
 ├── test_p1_background_segmentation.py
 ├── test_p1_aspect_ratio_consistency.py
@@ -51,7 +51,7 @@ tests/
 
 ## 🧪 Chạy Kiểm Thử (Tự Động & Độc Lập)
 
-Toàn bộ 22 bài kiểm thử đơn vị và tích hợp E2E chạy độc lập trên CPU không yêu cầu GPU:
+Toàn bộ 23 bài kiểm thử đơn vị và tích hợp E2E chạy độc lập trên CPU không yêu cầu GPU:
 
 ```bash
 python tests/run_all_tests.py

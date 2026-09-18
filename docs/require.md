@@ -23,16 +23,15 @@
   - Định dạng: `.jpg`, `.jpeg`, `.png`.
   - Độ phân giải: Tối thiểu $512 \times 512$ pixel.
   - Số lượng: $1$ ảnh (đơn ảnh) hoặc $4 \sim 8$ ảnh chụp quanh vật thể (đa góc nhìn).
-  - Tách nền & Chuẩn hóa: Dùng DUSt3R Image Loader (resize giữ aspect ratio, không crop riêng lẻ làm méo camera parameters); RMBG-2.0 chạy song song lấy Alpha mask lọc điểm sau.
-- **Mô hình & Thuật toán (Pipeline v1):**
-  - Đa ảnh (Multi-view): DUSt3R (Pairwise matching + Global Alignment tự sinh Poses, Focals và 3D Point-maps đồng nhất; không trộn Depth-Anything vào).
-  - Kiểm soát chất lượng (Quality Gate): Kiểm tra đồ thị Co-visibility liên thông, mật độ pixel confidence cao, và loss alignment; tự động **Fallback về TripoSR Single-view** trên ảnh nét nhất nếu fail.
-  - Đơn ảnh (Single-view): TripoSR (trực tiếp) hoặc Depth-Anything-V2 + Poisson (hình học).
-  - Dựng hình khối đa ảnh: Background Point Pruning (áp mask RMBG-2.0) $\to$ Open3D Scalable TSDF Integration $\to$ Marching Cubes (kín nước 360°).
-  - Vân bề mặt: XAtlas UV Unwrapping + Angle-weighted RGB color blending (**Base-Color Texture**, không gọi là PBR Texture).
+  - Tách nền & Chuẩn hóa: Dùng module tiền xử lý P1 (Uniform Scaling bảo toàn Aspect Ratio, bù trừ ma trận Camera Intrinsics $K \to K'$, Rembg/BiRefNet tạo Alpha mask và thuật toán `refine_alpha_mask` vá lỗ phản quang).
+- **Mô hình & Thuật toán (Kiến trúc Dual-Stream SOTA):**
+  - **Luồng 1 (Đơn ảnh - Single-view 1 ảnh):** **TripoSR** (ViT + Triplane NeRF + Marching Cubes) sinh khối 3D kín nước 100% (Watertight) siêu tốc trong **~1.5 giây**.
+  - **Luồng 2 (Đa ảnh - Multi-view $N \ge 2$ ảnh):** **Tencent Hunyuan3D-2mv** (DiT Flow Matching Pipeline) kết hợp bộ gán góc Hungarian Viewpoint Assignment gán 4 góc chuẩn $[0^\circ, 90^\circ, 180^\circ, 270^\circ]$ $\to$ sinh khối 3D đặc kín nước 100% chuẩn CAD/Game asset (có đế và lòng giày hoàn chỉnh).
+  - **Hòa trộn màu sắc bề mặt (Multi-View Texture Blender):** Chiếu chùm tia màu từ toàn bộ $N$ ảnh góc chụp thực tế lên lưới 3D sử dụng trọng số Fresnel $\cos^3\theta$ kết hợp bộ đệm độ sâu Z-buffer culling để loại bỏ bóng chói và hiện tượng xuyên thấu che khuất.
+  - **Kiểm soát chất lượng (Quality Gate & Fail-safe):** Đánh giá độ phủ góc và tính toàn vẹn hình học; tự động Fallback về Luồng 1 (Anchor View) nếu bộ ảnh đa góc không đạt chuẩn.
 - **Đầu ra:**
-  - Định dạng: Duy nhất **1 file nhị phân `.glb` (GLTF 2.0 Binary)** chứa toàn bộ Mesh + UV + Base-Color Texture.
-- **Giao diện:** Web UI tinh gọn (Vite/React hoặc Gradio/Streamlit chạy trên Colab qua ngrok/localtunnel).
+  - Định dạng: Duy nhất **1 file nhị phân `.glb` (GLTF 2.0 Binary)** chứa toàn bộ Mesh kín nước + Màu sắc Albedo Texture / Vertex Colors chân thực.
+- **Giao diện:** Web UI 3D trực quan (HTML5 + Three.js Viewer với OrbitControls) và Gradio Client (`notebook/local_app.py`).
 
 ### 2.2. Ngoài phạm vi (OUT-OF-SCOPE) ❌
 - **Huấn luyện mô hình từ đầu (Training from scratch):** Không train mô hình, chỉ sử dụng mô hình pre-trained SOTA phục vụ suy luận (Inference only).
@@ -47,7 +46,7 @@
 
 | Ràng buộc | Ngưỡng cho phép | Giải pháp kiểm soát |
 | :--- | :--- | :--- |
-| **GPU VRAM** | $\le 12$ GB (trên 15 GB của T4) | Xử lý batch tuần tự cho RMBG, dùng FP16 cho Depth Anything và DUSt3R. |
+| **GPU VRAM** | $\le 12$ GB (trên 15 GB của T4) | Xử lý batch tuần tự cho Rembg, dùng FP16 cho Tencent Hunyuan3D-2mv DiT (~6-8GB) và TripoSR (~4-5GB). |
 | **RAM Hệ thống** | $\le 10$ GB (trên 12 GB Colab) | Giải phóng biến tạm (`gc.collect()`, `torch.cuda.empty_cache()`), không tích lũy tensor lớn trên RAM. |
 | **Thời gian xử lý (Latency)** | $\le 30$ giây / mô hình | Tối ưu TSDF voxel size ($v_{\text{size}} \approx 3\text{mm} \sim 5\text{mm}$), chạy Marching Cubes đa luồng Open3D. |
 | **Bản quyền (License)** | Phù hợp nghiên cứu / học thuật | Các mô hình được chọn đều có license Apache 2.0, MIT hoặc CC BY-NC 4.0. |

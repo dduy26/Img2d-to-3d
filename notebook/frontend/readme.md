@@ -22,9 +22,9 @@ Cell 4 in ra URL Cloudflare `https://xxxx.trycloudflare.com` → mở URL đó �
 index.html ──POST /generate-3d/ (multipart, N ảnh)──► app.py
                                                         │
                             ┌───────────────────────────┴───────────────────────────┐
-                            │ N=1 → Depth-Anything-V2   N≥2 → P1 Viewpoint Detect   │
-                            │       (Surface ~1.1s)           P2 Depth-Anything-V2  │
-                            │                                 P4 TSDF → P5 GLB 360° │
+                            │ N=1 → TripoSR / Depth     N≥2 → P1 Hungarian Viewpoint│
+                            │       (Watertight ~1.5s)        P2 Tencent Hunyuan3D  │
+                            │                                 P5 Texture Blender    │
                             └───────────────────────────┬───────────────────────────┘
                     {"output_file": "output/result_x.glb"}
                                                         │
