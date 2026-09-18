@@ -67,6 +67,16 @@ class TestP6Hunyuan3DEngine(unittest.TestCase):
         self.assertGreater(mesh_info.get("face_count", 0), 0)
         self.assertTrue(mesh_info.get("is_watertight", False))
 
+    def test_apply_multiview_texture_paints_mesh(self):
+        """Kiem tra apply_multiview_texture phu mau day du len dinh mesh."""
+        import trimesh
+        from notebook.backend.engine_hunyuan3d import apply_multiview_texture
+        mesh = trimesh.creation.icosphere(radius=0.5, subdivisions=2)
+        mesh_colored = apply_multiview_texture(mesh, self.image_paths)
+        self.assertTrue(hasattr(mesh_colored.visual, "vertex_colors"))
+        self.assertEqual(len(mesh_colored.visual.vertex_colors), len(mesh.vertices))
+        self.assertEqual(mesh_colored.visual.vertex_colors.shape[1], 4)
+
 
 if __name__ == "__main__":
     unittest.main()
