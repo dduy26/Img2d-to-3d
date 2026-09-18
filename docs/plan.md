@@ -27,7 +27,7 @@ Hệ thống được thiết kế để vượt qua 4 điểm nghẽn cốt t�
 | **B2** | **Hiểu về dữ liệu (Data Understanding)** | Phân loại dữ liệu ảnh thực tế & Objaverse-1k, chuẩn hóa benchmark | ✅ Hoàn thành | Dữ liệu kiểm thử trong `input/` và scratch |
 | **B3** | **Xác định tính năng (Feature Definition)** | Đặc tả tính năng P1 (Tiền xử lý), P2 (Depth/Pose), P3 (Quality Gate), P4 (TSDF Mesh), P5 (Texture), P6 (Web UI) | ✅ Hoàn thành | Bảng đặc tả tính năng F1.x → F6.x |
 | **B4** | **Giải pháp Kỹ thuật (Technical Solution)** | Chuẩn hóa toàn bộ Pipeline theo triết lý NVIDIA 3D & Dual-Engine | ✅ Hoàn thành | [docs/nvidia_3d_pipeline_flow.md](file:///d:/Xử%20Lí%20Ảnh/ImgToModel/docs/nvidia_3d_pipeline_flow.md) |
-| **B5** | **Hiện thực hóa (Implementation)** | Lập trình Backend (`notebook/backend/`) và Frontend Web UI (`notebook/frontend/`) | 🔄 Đang nâng cấp P1 | Mã nguồn Python FastAPI + Three.js Viewer |
+| **B5** | **Hiện thực hóa (Implementation)** | Lập trình Backend (`notebook/backend/`) và Frontend Web UI (`notebook/frontend/`) | ✅ Hoàn thành | Mã nguồn Python FastAPI + Three.js Viewer |
 | **B6** | **Kiểm thử và Đánh giá (Testing & Eval)** | Kiểm định hình học Mesh Health (Watertight, 0 non-manifold edges, Latency) | ✅ Hoàn thành | Slicer in 3D kiểm tra đạt chuẩn xanh 100% |
 | **B7** | **Kết luận & Bàn giao (Conclusion)** | Bàn giao tài liệu, Runbook Colab 1-click, đồng bộ Git | ✅ Hoàn thành | Branch `P6-FullStack-Cloud` |
 
