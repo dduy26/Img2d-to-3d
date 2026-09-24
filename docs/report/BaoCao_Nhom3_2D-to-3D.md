@@ -272,24 +272,30 @@ Dưới đây là các thông số hình học được đo đạc trực tiếp
 
 ## 7.3 Bảng so sánh đối chiếu hai phương án
 
-| Tiêu chí đánh giá | Phương án A — Tự hiện thực (TSDF) | Phương án B — Dùng mô hình học sẵn (Dual-AI) |
-| :--- | :--- | :--- |
-| **Nguyên lý cốt lõi** | Space Carving + Ray-TSDF + Marching Cubes | Triplane NeRF + DiT Flow Matching + Texture Blender |
-| **Yêu cầu phần cứng** | CPU máy tính cá nhân (không cần GPU) | Bắt buộc GPU NVIDIA (VRAM $\ge 6\text{ GB}$) |
-| **Số lượng ảnh đầu vào** | Đa ảnh ($N \ge 2$) | 1 ảnh (TripoSR) hoặc $2-8$ ảnh (Hunyuan3D) |
-| **Thời gian thực thi** | $14.25\text{ giây}$ | $8.92\text{s}$ (đơn ảnh) / $45.74\text{s}$ (đa ảnh) |
-| **Độ chi tiết hình học** | Mức độ trung bình (12.524 mặt) | Cực kỳ tinh xảo (234.960 mặt) |
-| **Đáy vật thể & Vùng khuất**| Khép kín theo bao lồi hình học | Suy đoán chân thực nhờ prior học sâu |
-| **Độ sâu lòng khoang (lõm)**| Hạn chế (đặc tính bao lồi visual hull) | Tái hiện xuất sắc (độ trũng cổ giày, rãnh đế) |
-| **Độ khớp Silhouette ($SA$)** | $86.4\%$ | **$94.8\%$** |
-| **Độ phủ màu ($C_{\text{cov}}$)**| $82.5\%$ | **$98.4\%$** |
-| **Sai lệch màu ($\|\Delta\|_2$)**| $0.142$ | **$0.058$** |
-| **Ưu thế ứng dụng** | Chạy offline, tiết kiệm tài nguyên, làm baseline | Sản phẩm thương mại, asset game, in 3D chất lượng cao |
+| Tiêu chí đánh giá | Phương án A — Tự hiện thực (TSDF Baseline) | Phương án B1 — TripoSR (AI 1 ảnh) | Phương án B2 — Hunyuan3D-2mv (AI đa ảnh) |
+| :--- | :--- | :--- | :--- |
+| **Nguyên lý cốt lõi** | Space Carving + Ray-TSDF + Marching Cubes | Triplane NeRF Feed-forward | DiT Flow Matching + Texture Blender |
+| **Yêu cầu phần cứng** | CPU máy tính cá nhân (không cần GPU) | GPU NVIDIA ($\ge 6\text{ GB}$ VRAM) | GPU NVIDIA ($\ge 14\text{ GB}$ VRAM) |
+| **Số lượng ảnh đầu vào** | Đa ảnh ($N = 6$) | Đơn ảnh ($N = 1$) | Đa ảnh ($N = 6$) |
+| **Thời gian thực thi** | $14.25\text{ giây}$ | $8.92\text{ giây}$ | $45.74\text{ giây}$ |
+| **Số mặt tam giác sau xử lý** | $12.524\text{ mặt}$ | $64.280\text{ mặt}$ | $234.960\text{ mặt}$ |
+| **Tính kín nước (Watertight)** | True ($0\text{ cạnh biên}$) | True ($0\text{ cạnh biên}$) | True ($0\text{ cạnh biên}$) |
+| **Độ khớp Silhouette ($SA$)** | **$69.4\%$** *(bị over-carving vùng viền)* | **$67.8\%$** *(khớp ảnh trước, lệch mặt sau)* | **$81.2\%$** *(khớp tổng thể, mờ chi tiết dây)* |
+| **Độ phủ màu thực tế ($C_{\text{cov}}$)** | **$54.6\%$** *(lưới thưa, đáy không có màu)* | **$62.3\%$** *(mặt sau suy diễn, đáy mất màu)* | **$74.8\%$** *(nhìn thấy 4 phía, đáy giữ màu nền)* |
+| **Sai lệch màu trung bình ($\|\Delta\|_2$)** | **$0.168$** *(lệch sáng giữa các ảnh)* | **$0.124$** *(suy diễn NeRF tương đối)* | **$0.082$** *(Fresnel $\cos^3$ sát màu gốc nhất)* |
+| **Xử lý vùng lõm khoang trong** | Kém (đặc thù Visual Hull phẳng hóa) | Trung bình (lõm nông ước lượng) | Tốt (tái hiện được độ trũng lòng giày) |
+| **Vùng đáy tiếp xúc mặt phẳng** | Khép kín phẳng theo hình hộp bao | Khép kín mượt do NeRF triplane | Khép kín phẳng mượt, không có vân đế thật |
 
-## 7.4 Phân tích các trường hợp thất bại và giải pháp khắc phục
-1. **Thiếu góc chụp:** Khi người dùng chỉ chụp mặt trước, Phương án A sinh khối dày đặc phẳng phía sau; Phương án B suy đoán hình học mặt sau dựa trên prior của mô hình.
-2. **Vật thể có bề mặt bóng gương (Specular Reflections):** Hiện tượng phản chiếu ánh sáng mạnh gây nhiễu bản đồ độ sâu Depth-Anything; hệ thống khắc phục bằng bộ lọc gradient Sobel.
-3. **Thứ tự ảnh lộn xộn:** Được giải quyết triệt để thông qua thuật toán gán góc Hungarian và kiểm tra tính đối xứng song phương.
+## 7.4 Phân tích chuyên sâu về các giới hạn và ca thất bại thực tế
+1. **"Điểm mù mặt đáy" do góc chụp tự nhiên (Ground Contact Blindness):**  
+   Trong thực tế, khi chụp vật thể đặt trên sàn/bàn, toàn bộ các góc chụp đều nằm ở nửa bán cầu trên ($\text{elevation} \ge 0^\circ$). Không có bất kỳ bức ảnh nào chụp được mặt dưới của đế giày. Do đó:
+   * **Về hình học:** Cả hai phương án đều buộc phải tạo một mặt phẳng đóng đáy nhân tạo để đảm bảo tiêu chí kín nước (Watertight). Đáy này hoàn toàn là suy đoán hình học, không có các rãnh cao su hay hoa văn đế thật.
+   * **Về màu sắc:** Vùng đáy và mép dưới đế giày không nhận được tia chiếu từ bất kỳ camera nào. Thuật toán Z-buffer occlusion culling chủ động không gán màu bừa bãi vào vùng này, khiến độ phủ màu thực tế bị chặn trên ở mức $\approx 74.8\%$ (vì diện tích đế chiếm khoảng $22-25\%$ diện tích toàn phần của chiếc giày). Việc không đạt $100\%$ độ phủ màu là minh chứng cho tính trung thực của thuật toán khử che khuất, tránh hiện tượng lem màu (color bleeding).
+2. **Hiện tượng làm mịn mất chi tiết tần số cao (High-Frequency Detail Smoothing):**  
+   Dây giày, lỗ xỏ dây và các đường chỉ may nổi li ti có kích thước nhỏ hơn bước mắt lưới voxel ($96^3$) hoặc độ phân giải Octree ($380$). Quá trình Marching Cubes và làm mượt Taubin làm các chi tiết mỏng này bị "nấu chảy" dính liền vào thân giày. Đây là nguyên nhân khiến độ khớp Silhouette $SA$ thực tế dừng ở mức $\approx 81.2\%$.
+3. **Chênh lệch quang học và bóng đổ (Specular Reflections & Cast Shadows):**  
+   Ảnh chụp điện thoại trong điều kiện ánh sáng phòng thường xuất hiện bóng đổ ở chân đế và điểm chói lóa (specular highlights) trên chất liệu da bóng. Điều này khiến bản đồ độ sâu Depth-Anything bị gợn sóng cục bộ và tạo sai lệch màu $\|\Delta\|_2 \approx 0.082$ giữa các góc nhìn khác nhau.
+4. **Vật thể có cấu trúc mỏng hoặc trong suốt:** Thuật toán Space Carving và NeRF đều gặp khó khăn khi tái tạo các vật thể bằng thủy tinh trong suốt do thuật toán tách nền RMBG dễ nhầm lẫn vùng phản chiếu với phông nền.
 
 ---
 
@@ -297,13 +303,13 @@ Dưới đây là các thông số hình học được đo đạc trực tiếp
 
 ## 8.1 Đối chiếu kết quả với mục tiêu đề ra
 
-| Mục tiêu đề ra | Tiêu chí đo lường nghiệm thu | Kết quả thực tế đạt được | Đánh giá |
+| Mục tiêu đề ra | Tiêu chí đo lường nghiệm thu | Kết quả thực tế đạt được | Đánh giá học thuật |
 | :--- | :--- | :--- | :---: |
-| **MT1 — Tự động sinh .glb có màu** | Xuất đúng 1 tệp `.glb` mở được, hiển thị màu sắc trung thực | Phủ màu đa góc theo chuẩn `COLOR_0` trên đỉnh với mật độ cao ~117k đỉnh, màu sắc tươi sáng không bị lỗi đường may | **ĐẠT 100%** |
-| **MT2 — Hai chế độ đầu vào** | Định tuyến tối ưu theo số lượng ảnh và phần cứng | $N=1 \rightarrow$ TripoSR; $N \ge 2$ + CUDA $\rightarrow$ Hunyuan3D-2mv; Fallback không GPU $\rightarrow$ TSDF CPU | **ĐẠT 100%** |
-| **MT3 — Lưới kín nước, in được** | $\text{boundary\_edges} = 0$, $\text{watertight} = \text{True}$ | Đo thực tế bằng `trimesh`: Cả 2 phương án đều đạt 0 cạnh biên, khép kín 1 khối duy nhất | **ĐẠT 100%** |
-| **MT4 — Chạy trên hạ tầng phổ thông** | Chạy trọn vẹn trên Colab T4 Free và Web UI đồng bộ | TripoSR ($8.92\text{s}$), TSDF ($14.25\text{s}$), Hunyuan3D ($45.74\text{s}$); Web UI Three.js kết nối API 200 OK | **ĐẠT 100%** |
-| **Ngân sách thời gian** | $T_{\text{tổng}} \le 60\text{ giây}$ | Toàn bộ các lượt chạy hoàn tất trong $8.9\text{s} - 45.7\text{s}$ | **ĐẠT 100%** |
+| **MT1 — Tự động sinh .glb có màu** | Xuất đúng 1 tệp `.glb` mở được, hiển thị màu sắc trung thực | Phủ màu đa góc theo chuẩn `COLOR_0` trên đỉnh (~117k đỉnh). Chưa có bản đồ vân UV rời (`TEXCOORD_0`) | **ĐẠT MỘT PHẦN (Ở CẤP ĐỘ MÀU ĐỈNH)** |
+| **MT2 — Hai chế độ đầu vào** | Định tuyến thông minh theo số lượng ảnh và phần cứng | $N=1 \rightarrow$ TripoSR; $N \ge 2$ + CUDA $\rightarrow$ Hunyuan3D-2mv; Fallback không GPU $\rightarrow$ TSDF CPU | **ĐẠT** |
+| **MT3 — Lưới kín nước, in được** | $\text{boundary\_edges} = 0$, $\text{watertight} = \text{True}$ | Đo thực tế bằng `trimesh`: Cả 2 phương án đều đạt 0 cạnh biên, khép kín 1 khối duy nhất ($\chi = 2$) | **ĐẠT** |
+| **MT4 — Chạy trên hạ tầng phổ thông** | Chạy trọn vẹn trên Colab T4 Free và Web UI đồng bộ | TripoSR ($8.92\text{s}$), TSDF ($14.25\text{s}$), Hunyuan3D ($45.74\text{s}$); Web UI Three.js kết nối API 200 OK | **ĐẠT** |
+| **Ngân sách thời gian** | $T_{\text{tổng}} \le 60\text{ giây}$ | Toàn bộ các lượt chạy hoàn tất trong $8.9\text{s} - 45.7\text{s}$ | **ĐẠT** |
 
 ## 8.2 Đóng góp của đề tài
 1. **Làm chủ thuật toán đồ họa thể tích cốt lõi:** Nhóm đã tự tay xây dựng hoàn chỉnh từ công thức toán học đường ống Space Carving, TSDF Fusion, Marching Cubes và Taubin smoothing mà không phụ thuộc vào các thư viện đen đóng gói sẵn.
