@@ -57,6 +57,7 @@ class TestP6Hunyuan3DEngine(unittest.TestCase):
             image_paths=self.image_paths,
             output_glb=out_glb,
             device="cpu",
+            allow_fallback_mesh=True,
         )
         self.assertEqual(res["status"], "success")
         self.assertTrue(os.path.exists(out_glb))
@@ -66,6 +67,17 @@ class TestP6Hunyuan3DEngine(unittest.TestCase):
         self.assertGreater(mesh_info.get("vertex_count", 0), 0)
         self.assertGreater(mesh_info.get("face_count", 0), 0)
         self.assertTrue(mesh_info.get("is_watertight", False))
+
+    def test_reconstruct_hunyuan3d_raises_without_fallback(self):
+        """Kiem tra reconstruct_hunyuan3d nem loi khi thieu GPU/weights va khong cho phep mock."""
+        out_glb = os.path.join(self.tmp_path, "model_no_mock.glb")
+        with self.assertRaises(RuntimeError):
+            reconstruct_hunyuan3d(
+                image_paths=self.image_paths,
+                output_glb=out_glb,
+                device="cpu",
+                allow_fallback_mesh=False,
+            )
 
     def test_apply_multiview_texture_paints_mesh(self):
         """Kiem tra apply_multiview_texture phu mau day du len dinh mesh."""

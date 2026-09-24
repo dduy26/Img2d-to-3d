@@ -3,7 +3,7 @@ quality_gate.py — P3: Cong Kiem Soat Chat Luong & Fail-safe Fallback
 =====================================================================
 Chuc nang:
   1. Kiem dinh danh sach views sau P2 theo nhieu tieu chi:
-       - Dien tich tien canh (foreground area) > 1% canvas.
+       - Dien tich tien canh (foreground area) >= 0.05% canvas (MIN_FOREGROUND_RATIO = 0.0005).
        - Do bao phu goc (angle coverage) > 45 do.
        - So luong views hop le >= 2 (cho multi-view).
   2. Neu vuot nguong -> cho phep chay engine multi-view (Branch B).

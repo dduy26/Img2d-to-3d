@@ -384,26 +384,73 @@ def place_on_canvas(
 # 5. PHAN LOAI GOC CHUP — Hungarian Viewpoint Assignment
 # ---------------------------------------------------------------------------
 
-def _estimate_azimuth(img_rgb: np.ndarray) -> float:
-    """Uoc luong goc chup nhin (azimuth) tu noi dung anh (phuong phap don gian).
+def classify_viewpoints(image_paths: list[Union[str, Path]]) -> dict[int, str]:
+    """Phân loại chuỗi ảnh vào 4 góc vật lý chuẩn [0, 90, 180, 270] sử dụng thuật toán Hungarian.
 
-    Phuong phap: Phan tich trong so khoi luong anh sang (luminance mass)
-    tren nua trai vs phai de phan biet front/back vs left/right.
-    Day la phuong phap heuristic nhanh, du chuan xac cho 4-view ortho.
+    Quy trình:
+      1. Phân tích tên file và đặc trưng quang học:
+         - Heuristic từ khóa: front/chinh dien -> 0, right/phai -> 90, back/sau -> 180, left/trai -> 270.
+         - Độ đối xứng trục đứng (Bilateral Symmetry): Mặt front (0) và back (180) có đối xứng cao hơn profile (90, 270).
+      2. Xây dựng ma trận chi phí Cost Matrix C (N x 4) giữa N ảnh và 4 góc chuẩn.
+      3. Giải bài toán gán cặp 1-1 tối ưu bằng scipy.optimize.linear_sum_assignment (Hungarian Algorithm).
 
     Returns:
-        Goc uoc tinh (0, 90, 180, 270) do.
+        dict[int, str]: ánh xạ góc độ vật lý (0, 90, 180, 270) -> đường dẫn ảnh tương ứng.
     """
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    h, w = gray.shape
-    left_mass  = gray[:, :w//2].mean()
-    right_mass = gray[:, w//2:].mean()
-    top_mass   = gray[:h//2, :].mean()
-    bot_mass   = gray[h//2:, :].mean()
+    N = len(image_paths)
+    if N == 0:
+        return {}
 
-    # Heuristic: anh front thuong co khoi luong xung doi
-    # Khong du thong tin de phan biet chinh xac -> tra ve None
-    return None
+    canonical_angles = [0, 90, 180, 270]
+    cost_matrix = np.zeros((N, 4), dtype=np.float32)
+
+    for i, p in enumerate(image_paths):
+        stem = Path(p).stem.lower()
+
+        # 1. Chi phí theo tên file (filename prior)
+        has_hint = False
+        if any(k in stem for k in ["front", "truoc", "chinhdien", "face", "0000", "cam0", "view_1", "view_01"]):
+            cost_matrix[i, 0] -= 10.0
+            has_hint = True
+        if any(k in stem for k in ["right", "phai", "cam1", "view_2", "view_02"]):
+            cost_matrix[i, 1] -= 10.0
+            has_hint = True
+        if any(k in stem for k in ["back", "sau", "lung", "rear", "cam2", "view_3", "view_03"]):
+            cost_matrix[i, 2] -= 10.0
+            has_hint = True
+        if any(k in stem for k in ["left", "trai", "cam3", "view_4", "view_04"]):
+            cost_matrix[i, 3] -= 10.0
+            has_hint = True
+
+        # 2. Chi phí hình thái học (Symmetry & Optical Mass) nếu không có hint
+        if not has_hint:
+            try:
+                raw = load_image_safe(p)
+                rgb = ensure_rgb(raw)
+                gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+                gray_norm = (gray - gray.mean()) / (gray.std() + 1e-6)
+                flipped = cv2.flip(gray_norm, 1)
+                sym_diff = float(np.mean(np.abs(gray_norm - flipped)))
+
+                cost_matrix[i, 0] += sym_diff * 2.0
+                cost_matrix[i, 2] += sym_diff * 2.0
+                cost_matrix[i, 1] += (1.5 - sym_diff) * 2.0
+                cost_matrix[i, 3] += (1.5 - sym_diff) * 2.0
+            except Exception:
+                pass
+
+            for j in range(4):
+                cost_matrix[i, j] += abs((i / max(N - 1, 1)) - (j / 3.0)) * 1.5
+
+    # 3. Hungarian Optimization (linear_sum_assignment)
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+    assignments = {}
+    for r, c in zip(row_ind, col_ind):
+        angle = canonical_angles[c]
+        assignments[angle] = str(image_paths[r])
+
+    return assignments
 
 
 def assign_viewpoints_hungarian(
@@ -411,9 +458,6 @@ def assign_viewpoints_hungarian(
     known_azimuths: Optional[list] = None,
 ) -> list:
     """Phan cong goc chup cho N anh bang thuat toan Hungarian.
-
-    Neu already co thong tin ten file (front/right/back/left), dung truc tiep.
-    Neu khong, giu nguyen thu tu (front=0, right=1, back=2, left=3...).
 
     Args:
         images_rgb:     Danh sach N anh RGB.
@@ -423,10 +467,24 @@ def assign_viewpoints_hungarian(
         Danh sach chi so thu tu da sap xep (viewpoint assignment).
     """
     N = len(images_rgb)
+    if N <= 1:
+        return list(range(N))
+
     if known_azimuths is not None and len(known_azimuths) == N:
-        # Sap xep theo thu tu tang dan cua azimuth
-        return sorted(range(N), key=lambda i: known_azimuths[i])
-    # Mac dinh: giu nguyen thu tu dau vao
+        canonical_targets = [0.0, 90.0, 180.0, 270.0]
+        C = np.zeros((N, min(N, 4)), dtype=np.float32)
+        for i in range(N):
+            for j in range(min(N, 4)):
+                diff = abs(known_azimuths[i] - canonical_targets[j])
+                C[i, j] = min(diff, 360.0 - diff)
+        row_ind, col_ind = linear_sum_assignment(C)
+        sorted_rows = [r for _, r in sorted(zip(col_ind, row_ind))]
+        # Neu N > 4, bo sung cac row con lai
+        for r in range(N):
+            if r not in sorted_rows:
+                sorted_rows.append(r)
+        return sorted_rows
+
     return list(range(N))
 
 

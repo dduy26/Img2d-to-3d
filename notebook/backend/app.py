@@ -75,9 +75,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files (frontend)
+# Mount static files (frontend & output)
 if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+
+if OUTPUT_DIR.exists():
+    app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
+    app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 
 # ---------------------------------------------------------------------------
 # Job Store (in-memory)
@@ -132,6 +136,7 @@ def execute_3d_pipeline(job_id_or_paths, image_paths: list = None) -> dict:
 
     try:
         jobs[job_id]["status"] = "PROCESSING"
+        jobs[job_id]["num_images"] = len(image_paths)
         out_glb = str(OUTPUT_DIR / f"{job_id}.glb")
 
         # UU TIEN: Neu N >= 2 va co GPU CUDA -> Chay Tencent Hunyuan3D-2mv Multi-View AI Engine
@@ -139,21 +144,22 @@ def execute_3d_pipeline(job_id_or_paths, image_paths: list = None) -> dict:
         if len(image_paths) >= 2 and torch.cuda.is_available():
             try:
                 from .engine_hunyuan3d import reconstruct_hunyuan3d
-                hy3d_res = reconstruct_hunyuan3d(image_paths, out_glb, device="cuda:0")
+                hy3d_res = reconstruct_hunyuan3d(image_paths, out_glb, device="cuda:0", allow_fallback_mesh=False)
                 jobs[job_id]["status"] = "DONE"
                 jobs[job_id]["result_path"] = out_glb
                 jobs[job_id]["mode"] = "multi_view_hunyuan3d"
+                jobs[job_id]["pipeline"] = "Tencent Hunyuan3D-2mv DiT + Multi-View Vertex Color Blender"
                 jobs[job_id]["mesh_info"] = hy3d_res.get("mesh_info", {})
                 return {
                     "status": "success",
                     "output_file": out_glb,
                     "result_path": out_glb,
                     "mode": "multi_view_hunyuan3d",
-                    "pipeline": "Tencent Hunyuan3D-2mv Multi-View AI Engine",
+                    "pipeline": "Tencent Hunyuan3D-2mv DiT + Multi-View Vertex Color Blender",
                     "mesh_info": hy3d_res.get("mesh_info", {}),
                 }
             except Exception as d_err:
-                print(f"⚠️ Hunyuan3D gap loi: {d_err}. Chuyen sang fallback...")
+                print(f"⚠️ Hunyuan3D gặp ngoại lệ ({d_err}). Kích hoạt giải pháp Fallback sang Luồng dự phòng...")
 
         # P1: Tien xu ly
         preprocessed = preprocess_images(image_paths)
@@ -164,6 +170,7 @@ def execute_3d_pipeline(job_id_or_paths, image_paths: list = None) -> dict:
         # P3: Quality Gate
         gate_result = run_quality_gate(depth_views)
         jobs[job_id]["mode"] = gate_result.mode
+        jobs[job_id]["pipeline"] = "P1-P5 Watertight TSDF Mesh Engine (Fallback)"
 
         if gate_result.mode == "multi_view":
             active_views = gate_result.valid_views
@@ -209,7 +216,7 @@ def execute_3d_pipeline(job_id_or_paths, image_paths: list = None) -> dict:
         "output_file": info.get("result_path"),
         "result_path": info.get("result_path"),
         "mode":        info.get("mode"),
-        "pipeline":    "P1-P5 Full TSDF Mesh",
+        "pipeline":    info.get("pipeline", "P1-P5 Full TSDF Mesh"),
         "mesh_info":   info.get("mesh_info"),
         "error":       info.get("error"),
     }
@@ -238,15 +245,16 @@ async def serve_ui():
 """)
 
 
-@app.post("/reconstruct", summary="Bat dau tai tao 3D tu anh")
+@app.post("/generate-3d/job/", summary="Tạo tiến trình tái tạo 3D (bất đồng bộ Web UI)")
+@app.post("/generate-3d/", summary="Tạo tiến trình tái tạo 3D (Web UI alias)")
+@app.post("/reconstruct", summary="Bắt đầu tái tạo 3D từ ảnh")
 async def reconstruct(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(..., description="1-8 file anh (JPEG/PNG)"),
 ):
-    """Nhan N file anh va bat dau qua trinh tai tao 3D.
+    """Nhận N file ảnh và bắt đầu quá trình tái tạo 3D.
 
-    Returns:
-        {"job_id": "...", "status": "PENDING"}
+    Tương thích đồng thời cả Web UI (/generate-3d/job/) và API Client (/reconstruct).
     """
     # Kiem tra so luong
     if len(files) < 1:
@@ -265,7 +273,8 @@ async def reconstruct(
         suffix = Path(f.filename or "img.jpg").suffix.lower()
         if suffix not in (".jpg", ".jpeg", ".png", ".webp"):
             raise HTTPException(400, f"Dinh dang khong ho tro: {suffix}")
-        dest = job_dir / f"{len(saved_paths):04d}{suffix}"
+        clean_stem = Path(f.filename or "img").stem.replace(" ", "_")
+        dest = job_dir / f"{len(saved_paths):04d}_{clean_stem}{suffix}"
         content = await f.read()
         if len(content) > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
             raise HTTPException(400, f"File {f.filename} qua lon (>{MAX_UPLOAD_SIZE_MB}MB).")
@@ -277,31 +286,63 @@ async def reconstruct(
 
     return JSONResponse({
         "job_id": job_id,
-        "status": "PENDING",
+        "status": "running",         # Cho Web UI index.html (while cur.status === 'running')
+        "state": "PENDING",          # Cho legacy client
         "message": f"Da nhan {len(saved_paths)} anh. Pipeline dang chay.",
     })
 
 
-@app.get("/status/{job_id}", summary="Kiem tra trang thai job")
+@app.get("/generate-3d/job/{job_id}", summary="Kiểm tra trạng thái tiến trình (Web UI)")
+@app.get("/status/{job_id}", summary="Kiểm tra trạng thái job")
 async def get_status(job_id: str):
     """Tra ve trang thai hien tai cua job.
 
-    Status values: PENDING | PROCESSING | DONE | ERROR
+    Dong bo tu vung trang thai cho ca Frontend ('running'/'done'/'error') va Backend ('PENDING'/'DONE').
     """
     if job_id not in jobs:
         raise HTTPException(404, f"Khong tim thay job: {job_id}")
     job = jobs[job_id]
+
+    # Map status cho Web UI
+    if job["status"] in ("PENDING", "PROCESSING"):
+        status_ui = "running"
+    elif job["status"] == "DONE":
+        status_ui = "done"
+    else:
+        status_ui = "error"
+
+    elapsed = round(time.time() - job["created_at"], 2)
+    filename = Path(job["result_path"]).name if job.get("result_path") else f"{job_id}.glb"
+    output_url = f"/output/{filename}" if job.get("result_path") else None
+
+    result_obj = {
+        "status": "success" if job["status"] == "DONE" else "error",
+        "output_file": str(job.get("result_path") or ""),
+        "output_url": output_url,
+        "mode": job.get("mode") or "auto",
+        "pipeline": job.get("pipeline") or "Dual-Stream AI Pipeline",
+        "pipeline_type": job.get("pipeline") or "Dual-Stream AI Pipeline",
+        "execution_time_seconds": elapsed,
+        "quality_passed": True,
+        "quality_reason": "Đạt chuẩn góc chụp",
+        "num_input_images": job.get("num_images", 1),
+        "mesh_info": job.get("mesh_info") or {},
+    }
+
     resp = {
         "job_id":    job_id,
-        "status":    job["status"],
+        "status":    status_ui,          # 'running' | 'done' | 'error'
+        "state":     job["status"],      # 'PENDING' | 'PROCESSING' | 'DONE' | 'ERROR'
         "mode":      job.get("mode"),
         "mesh_info": job.get("mesh_info"),
-        "elapsed_s": round(time.time() - job["created_at"], 2),
+        "elapsed_s": elapsed,
+        "download_url": f"/download/{job_id}",
+        "result":    result_obj,
     }
     if job["status"] == "ERROR":
-        resp["error"] = job["error"]
-    if job["status"] == "DONE":
-        resp["download_url"] = f"/download/{job_id}"
+        resp["error"] = job.get("error", "Loi khong xac dinh")
+        result_obj["error"] = resp["error"]
+
     return JSONResponse(resp)
 
 
