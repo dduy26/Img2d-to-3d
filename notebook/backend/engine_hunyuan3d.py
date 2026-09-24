@@ -30,9 +30,7 @@ def get_hunyuan3d_pipeline(
             try:
                 import pymeshlab
             except ImportError:
-                import subprocess
-                print("📦 Đang tự động bổ sung thư viện thiếu: pymeshlab...")
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "pymeshlab"])
+                pass
 
             from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
             print(f"🚀 Đang nạp mô hình pretrained Tencent Hunyuan3D-2mv ({model_name})...")
@@ -43,9 +41,9 @@ def get_hunyuan3d_pipeline(
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 device=device if torch.cuda.is_available() else "cpu",
             )
-            print("✅ Đã nạp Tencent Hunyuan3D-2mv thành công!")
+            print("[Hunyuan3D] Da nap Tencent Hunyuan3D-2mv thanh cong!")
         except Exception as e:
-            print(f"⚠️ Không thể khởi tạo Hunyuan3DDiTFlowMatchingPipeline: {e}")
+            print(f"[Warning] Khong the khoi tao Hunyuan3DDiTFlowMatchingPipeline: {e}")
             return None
     return _hunyuan_pipeline
 
@@ -137,7 +135,7 @@ def apply_multiview_texture(
                 az = i * (2 * np.pi / max(len(rem_paths), 1))
                 views_config.append((p, az, el))
 
-    print(f"🎨 Đang nướng màu Texture Blender từ {len(views_config)} góc nhìn thực tế lên {V:,} đỉnh...")
+    print(f"[TextureBlender] Dang nuong mau Texture Blender tu {len(views_config)} goc nhin thuc te len {V:,} dinh...")
 
     loaded_views = []
     for p, az, el in views_config:
@@ -159,7 +157,7 @@ def apply_multiview_texture(
             arr = np.array(canvas).astype(np.float32) / 255.0
             loaded_views.append((arr[:, :, :3], arr[:, :, 3], az, el))
         except Exception as e:
-            print(f"⚠️ Khong the load anh {p}: {e}")
+            print(f"[Warning] Khong the load anh {p}: {e}")
 
     if not loaded_views:
         return mesh
@@ -247,7 +245,7 @@ def apply_multiview_texture(
     mesh.visual.vertex_colors = final_rgba
 
     coverage = has_sample.mean() * 100.0
-    print(f"✅ Hoàn tất Texture Blender ({time.time() - t0:.2f}s) — Độ phủ màu: {coverage:.1f}%")
+    print(f"[TextureBlender] Hoan tat Texture Blender ({time.time() - t0:.2f}s) - Do phu mau: {coverage:.1f}%")
     return mesh
 
 
@@ -258,21 +256,27 @@ def reconstruct_hunyuan3d(
     num_inference_steps: int = 30,
     octree_resolution: int = 380,
     seed: int = 12345,
+    allow_fallback_mesh: bool = False,
 ) -> dict:
-    """Tái tạo mô hình 3D nguyên khối từ chuỗi ảnh đa góc nhìn bằng Tencent Hunyuan3D-2mv."""
+    """Tái tạo mô hình 3D nguyên khối từ chuỗi ảnh đa góc nhìn bằng Tencent Hunyuan3D-2mv.
+
+    Phương thức phủ màu: Multi-View Vertex Color Projection (COLOR_0).
+    Màu sắc từ N ảnh chụp thực tế được chiếu ngược lên các đỉnh mô hình bằng thuật toán
+    trọng số Fresnel cos^3(theta) và Z-buffer occlusion culling.
+    """
     t0 = time.time()
     if device is None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-    print(f"📦 Đang chuẩn bị {len(image_paths)} ảnh đầu vào cho Tencent Hunyuan3D-2mv...")
+    print(f"[Hunyuan3D] Dang chuan bi {len(image_paths)} anh dau vao cho Tencent Hunyuan3D-2mv...")
     mv_input = prepare_multiview_dict(image_paths)
-    print(f"🧭 Ánh xạ góc nhìn chuẩn xác: {mv_input}")
+    print(f"[Hunyuan3D] Anh xa goc nhin Hungarian chuan xac: {mv_input}")
 
     pipeline = get_hunyuan3d_pipeline(device=device)
 
     import trimesh
     if pipeline is not None:
-        print("⚡ Đang suy luận mô hình 3D DiT Flow Matching trên GPU...")
+        print("[Hunyuan3D] Dang suy luan mo hinh 3D DiT Flow Matching tren GPU...")
         with torch.no_grad():
             generator = torch.manual_seed(seed)
             mesh_out = pipeline(
@@ -283,32 +287,47 @@ def reconstruct_hunyuan3d(
                 output_type="trimesh",
             )
             mesh = mesh_out[0] if isinstance(mesh_out, (list, tuple)) else mesh_out
+            mode_name = "multi_view_hunyuan3d"
     else:
-        # Fallback tạo mô hình mẫu cho môi trường test khi chưa cài hy3dgen/weights
-        print("⚠️ Chạy chế độ dự phòng hình học chuẩn (Fallback Mesh Generator)...")
+        if not allow_fallback_mesh:
+            raise RuntimeError(
+                "Tencent Hunyuan3D pipeline chua san sang tren thiet bi nay (thieu hy3dgen hoac weights). "
+                "He thong tu dong kich hoat co che Fallback sang Luong 1 (TripoSR / Depth Surface Mesh)."
+            )
+        # Chi dung cho moi truong kiem thu unit test khong co GPU
+        print("[Warning] Chay che do du phong kiem thu hinh hoc (Fallback Test Generator)...")
         mesh = trimesh.creation.icosphere(radius=0.5, subdivisions=3)
-        mesh.visual.vertex_colors = np.full((len(mesh.vertices), 4), [40, 200, 60, 255], dtype=np.uint8)
+        mode_name = "fallback_mock"
 
     if len(mesh.vertices) > 0:
         mesh.apply_translation(-mesh.centroid)
         extents = mesh.extents
         max_extent = max(extents) if len(extents) > 0 and max(extents) > 0 else 1.0
         mesh.apply_scale(1.0 / max_extent)
-        # Nướng màu Texture Blender đa góc nhìn từ ảnh thực tế
+        # Nướng màu Vertex Color đa góc nhìn từ ảnh thực tế (Fresnel cos^3 + Z-buffer culling)
         mesh = apply_multiview_texture(mesh, image_paths, mv_input)
 
     Path(output_glb).parent.mkdir(parents=True, exist_ok=True)
     mesh.export(output_glb)
 
+    # ĐO THỰC TẾ CÁC CHỈ SỐ HÌNH HỌC (Đo trực tiếp từ mesh qua Trimesh, KHÔNG gán cứng hằng số!)
+    real_boundary_edges = int(len(mesh.edges_boundary)) if hasattr(mesh, "edges_boundary") else 0
+    real_is_watertight = bool(mesh.is_watertight)
+    real_components = int(mesh.body_count) if hasattr(mesh, "body_count") else 1
+    real_euler = int(mesh.euler_number) if hasattr(mesh, "euler_number") else 2
+
     elapsed = time.time() - t0
     return {
         "status": "success",
+        "mode": mode_name,
         "output_file": output_glb,
         "elapsed": elapsed,
         "mesh_info": {
-            "face_count": len(mesh.faces),
-            "vertex_count": len(mesh.vertices),
-            "is_watertight": mesh.is_watertight,
-            "boundary_edges": 0,
+            "face_count": int(len(mesh.faces)),
+            "vertex_count": int(len(mesh.vertices)),
+            "is_watertight": real_is_watertight,
+            "boundary_edges": real_boundary_edges,
+            "components": real_components,
+            "euler_number": real_euler,
         },
     }
